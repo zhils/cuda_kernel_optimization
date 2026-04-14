@@ -1,8 +1,8 @@
 set(GEMM_VARIANTS
     gemm_v0_naive
     gemm_v1_tiled_smem
-    gemm_v2_bank_conflict_free
-    gemm_v3_thread_tiling
+    gemm_v2_thread_tiling
+    gemm_v3_fastpath
     gemm_cublas_ref
 )
 

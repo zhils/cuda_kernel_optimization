@@ -241,8 +241,7 @@ footer span{
         <tr><td>9</td><td><code>gemm/CMakeLists.txt</code></td><td>GEMM 子目录构建配置</td></tr>
         <tr><td>10</td><td><code>gemm/gemm_v0_naive.cu</code></td><td>朴素三层循环实现，每线程算一个输出元素</td></tr>
         <tr><td>11</td><td><code>gemm/gemm_v1_tiled_smem.cu</code></td><td>共享内存分块，减少全局内存访问</td></tr>
-        <tr><td>12</td><td><code>gemm/gemm_v2_bank_conflict_free.cu</code></td><td>消除 Bank Conflict + __ldg + unroll</td></tr>
-        <tr><td>13</td><td><code>gemm/gemm_v3_thread_tiling.cu</code></td><td>线程级 4×4 分块，寄存器复用</td></tr>
+        <tr><td>12</td><td><code>gemm/gemm_v2_thread_tiling.cu</code></td><td>线程级 4×4 分块，寄存器复用</td></tr>
         <tr><td>14</td><td><code>gemm/gemm_cublas_ref.cu</code></td><td>cuBLAS 参考实现，性能对比基线</td></tr>
         <tr><td>15</td><td><code>gemm/benchmark_all.cu</code></td><td>统一跑全部 GEMM 版本 + cuBLAS 对比</td></tr>
 
@@ -461,7 +460,7 @@ footer span{
   <div class="code-block">
     <span class="cmd">cd</span> ..  <span class="comment"># 回到项目根目录</span><br>
     <span class="cmd">./build/bin/gemm_v0_naive</span><br>
-    <span class="cmd">./build/bin/gemm_v2_bank_conflict_free</span><br>
+    <span class="cmd">./build/bin/gemm_v2_thread_tiling</span><br>
     <span class="cmd">./build/bin/softmax_v3_warp_shuffle</span><br>
     <span class="cmd">./build/bin/rmsnorm_v2_vectorized</span>
   </div>
@@ -482,7 +481,7 @@ footer span{
   </div>
   <div class="code-block">
     <span class="cmd">ncu</span> <span class="flag">--set full</span> <span class="path">./build/bin/gemm_v0_naive</span><br>
-    <span class="cmd">ncu</span> <span class="flag">--set full</span> <span class="path">./build/bin/gemm_v2_bank_conflict_free</span>
+    <span class="cmd">ncu</span> <span class="flag">--set full</span> <span class="path">./build/bin/gemm_v2_thread_tiling</span>
   </div>
 
   <div class="note">

@@ -434,8 +434,7 @@
 │   ├── <span class="fn">README.md</span>
 │   ├── <span class="kw">gemm_v0_naive.cu</span>
 │   ├── <span class="kw">gemm_v1_tiled_smem.cu</span>
-│   ├── <span class="kw">gemm_v2_bank_conflict_free.cu</span>
-│   ├── <span class="kw">gemm_v3_thread_tiling.cu</span>
+│   ├── <span class="kw">gemm_v2_thread_tiling.cu</span>
 │   ├── <span class="nu">gemm_cublas_ref.cu</span>
 │   └── <span class="fn">benchmark_all.cu</span>
 │
@@ -504,14 +503,14 @@
     <tr>
       <td class="old">gemm2.cu</td>
       <td class="arrow-cell">→</td>
-      <td class="new">gemm_v2_bank_conflict_free.cu</td>
-      <td style="font-family:'Noto Sans SC',sans-serif;font-size:0.85rem;">消除 Bank Conflict</td>
+      <td class="new">gemm_v2_thread_tiling.cu</td>
+      <td style="font-family:'Noto Sans SC',sans-serif;font-size:0.85rem;">Thread-level Tiling</td>
     </tr>
     <tr style="background:var(--code-bg);">
       <td class="old">gemm3.cu</td>
       <td class="arrow-cell">→</td>
-      <td class="new">gemm_v3_thread_tiling.cu</td>
-      <td style="font-family:'Noto Sans SC',sans-serif;font-size:0.85rem;">Thread-level Tiling</td>
+      <td class="new">（并入 V2）</td>
+      <td style="font-family:'Noto Sans SC',sans-serif;font-size:0.85rem;">已上移并重命名为 V2</td>
     </tr>
     <tr>
       <td class="old">nvidia_ref.cu</td>

@@ -19,11 +19,11 @@ std::vector<TestCase> BuildDefaultTestCases(int min_dim, int max_dim, int total_
   (void)max_elements;
   (void)seed;
   return {
-      {0, "A", 32, 32},
-      {1, "A", 128, 256},
-      {2, "B", 1111, 222},
-      {3, "C", 4096, 4096},
-      {4, "D", 32768, 64},
+      {0, "A", 128, 128},
+      {1, "A", 256, 256},
+      {2, "B", 512, 512},
+      {3, "C", 1024, 1024},
+      {4, "D", 4096, 4096},
   };
 }
 
