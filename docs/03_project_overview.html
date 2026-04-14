@@ -1,0 +1,571 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>CUDA 算子优化项目 — 项目总览</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Noto+Sans+SC:wght@300;400;500;700;900&family=JetBrains+Mono:wght@400;500;700&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/katex.min.css">
+<script defer src="https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/katex.min.js"></script>
+<script defer src="https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/contrib/auto-render.min.js"
+  onload="renderMathInElement(document.body,{delimiters:[{left:'$$',right:'$$',display:true},{left:'$',right:'$',display:false}]})"></script>
+<style>
+:root {
+  --q: #e74c3c;
+  --k: #2980b9;
+  --v: #27ae60;
+  --g: #f39c12;
+  --s: #8e44ad;
+  --o: #e67e22;
+  --r: #c0392b;
+  --beta: #1abc9c;
+  --bg: #0f1117;
+  --bg2: #1a1d27;
+  --bg3: #242836;
+  --text: #e8e6e3;
+  --text2: #a0a0b0;
+  --border: #2a2e3a;
+  --shadow: rgba(0,0,0,0.4);
+}
+*{margin:0;padding:0;box-sizing:border-box}
+body{
+  font-family:'Noto Sans SC',sans-serif;
+  background:var(--bg);
+  color:var(--text);
+  line-height:1.8;
+  padding:0 0 60px;
+}
+.hero{
+  text-align:center;
+  padding:80px 20px 60px;
+  background:linear-gradient(135deg,#141824 0%,#1e2235 50%,#1a1530 100%);
+  border-bottom:3px solid var(--border);
+  position:relative;
+  overflow:hidden;
+}
+.hero::before{
+  content:'';position:absolute;top:0;left:0;right:0;bottom:0;
+  background:radial-gradient(ellipse at 30% 20%,rgba(231,76,60,0.08) 0%,transparent 50%),
+             radial-gradient(ellipse at 70% 80%,rgba(142,68,173,0.08) 0%,transparent 50%);
+  pointer-events:none;
+}
+.hero h1{
+  font-size:2.6em;font-weight:900;
+  background:linear-gradient(135deg,#e74c3c,#e67e22,#f39c12);
+  -webkit-background-clip:text;-webkit-text-fill-color:transparent;
+  background-clip:text;
+  margin-bottom:12px;position:relative;
+}
+.hero .subtitle{
+  font-size:1.15em;color:var(--text2);font-weight:300;
+  letter-spacing:1px;position:relative;
+}
+section{
+  max-width:1100px;margin:40px auto;padding:32px 36px;
+  background:var(--bg2);border-radius:16px;
+  border-left:4px solid var(--border);
+  box-shadow:0 4px 24px var(--shadow);
+}
+section h2{
+  font-size:1.6em;font-weight:700;margin-bottom:24px;
+  display:flex;align-items:center;gap:12px;
+}
+section h2 .icon{font-size:1.3em}
+.note,.info{
+  padding:16px 20px;border-radius:10px;margin:16px 0;
+  font-size:0.95em;line-height:1.7;
+}
+.note{background:rgba(231,76,60,0.1);border:1px solid rgba(231,76,60,0.25);color:#f5a0a0}
+.info{background:rgba(41,128,185,0.1);border:1px solid rgba(41,128,185,0.25);color:#7ec8e3}
+.code-block{
+  background:#0d1017;border:1px solid var(--border);border-radius:10px;
+  padding:20px 24px;margin:16px 0;overflow-x:auto;
+  font-family:'JetBrains Mono',monospace;font-size:0.88em;
+  line-height:1.7;color:#c9d1d9;
+}
+.code-block .comment{color:#6a737d}
+.code-block .cmd{color:#79c0ff}
+.code-block .flag{color:#ffa657}
+.code-block .path{color:#a5d6ff}
+.flow-compare{display:flex;gap:20px;margin:20px 0;flex-wrap:wrap}
+.flow-panel{
+  flex:1;min-width:280px;background:var(--bg3);border-radius:12px;
+  padding:20px;border:1px solid var(--border);
+}
+.flow-panel h3{font-size:1.05em;margin-bottom:14px;text-align:center}
+.flow-node{
+  padding:10px 16px;border-radius:8px;margin:8px 0;
+  text-align:center;font-size:0.92em;font-weight:500;
+  border:1px solid rgba(255,255,255,0.1);
+}
+.flow-arrow{
+  text-align:center;font-size:1.3em;color:var(--text2);
+  margin:4px 0;
+}
+.n-green{background:rgba(39,174,96,0.15);color:#6ee7a0;border-color:rgba(39,174,96,0.3)}
+.n-orange{background:rgba(230,126,34,0.15);color:#f5b07a;border-color:rgba(230,126,34,0.3)}
+.n-yellow{background:rgba(243,156,18,0.15);color:#f7d794;border-color:rgba(243,156,18,0.3)}
+.n-red{background:rgba(231,76,60,0.15);color:#f5a0a0;border-color:rgba(231,76,60,0.3)}
+.n-blue{background:rgba(41,128,185,0.15);color:#7ec8e3;border-color:rgba(41,128,185,0.3)}
+.n-purple{background:rgba(142,68,173,0.15);color:#c49be0;border-color:rgba(142,68,173,0.3)}
+.n-gray{background:rgba(127,140,141,0.15);color:#b0b8b8;border-color:rgba(127,140,141,0.3)}
+.n-pink{background:rgba(232,67,147,0.15);color:#f5a0c8;border-color:rgba(232,67,147,0.3)}
+.n-small{font-size:0.82em;padding:6px 12px}
+.matrix-container{overflow-x:auto;margin:16px 0}
+.formula-box{
+  background:var(--bg3);border:1px solid var(--border);border-radius:10px;
+  padding:20px 24px;margin:16px 0;text-align:center;
+  font-size:1.1em;
+}
+.step-header{
+  display:flex;align-items:center;gap:14px;margin:28px 0 14px;
+}
+.step-num{
+  width:36px;height:36px;border-radius:50%;
+  display:flex;align-items:center;justify-content:center;
+  font-weight:700;font-size:0.95em;color:#fff;flex-shrink:0;
+}
+.step-header h3{font-size:1.15em;font-weight:600}
+.tensor-row{
+  display:flex;align-items:center;gap:10px;margin:8px 0;
+  flex-wrap:wrap;
+}
+table{
+  width:100%;border-collapse:collapse;margin:16px 0;
+  font-size:0.9em;
+}
+th,td{
+  padding:12px 16px;text-align:left;
+  border:1px solid var(--border);
+}
+th{
+  background:var(--bg3);font-weight:600;
+  color:var(--text);white-space:nowrap;
+}
+td{color:var(--text2)}
+tr:hover td{background:rgba(255,255,255,0.02)}
+.dir-header td{
+  background:var(--bg3) !important;font-weight:600;
+  color:var(--text);font-size:0.95em;
+}
+.dir-header td .dir-icon{margin-right:6px}
+td code, th code{
+  font-family:'JetBrains Mono',monospace;font-size:0.88em;
+  background:rgba(255,255,255,0.06);padding:2px 7px;border-radius:4px;
+}
+.cell-gemm{background:rgba(230,126,34,0.1) !important}
+.cell-softmax{background:rgba(41,128,185,0.1) !important}
+.cell-rmsnorm{background:rgba(142,68,173,0.1) !important}
+.cell-na{color:#555 !important;font-style:italic}
+.priority-p0{background:rgba(231,76,60,0.12);border-left:4px solid var(--q)}
+.priority-p1{background:rgba(243,156,18,0.12);border-left:4px solid var(--g)}
+.priority-p2{background:rgba(39,174,96,0.12);border-left:4px solid var(--v)}
+.priority-block{padding:18px 22px;border-radius:10px;margin:14px 0}
+.priority-block h4{margin-bottom:10px;font-size:1em}
+.priority-block ol{padding-left:20px;color:var(--text2);line-height:2.2}
+.priority-block li{font-size:0.93em}
+.badge{
+  display:inline-block;padding:2px 10px;border-radius:12px;
+  font-size:0.78em;font-weight:700;color:#fff;margin-right:6px;
+  vertical-align:middle;
+}
+.badge-p0{background:var(--q)}
+.badge-p1{background:var(--g)}
+.badge-p2{background:var(--v)}
+.spec-table td:first-child{
+  font-weight:500;color:var(--text);white-space:nowrap;width:180px;
+}
+footer{
+  text-align:center;padding:40px 20px 20px;
+  color:var(--text2);font-size:0.88em;
+  border-top:1px solid var(--border);
+  max-width:1100px;margin:60px auto 0;
+}
+footer span{
+  background:linear-gradient(135deg,#e74c3c,#e67e22);
+  -webkit-background-clip:text;-webkit-text-fill-color:transparent;
+  background-clip:text;font-weight:700;
+}
+@media(max-width:768px){
+  .hero{padding:50px 16px 40px}
+  .hero h1{font-size:1.8em}
+  section{margin:20px 12px;padding:22px 18px}
+  .flow-compare{flex-direction:column}
+  table{font-size:0.82em}
+  th,td{padding:8px 10px}
+}
+@media(max-width:480px){
+  .hero h1{font-size:1.4em}
+  .hero .subtitle{font-size:0.95em}
+  section h2{font-size:1.25em}
+}
+</style>
+</head>
+<body>
+
+<!-- ======== HERO ======== -->
+<div class="hero">
+  <h1>CUDA 算子优化项目 — 项目总览</h1>
+  <p class="subtitle">最终文件清单 · 算子版本矩阵 · 构建运行指南 · 后续任务</p>
+</div>
+
+<!-- ======== Section 1: 项目文件清单 ======== -->
+<section style="border-color:var(--q)">
+  <h2><span class="icon">📂</span> 项目文件清单</h2>
+  <p style="color:var(--text2);margin-bottom:18px">全部 <strong style="color:var(--text)">31</strong> 个文件，按目录结构组织</p>
+
+  <div class="matrix-container">
+    <table>
+      <thead>
+        <tr><th style="width:36px">#</th><th>文件</th><th>说明</th></tr>
+      </thead>
+      <tbody>
+        <!-- Root -->
+        <tr class="dir-header"><td colspan="3"><span class="dir-icon">📁</span> <code>/</code> — 项目根目录（3 files）</td></tr>
+        <tr><td>1</td><td><code>README.md</code></td><td>项目总览文档，含算子列表与目标</td></tr>
+        <tr><td>2</td><td><code>CMakeLists.txt</code></td><td>顶层 CMake 配置，统一管理子目录构建</td></tr>
+        <tr><td>3</td><td><code>.gitignore</code></td><td>Git 忽略规则（build/、*.o、编辑器临时文件）</td></tr>
+
+        <!-- common/ -->
+        <tr class="dir-header"><td colspan="3"><span class="dir-icon">📁</span> <code>common/</code> — 公共工具库（4 files）</td></tr>
+        <tr><td>4</td><td><code>common/cuda_utils.h</code></td><td>CUDA 错误检查宏 <code>CUDA_CHECK</code></td></tr>
+        <tr><td>5</td><td><code>common/timer.h</code></td><td>cudaEvent 计时工具，支持 warmup + trimmed mean</td></tr>
+        <tr><td>6</td><td><code>common/matrix_utils.h</code></td><td>矩阵初始化、结果验证工具函数</td></tr>
+        <tr><td>7</td><td><code>common/reduce_utils.h</code></td><td>Warp/Block 级归约模板函数</td></tr>
+
+        <!-- gemm/ -->
+        <tr class="dir-header"><td colspan="3"><span class="dir-icon">📁</span> <code>gemm/</code> — 矩阵乘法算子（8 files）</td></tr>
+        <tr><td>8</td><td><code>gemm/README.md</code></td><td>GEMM 优化文档：逐版本原理分析与性能数据</td></tr>
+        <tr><td>9</td><td><code>gemm/CMakeLists.txt</code></td><td>GEMM 子目录构建配置</td></tr>
+        <tr><td>10</td><td><code>gemm/gemm_v0_naive.cu</code></td><td>朴素三层循环实现，每线程算一个输出元素</td></tr>
+        <tr><td>11</td><td><code>gemm/gemm_v1_tiled_smem.cu</code></td><td>共享内存分块，减少全局内存访问</td></tr>
+        <tr><td>12</td><td><code>gemm/gemm_v2_bank_conflict_free.cu</code></td><td>消除 Bank Conflict + __ldg + unroll</td></tr>
+        <tr><td>13</td><td><code>gemm/gemm_v3_thread_tiling.cu</code></td><td>线程级 4×4 分块，寄存器复用</td></tr>
+        <tr><td>14</td><td><code>gemm/gemm_cublas_ref.cu</code></td><td>cuBLAS 参考实现，性能对比基线</td></tr>
+        <tr><td>15</td><td><code>gemm/benchmark_all.cu</code></td><td>统一跑全部 GEMM 版本 + cuBLAS 对比</td></tr>
+
+        <!-- softmax/ -->
+        <tr class="dir-header"><td colspan="3"><span class="dir-icon">📁</span> <code>softmax/</code> — Softmax 算子（8 files）</td></tr>
+        <tr><td>16</td><td><code>softmax/README.md</code></td><td>Softmax 优化文档：逐版本原理分析与性能数据</td></tr>
+        <tr><td>17</td><td><code>softmax/CMakeLists.txt</code></td><td>Softmax 子目录构建配置</td></tr>
+        <tr><td>18</td><td><code>softmax/softmax_v0_naive.cu</code></td><td>朴素实现：三遍扫描（max → sum → normalize）</td></tr>
+        <tr><td>19</td><td><code>softmax/softmax_v1_shared_mem.cu</code></td><td>共享内存归约，block 级并行</td></tr>
+        <tr><td>20</td><td><code>softmax/softmax_v2_online.cu</code></td><td>Online Softmax：单遍同时计算 max+sum</td></tr>
+        <tr><td>21</td><td><code>softmax/softmax_v3_warp_shuffle.cu</code></td><td>Warp Shuffle + float4 向量化，零共享内存</td></tr>
+        <tr><td>22</td><td><code>softmax/softmax_cudnn_ref.cu</code></td><td>cuDNN 参考实现，性能对比基线</td></tr>
+        <tr><td>23</td><td><code>softmax/benchmark_all.cu</code></td><td>统一跑全部 Softmax 版本 + cuDNN 对比</td></tr>
+
+        <!-- rmsnorm/ -->
+        <tr class="dir-header"><td colspan="3"><span class="dir-icon">📁</span> <code>rmsnorm/</code> — RMSNorm 算子（7 files）</td></tr>
+        <tr><td>24</td><td><code>rmsnorm/README.md</code></td><td>RMSNorm 优化文档：逐版本原理分析与性能数据</td></tr>
+        <tr><td>25</td><td><code>rmsnorm/CMakeLists.txt</code></td><td>RMSNorm 子目录构建配置</td></tr>
+        <tr><td>26</td><td><code>rmsnorm/rmsnorm_v0_naive.cu</code></td><td>朴素实现：逐线程循环累加求 RMS</td></tr>
+        <tr><td>27</td><td><code>rmsnorm/rmsnorm_v1_warp_reduce.cu</code></td><td>Warp Shuffle 归约，warp 级并行</td></tr>
+        <tr><td>28</td><td><code>rmsnorm/rmsnorm_v2_vectorized.cu</code></td><td>float4 向量化加载，128-bit 事务</td></tr>
+        <tr><td>29</td><td><code>rmsnorm/rmsnorm_v3_fused.cu</code></td><td>融合 kernel + __fmul_rn 确定性舍入</td></tr>
+        <tr><td>30</td><td><code>rmsnorm/benchmark_all.cu</code></td><td>统一跑全部 RMSNorm 版本对比</td></tr>
+
+        <!-- docs/ -->
+        <tr class="dir-header"><td colspan="3"><span class="dir-icon">📁</span> <code>docs/</code> — 文档（1 file）</td></tr>
+        <tr><td>31</td><td><code>docs/benchmark_environment.md</code></td><td>基准测试硬件环境与方法论说明</td></tr>
+      </tbody>
+    </table>
+  </div>
+</section>
+
+<!-- ======== Section 2: 算子版本矩阵 ======== -->
+<section style="border-color:var(--s)">
+  <h2><span class="icon">🧮</span> 算子版本矩阵</h2>
+  <p style="color:var(--text2);margin-bottom:18px">三大算子 × 全部优化版本，纵览优化路径</p>
+
+  <div class="matrix-container">
+    <table>
+      <thead>
+        <tr>
+          <th style="width:80px">Version</th>
+          <th style="color:#f5b07a">GEMM</th>
+          <th style="color:#7ec8e3">Softmax</th>
+          <th style="color:#c49be0">RMSNorm</th>
+          <th>核心技术</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td><strong>V0</strong><br><span style="color:var(--text2);font-size:0.82em">Naive</span></td>
+          <td class="cell-gemm">三层循环，每线程计算一个 C[i][j]，全局内存读取 2MNK 次</td>
+          <td class="cell-softmax">三遍扫描：逐行 max → 逐行 exp/sum → 逐行 normalize</td>
+          <td class="cell-rmsnorm">单线程循环累加平方和，串行计算 RMS 并归一化</td>
+          <td>Baseline — 功能正确性验证</td>
+        </tr>
+        <tr>
+          <td><strong>V1</strong><br><span style="color:var(--text2);font-size:0.82em">第一轮优化</span></td>
+          <td class="cell-gemm">Tiled SMEM：TILE×TILE 分块加载到共享内存，数据复用</td>
+          <td class="cell-softmax">Shared Mem Reduce：block 内共享内存树形归约求 max/sum</td>
+          <td class="cell-rmsnorm">Warp Reduce：__shfl_xor_sync warp 级蝶形归约</td>
+          <td>数据复用 / 并行归约</td>
+        </tr>
+        <tr>
+          <td><strong>V2</strong><br><span style="color:var(--text2);font-size:0.82em">第二轮优化</span></td>
+          <td class="cell-gemm">Bank Conflict Free：[TILE][TILE+1] padding + __ldg() + #pragma unroll</td>
+          <td class="cell-softmax">Online Softmax：单遍同时更新 max 与 sum，减少一趟扫描</td>
+          <td class="cell-rmsnorm">Vectorized float4：128-bit 合并内存事务，带宽利用率翻倍</td>
+          <td>消除冲突 / 减少遍数 / 合并访存</td>
+        </tr>
+        <tr>
+          <td><strong>V3</strong><br><span style="color:var(--text2);font-size:0.82em">第三轮优化</span></td>
+          <td class="cell-gemm">Thread Tiling 4×4：每线程 16 个输出，寄存器积累，减少 SMEM 读取</td>
+          <td class="cell-softmax">Warp Shuffle + float4：零共享内存，纯寄存器 + warp 通信</td>
+          <td class="cell-rmsnorm">Fused Kernel + __fmul_rn：融合归约与输出，确定性浮点舍入</td>
+          <td>寄存器复用 / 零 SMEM / 快速数学</td>
+        </tr>
+        <tr>
+          <td><strong>V4</strong><br><span style="color:var(--text2);font-size:0.82em">高级优化</span></td>
+          <td class="cell-gemm">Tensor Core WMMA：wmma::mma_sync 硬件矩阵乘累加</td>
+          <td class="cell-na">—</td>
+          <td class="cell-na">—</td>
+          <td>硬件加速单元</td>
+        </tr>
+        <tr>
+          <td><strong>Ref</strong><br><span style="color:var(--text2);font-size:0.82em">NVIDIA 库</span></td>
+          <td class="cell-gemm">cuBLAS <code>cublasSgemm</code></td>
+          <td class="cell-softmax">cuDNN <code>cudnnSoftmaxForward</code></td>
+          <td class="cell-rmsnorm">cuDNN (自定义参考)</td>
+          <td>Performance Target</td>
+        </tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="info">
+    <strong>颜色说明：</strong>
+    <span style="color:#f5b07a">■ GEMM（橙色）</span> &nbsp;
+    <span style="color:#7ec8e3">■ Softmax（蓝色）</span> &nbsp;
+    <span style="color:#c49be0">■ RMSNorm（紫色）</span>
+    — 每种算子的优化路径相互独立，但核心思想可复用
+  </div>
+</section>
+
+<!-- ======== Section 3: 优化技术速查表 ======== -->
+<section style="border-color:var(--g)">
+  <h2><span class="icon">⚡</span> 优化技术速查表</h2>
+  <p style="color:var(--text2);margin-bottom:18px">本项目涉及的全部 CUDA 优化技术一览</p>
+
+  <div class="matrix-container">
+    <table>
+      <thead>
+        <tr>
+          <th>技术</th>
+          <th>类别</th>
+          <th>使用位置</th>
+          <th>说明</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td><code>Shared Memory Tiling</code></td>
+          <td><span class="flow-node n-blue n-small" style="display:inline-block;margin:0;padding:2px 10px">Memory</span></td>
+          <td>GEMM V1</td>
+          <td>将数据分块加载到共享内存 (SMEM)，在块内多次复用，减少全局内存访问</td>
+        </tr>
+        <tr>
+          <td><code>Bank Conflict Avoidance</code></td>
+          <td><span class="flow-node n-blue n-small" style="display:inline-block;margin:0;padding:2px 10px">Memory</span></td>
+          <td>GEMM V2</td>
+          <td><code>[TILE][TILE+1]</code> padding，错开 bank 映射消除共享内存 bank 冲突</td>
+        </tr>
+        <tr>
+          <td><code>__ldg() Read-Only Cache</code></td>
+          <td><span class="flow-node n-blue n-small" style="display:inline-block;margin:0;padding:2px 10px">Memory</span></td>
+          <td>GEMM V2</td>
+          <td>通过纹理缓存路径读取只读数据，减少 L1 cache 压力</td>
+        </tr>
+        <tr>
+          <td><code>float4 Vectorized Access</code></td>
+          <td><span class="flow-node n-blue n-small" style="display:inline-block;margin:0;padding:2px 10px">Memory</span></td>
+          <td>RMSNorm V2, Softmax V3</td>
+          <td>128-bit 内存事务，单条指令加载 4 个 float，提升带宽利用率</td>
+        </tr>
+        <tr>
+          <td><code>__restrict__</code></td>
+          <td><span class="flow-node n-blue n-small" style="display:inline-block;margin:0;padding:2px 10px">Memory</span></td>
+          <td>All Kernels</td>
+          <td>告诉编译器指针无别名，启用更激进的优化（常量传播、寄存器分配）</td>
+        </tr>
+        <tr>
+          <td><code>#pragma unroll</code></td>
+          <td><span class="flow-node n-orange n-small" style="display:inline-block;margin:0;padding:2px 10px">Compute</span></td>
+          <td>GEMM V2</td>
+          <td>编译器循环展开，消除循环开销，增加指令级并行</td>
+        </tr>
+        <tr>
+          <td><code>Thread-Level Tiling</code></td>
+          <td><span class="flow-node n-orange n-small" style="display:inline-block;margin:0;padding:2px 10px">Compute</span></td>
+          <td>GEMM V3</td>
+          <td>每线程计算 4×4 输出，结果留在寄存器，减少 SMEM 读取次数</td>
+        </tr>
+        <tr>
+          <td><code>Warp Shuffle (__shfl_sync)</code></td>
+          <td><span class="flow-node n-orange n-small" style="display:inline-block;margin:0;padding:2px 10px">Compute</span></td>
+          <td>Softmax V3, RMSNorm V1–V3</td>
+          <td>warp 内线程直接交换寄存器数据，无需 SMEM 中转，延迟更低</td>
+        </tr>
+        <tr>
+          <td><code>Online Algorithm</code></td>
+          <td><span class="flow-node n-green n-small" style="display:inline-block;margin:0;padding:2px 10px">Algorithm</span></td>
+          <td>Softmax V2</td>
+          <td>单遍同时计算 max 和 sum，减少一趟内存扫描（3→2 pass）</td>
+        </tr>
+        <tr>
+          <td><code>Kernel Fusion</code></td>
+          <td><span class="flow-node n-green n-small" style="display:inline-block;margin:0;padding:2px 10px">Algorithm</span></td>
+          <td>RMSNorm V3</td>
+          <td>将归约和输出写入融合到单个 kernel，消除中间全局内存读写</td>
+        </tr>
+        <tr>
+          <td><code>Tensor Core (WMMA)</code></td>
+          <td><span class="flow-node n-red n-small" style="display:inline-block;margin:0;padding:2px 10px">Hardware</span></td>
+          <td>GEMM V4</td>
+          <td>使用 <code>wmma::mma_sync</code> 调用硬件矩阵乘累加单元，吞吐量数量级提升</td>
+        </tr>
+        <tr>
+          <td><code>__fmul_rn Intrinsics</code></td>
+          <td><span class="flow-node n-red n-small" style="display:inline-block;margin:0;padding:2px 10px">Hardware</span></td>
+          <td>RMSNorm V3</td>
+          <td>使用硬件 round-to-nearest 乘法，确保浮点确定性，避免编译器 FMA 合并</td>
+        </tr>
+      </tbody>
+    </table>
+  </div>
+</section>
+
+<!-- ======== Section 4: 构建与运行指南 ======== -->
+<section style="border-color:var(--o)">
+  <h2><span class="icon">🔧</span> 构建与运行指南</h2>
+
+  <div class="step-header">
+    <div class="step-num" style="background:var(--o)">1</div>
+    <h3>构建项目</h3>
+  </div>
+  <div class="code-block">
+    <span class="cmd">mkdir</span> build && <span class="cmd">cd</span> build<br>
+    <span class="cmd">cmake</span> .. <span class="flag">-DCMAKE_CUDA_ARCHITECTURES=120</span><br>
+    <span class="cmd">make</span> <span class="flag">-j$(nproc)</span>
+  </div>
+
+  <div class="step-header">
+    <div class="step-num" style="background:var(--o)">2</div>
+    <h3>运行单个 Kernel（适合 Nsight 逐一分析）</h3>
+  </div>
+  <div class="code-block">
+    <span class="cmd">cd</span> ..  <span class="comment"># 回到项目根目录</span><br>
+    <span class="cmd">./build/bin/gemm_v0_naive</span><br>
+    <span class="cmd">./build/bin/gemm_v2_bank_conflict_free</span><br>
+    <span class="cmd">./build/bin/softmax_v3_warp_shuffle</span><br>
+    <span class="cmd">./build/bin/rmsnorm_v2_vectorized</span>
+  </div>
+
+  <div class="step-header">
+    <div class="step-num" style="background:var(--o)">3</div>
+    <h3>运行对比 Benchmark</h3>
+  </div>
+  <div class="code-block">
+    <span class="cmd">./build/bin/gemm_benchmark_all</span><br>
+    <span class="cmd">./build/bin/softmax_benchmark_all</span><br>
+    <span class="cmd">./build/bin/rmsnorm_benchmark_all</span>
+  </div>
+
+  <div class="step-header">
+    <div class="step-num" style="background:var(--o)">4</div>
+    <h3>Nsight Compute 性能分析</h3>
+  </div>
+  <div class="code-block">
+    <span class="cmd">ncu</span> <span class="flag">--set full</span> <span class="path">./build/bin/gemm_v0_naive</span><br>
+    <span class="cmd">ncu</span> <span class="flag">--set full</span> <span class="path">./build/bin/gemm_v2_bank_conflict_free</span>
+  </div>
+
+  <div class="note">
+    <strong>提示：</strong>使用 <code>ncu</code> 需要 root 权限或在 <code>/etc/modprobe.d/</code> 中配置 <code>NVreg_RestrictProfilingToAdminUsers=0</code>。
+    建议先用 <code>--target-processes all</code> 确认 kernel 可被正确捕获。
+  </div>
+</section>
+
+<!-- ======== Section 5: 后续任务清单 ======== -->
+<section style="border-color:var(--r)">
+  <h2><span class="icon">📋</span> 后续任务清单</h2>
+  <p style="color:var(--text2);margin-bottom:18px">按优先级排列，确保项目完整可展示</p>
+
+  <div class="step-header">
+    <div class="step-num" style="background:var(--q)">P0</div>
+    <h3>必须完成 — 项目可用性</h3>
+  </div>
+  <div class="priority-block priority-p0">
+    <ol>
+      <li>在 RTX 5060 Ti 上运行 <code>benchmark_all</code> → 填充各 README 中的性能表格</li>
+      <li>运行 Nsight Compute 分析 → 截图添加到各算子 README 中</li>
+      <li>填写硬件参数（XX TFLOPS、XX GB/s → 实际测量值）</li>
+      <li>验证全部 kernel 在 GPU 上的正确性（所有版本输出 <code>PASS</code>）</li>
+    </ol>
+  </div>
+
+  <div class="step-header">
+    <div class="step-num" style="background:var(--g)">P1</div>
+    <h3>应该完成 — 项目质量</h3>
+  </div>
+  <div class="priority-block priority-p1">
+    <ol>
+      <li>根据 Nsight 结果微调 kernel 参数（block size、tile size 等）</li>
+      <li>推送到 GitHub：<code>gh repo create cuda-kernel-optimization --public</code></li>
+    </ol>
+  </div>
+
+  <div class="step-header">
+    <div class="step-num" style="background:var(--v)">P2</div>
+    <h3>锦上添花 — 额外亮点</h3>
+  </div>
+  <div class="priority-block priority-p2">
+    <ol>
+      <li>为每个算子添加 Roofline Model 图表到 README</li>
+      <li>实现 Flash Attention 作为 bonus 算子</li>
+      <li>添加 FP16 / BF16 数据类型变体</li>
+    </ol>
+  </div>
+</section>
+
+<!-- ======== Section 6: 硬件环境 ======== -->
+<section style="border-color:var(--k)">
+  <h2><span class="icon">🖥️</span> 硬件环境</h2>
+  <p style="color:var(--text2);margin-bottom:18px">RTX 5060 Ti — Blackwell 架构开发平台</p>
+
+  <div class="matrix-container">
+    <table class="spec-table">
+      <thead>
+        <tr><th>组件</th><th>规格</th></tr>
+      </thead>
+      <tbody>
+        <tr><td>GPU</td><td>NVIDIA GeForce RTX 5060 Ti 16GB</td></tr>
+        <tr><td>Architecture</td><td>Blackwell (<code>sm_120</code>)</td></tr>
+        <tr><td>CUDA Toolkit</td><td>12.9</td></tr>
+        <tr><td>SMs</td><td>36</td></tr>
+        <tr><td>CUDA Cores</td><td>4608</td></tr>
+        <tr><td>VRAM</td><td>16 GB GDDR7</td></tr>
+        <tr><td>L2 Cache</td><td>48 MB</td></tr>
+        <tr><td>Timing Method</td><td><code>cudaEvent</code>，trimmed mean of 10 runs，3 warmup iterations</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="info">
+    <strong>注意：</strong>性能数据均在上述硬件环境下测得。不同 GPU 架构、驱动版本可能导致结果差异。
+    建议使用 <code>nvidia-smi</code> 确认 GPU 状态后再进行基准测试。
+  </div>
+</section>
+
+<!-- ======== Footer ======== -->
+<footer>
+  <span>CUDA 算子优化项目</span> — 项目总览 · Lisha GUO
+</footer>
+
+</body>
+</html>

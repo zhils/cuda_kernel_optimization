@@ -1,0 +1,967 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>CUDA 算子优化项目 — 策略规划指南</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Noto+Sans+SC:wght@300;400;500;700;900&family=JetBrains+Mono:wght@400;500;700&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/katex.min.css">
+<script defer src="https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/katex.min.js"></script>
+<script defer src="https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/contrib/auto-render.min.js"
+  onload="renderMathInElement(document.body, {delimiters:[{left:'$$',right:'$$',display:true},{left:'$',right:'$',display:false}]});"></script>
+<style>
+:root {
+  --q: #6366f1;
+  --k: #f59e0b;
+  --v: #10b981;
+  --g: #22c55e;
+  --s: #3b82f6;
+  --o: #f97316;
+  --r: #ef4444;
+  --beta: #a855f7;
+  --bg: #0f1117;
+  --bg2: #1a1b26;
+  --bg3: #24253a;
+  --fg: #c9d1d9;
+  --fg2: #8b949e;
+  --border: #30363d;
+}
+
+* { margin: 0; padding: 0; box-sizing: border-box; }
+
+body {
+  font-family: 'Noto Sans SC', -apple-system, BlinkMacSystemFont, sans-serif;
+  background: var(--bg);
+  color: var(--fg);
+  line-height: 1.8;
+  -webkit-font-smoothing: antialiased;
+}
+
+.container {
+  max-width: 1100px;
+  margin: 0 auto;
+  padding: 0 2rem 4rem;
+}
+
+/* ---- Hero ---- */
+.hero {
+  text-align: center;
+  padding: 5rem 2rem 4rem;
+  background: linear-gradient(135deg, #0f1117 0%, #1a1040 40%, #162040 70%, #0f1117 100%);
+  border-bottom: 1px solid var(--border);
+  margin-bottom: 3rem;
+}
+
+.hero h1 {
+  font-size: 2.6rem;
+  font-weight: 900;
+  background: linear-gradient(135deg, var(--q), var(--s), var(--beta));
+  -webkit-background-clip: text;
+  -webkit-text-fill-color: transparent;
+  background-clip: text;
+  margin-bottom: 0.6rem;
+  letter-spacing: -0.02em;
+}
+
+.hero .subtitle {
+  font-size: 1.15rem;
+  color: var(--fg2);
+  font-weight: 300;
+  letter-spacing: 0.06em;
+}
+
+/* ---- Sections ---- */
+section {
+  background: var(--bg2);
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  padding: 2.5rem;
+  margin-bottom: 2.5rem;
+  border-left: 4px solid var(--border);
+}
+
+h2 {
+  font-size: 1.55rem;
+  font-weight: 700;
+  margin-bottom: 1.6rem;
+  padding-bottom: 0.7rem;
+  border-bottom: 2px solid var(--border);
+  display: flex;
+  align-items: center;
+  gap: 0.6rem;
+}
+
+h2 .icon { font-size: 1.3rem; }
+
+h3 {
+  font-size: 1.15rem;
+  font-weight: 600;
+  color: var(--fg);
+  margin: 1.6rem 0 0.8rem;
+}
+
+p { margin-bottom: 1rem; color: var(--fg); }
+
+/* ---- Tables ---- */
+table {
+  width: 100%;
+  border-collapse: collapse;
+  margin: 1.2rem 0;
+  font-size: 0.92rem;
+}
+
+thead th {
+  background: var(--bg3);
+  color: var(--fg);
+  font-weight: 600;
+  padding: 0.7rem 1rem;
+  text-align: left;
+  border-bottom: 2px solid var(--border);
+  white-space: nowrap;
+}
+
+tbody td {
+  padding: 0.6rem 1rem;
+  border-bottom: 1px solid var(--border);
+}
+
+tbody tr:nth-child(even) { background: rgba(255,255,255,0.02); }
+tbody tr:hover { background: rgba(99,102,241,0.06); }
+
+td code, th code {
+  font-family: 'JetBrains Mono', monospace;
+  background: var(--bg);
+  padding: 0.15em 0.45em;
+  border-radius: 4px;
+  font-size: 0.88em;
+  color: var(--q);
+}
+
+.stars { color: var(--k); letter-spacing: 1px; }
+
+/* ---- Note & Info Boxes ---- */
+.note {
+  background: rgba(239,68,68,0.08);
+  border-left: 4px solid var(--r);
+  border-radius: 8px;
+  padding: 1.1rem 1.4rem;
+  margin: 1.2rem 0;
+  font-size: 0.93rem;
+  line-height: 1.7;
+}
+
+.note strong { color: var(--r); }
+
+.info {
+  background: rgba(59,130,246,0.08);
+  border-left: 4px solid var(--s);
+  border-radius: 8px;
+  padding: 1.1rem 1.4rem;
+  margin: 1.2rem 0;
+  font-size: 0.93rem;
+  line-height: 1.7;
+}
+
+.info strong { color: var(--s); }
+
+.info-green {
+  background: rgba(34,197,94,0.08);
+  border-left: 4px solid var(--g);
+  border-radius: 8px;
+  padding: 1.1rem 1.4rem;
+  margin: 1.2rem 0;
+  font-size: 0.93rem;
+  line-height: 1.7;
+}
+
+.info-green strong { color: var(--g); }
+
+.info-purple {
+  background: rgba(168,85,247,0.08);
+  border-left: 4px solid var(--beta);
+  border-radius: 8px;
+  padding: 1.1rem 1.4rem;
+  margin: 1.2rem 0;
+  font-size: 0.93rem;
+  line-height: 1.7;
+}
+
+.info-purple strong { color: var(--beta); }
+
+/* ---- Code Block ---- */
+.code-block {
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 1.2rem 1.4rem;
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 0.88rem;
+  line-height: 1.7;
+  overflow-x: auto;
+  margin: 1rem 0;
+  color: var(--fg);
+}
+
+/* ---- Flow Compare ---- */
+.flow-compare {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 1.5rem;
+  margin: 1.5rem 0;
+}
+
+.flow-panel {
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 1.5rem;
+  text-align: center;
+}
+
+.flow-panel h4 {
+  font-size: 1rem;
+  font-weight: 600;
+  margin-bottom: 1rem;
+  padding-bottom: 0.6rem;
+  border-bottom: 1px solid var(--border);
+}
+
+.flow-node {
+  background: var(--bg2);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 0.55rem 1rem;
+  margin: 0.4rem auto;
+  display: inline-block;
+  font-size: 0.88rem;
+  font-weight: 500;
+  min-width: 70%;
+}
+
+.flow-arrow {
+  color: var(--fg2);
+  font-size: 1.1rem;
+  margin: 0.2rem 0;
+}
+
+.n-green { border-color: var(--g); color: var(--g); }
+.n-orange { border-color: var(--o); color: var(--o); }
+.n-red { border-color: var(--r); color: var(--r); }
+.n-blue { border-color: var(--s); color: var(--s); }
+.n-purple { border-color: var(--beta); color: var(--beta); }
+.n-indigo { border-color: var(--q); color: var(--q); }
+
+.flow-panel.panel-highlight-green { border-color: var(--g); }
+.flow-panel.panel-highlight-orange { border-color: var(--o); }
+.flow-panel.panel-highlight-red { border-color: var(--r); }
+
+/* ---- Step Header ---- */
+.step-header {
+  display: flex;
+  align-items: center;
+  gap: 0.9rem;
+  margin: 1.8rem 0 0.8rem;
+}
+
+.step-num {
+  width: 36px;
+  height: 36px;
+  border-radius: 50%;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-weight: 700;
+  font-size: 1rem;
+  color: #fff;
+  flex-shrink: 0;
+}
+
+.step-header h3 {
+  margin: 0;
+  font-size: 1.1rem;
+}
+
+.step-eval {
+  font-size: 0.88rem;
+  color: var(--fg2);
+  margin-left: auto;
+  font-weight: 500;
+  white-space: nowrap;
+}
+
+/* ---- Formula Box ---- */
+.formula-box {
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 1.5rem 2rem;
+  margin: 1.2rem 0;
+  text-align: center;
+  font-size: 1.1rem;
+}
+
+.formula-box .label {
+  font-size: 0.82rem;
+  color: var(--fg2);
+  margin-top: 0.6rem;
+}
+
+/* ---- Matrix Container (Tier Grid) ---- */
+.matrix-container {
+  margin: 1.5rem 0;
+}
+
+.matrix-grid {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 1.2rem;
+  margin: 1rem 0;
+}
+
+.matrix-cell {
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 1.3rem;
+  border-top: 3px solid var(--border);
+}
+
+.matrix-cell h4 {
+  font-size: 1rem;
+  font-weight: 700;
+  margin-bottom: 0.6rem;
+}
+
+.matrix-cell ul {
+  list-style: none;
+  padding: 0;
+}
+
+.matrix-cell ul li {
+  padding: 0.3rem 0;
+  font-size: 0.9rem;
+  color: var(--fg);
+  border-bottom: 1px solid rgba(255,255,255,0.04);
+}
+
+.matrix-cell ul li:last-child { border-bottom: none; }
+
+.tier-green { border-top-color: var(--g); }
+.tier-green h4 { color: var(--g); }
+
+.tier-yellow { border-top-color: var(--k); }
+.tier-yellow h4 { color: var(--k); }
+
+.tier-gray { border-top-color: var(--fg2); }
+.tier-gray h4 { color: var(--fg2); }
+
+/* ---- Vertical Flow ---- */
+.opt-roadmap {
+  margin: 1.5rem 0;
+}
+
+.opt-flow {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 0.4rem;
+  margin: 0.8rem 0;
+}
+
+.opt-node {
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 0.5rem 1rem;
+  font-size: 0.85rem;
+  font-weight: 500;
+  text-align: center;
+  min-width: 120px;
+}
+
+.opt-node .version {
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 0.75rem;
+  color: var(--fg2);
+  display: block;
+  margin-bottom: 0.15rem;
+}
+
+.opt-node .tech {
+  font-size: 0.78rem;
+  color: var(--fg2);
+  display: block;
+  margin-top: 0.2rem;
+}
+
+.opt-arrow {
+  color: var(--fg2);
+  font-size: 1.1rem;
+  flex-shrink: 0;
+}
+
+.opt-node.highlight-q { border-color: var(--q); }
+.opt-node.highlight-q .version { color: var(--q); }
+.opt-node.highlight-s { border-color: var(--s); }
+.opt-node.highlight-s .version { color: var(--s); }
+.opt-node.highlight-g { border-color: var(--g); }
+.opt-node.highlight-g .version { color: var(--g); }
+
+/* ---- Checklist ---- */
+.checklist {
+  list-style: none;
+  padding: 0;
+  margin: 1rem 0;
+}
+
+.checklist li {
+  padding: 0.55rem 0;
+  padding-left: 1.8rem;
+  position: relative;
+  font-size: 0.93rem;
+  border-bottom: 1px solid rgba(255,255,255,0.04);
+}
+
+.checklist li:last-child { border-bottom: none; }
+
+.checklist li::before {
+  content: '';
+  position: absolute;
+  left: 0;
+  top: 0.75rem;
+  width: 10px;
+  height: 10px;
+  border-radius: 3px;
+  border: 2px solid var(--g);
+  background: transparent;
+}
+
+/* ---- Footer ---- */
+footer {
+  text-align: center;
+  padding: 3rem 2rem;
+  color: var(--fg2);
+  font-size: 0.88rem;
+  border-top: 1px solid var(--border);
+  margin-top: 2rem;
+}
+
+footer span {
+  background: linear-gradient(135deg, var(--q), var(--beta));
+  -webkit-background-clip: text;
+  -webkit-text-fill-color: transparent;
+  background-clip: text;
+  font-weight: 600;
+}
+
+/* ---- Responsive ---- */
+@media (max-width: 768px) {
+  .hero h1 { font-size: 1.8rem; }
+  .container { padding: 0 1rem 3rem; }
+  section { padding: 1.5rem; }
+  .flow-compare { grid-template-columns: 1fr; }
+  .matrix-grid { grid-template-columns: 1fr; }
+  .opt-flow { flex-direction: column; }
+  .opt-arrow { transform: rotate(90deg); }
+}
+</style>
+</head>
+<body>
+
+<!-- ============ HERO ============ -->
+<div class="hero">
+  <h1>CUDA 算子优化项目 — 策略规划指南</h1>
+  <p class="subtitle">算子选择 · 亮点评估 · 优先级裁剪 · 面试展示策略</p>
+</div>
+
+<div class="container">
+
+<!-- ============ SECTION 1: 算子选择总览 ============ -->
+<section style="border-left-color: var(--q);">
+  <h2 style="border-bottom-color: var(--q);"><span class="icon">📋</span> Section 1 · 算子选择总览</h2>
+
+  <p>从 10 个候选算子中，根据<strong>优化复杂度</strong>和<strong>面试影响力</strong>两个维度进行评估和筛选：</p>
+
+  <table>
+    <thead>
+      <tr>
+        <th>#</th>
+        <th>算子</th>
+        <th>类别</th>
+        <th>瓶颈类型</th>
+        <th>优化复杂度</th>
+        <th>面试影响力</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>1</td>
+        <td><code>add</code></td>
+        <td>Elementwise</td>
+        <td>Memory-bound</td>
+        <td><span class="stars">★</span></td>
+        <td><span class="stars">★</span></td>
+      </tr>
+      <tr>
+        <td>2</td>
+        <td><code>gelu</code></td>
+        <td>Elementwise</td>
+        <td>Memory-bound</td>
+        <td><span class="stars">★★</span></td>
+        <td><span class="stars">★★★</span></td>
+      </tr>
+      <tr>
+        <td>3</td>
+        <td><code>rmsnorm</code></td>
+        <td>Normalization</td>
+        <td>Memory-bound</td>
+        <td><span class="stars">★★★</span></td>
+        <td><span class="stars">★★★★★</span></td>
+      </tr>
+      <tr>
+        <td>4</td>
+        <td><code>conv2d</code></td>
+        <td>Convolution</td>
+        <td>Compute-bound</td>
+        <td><span class="stars">★★★★★</span></td>
+        <td><span class="stars">★★★</span></td>
+      </tr>
+      <tr>
+        <td>5</td>
+        <td><code>adaptive_avgpool</code></td>
+        <td>Pooling</td>
+        <td>Memory-bound</td>
+        <td><span class="stars">★★</span></td>
+        <td><span class="stars">★★</span></td>
+      </tr>
+      <tr>
+        <td>6</td>
+        <td><code>gemm</code></td>
+        <td>BLAS</td>
+        <td>Compute-bound</td>
+        <td><span class="stars">★★★★★</span></td>
+        <td><span class="stars">★★★★★</span></td>
+      </tr>
+      <tr>
+        <td>7</td>
+        <td><code>argmax</code></td>
+        <td>Reduction</td>
+        <td>Memory-bound</td>
+        <td><span class="stars">★★</span></td>
+        <td><span class="stars">★★</span></td>
+      </tr>
+      <tr>
+        <td>8</td>
+        <td><code>softmax</code></td>
+        <td>Normalization</td>
+        <td>Memory-bound</td>
+        <td><span class="stars">★★★★</span></td>
+        <td><span class="stars">★★★★★</span></td>
+      </tr>
+      <tr>
+        <td>9</td>
+        <td><code>topk</code></td>
+        <td>Selection</td>
+        <td>Memory-bound</td>
+        <td><span class="stars">★★★</span></td>
+        <td><span class="stars">★★★</span></td>
+      </tr>
+      <tr>
+        <td>10</td>
+        <td><code>embedding</code></td>
+        <td>Lookup</td>
+        <td>Memory-bound</td>
+        <td><span class="stars">★</span></td>
+        <td><span class="stars">★</span></td>
+      </tr>
+    </tbody>
+  </table>
+
+  <h3>广度优先 vs 深度优先</h3>
+
+  <div class="flow-compare">
+    <div class="flow-panel panel-highlight-orange">
+      <h4 style="color: var(--o);">❌ 广度优先（10 个算子）</h4>
+      <div class="flow-node">Input: 10 个算子</div>
+      <div class="flow-arrow">↓</div>
+      <div class="flow-node">每个算子 1 个 Naive Kernel</div>
+      <div class="flow-arrow">↓</div>
+      <div class="flow-node">无 Profiling，无对比</div>
+      <div class="flow-arrow">↓</div>
+      <div class="flow-node n-orange">面试官印象：<strong>"学习者"</strong></div>
+    </div>
+    <div class="flow-panel panel-highlight-green">
+      <h4 style="color: var(--g);">✅ 深度优先（3 个算子）</h4>
+      <div class="flow-node">Input: 3 个核心算子</div>
+      <div class="flow-arrow">↓</div>
+      <div class="flow-node n-green">每个算子 3–5 个渐进优化版本</div>
+      <div class="flow-arrow">↓</div>
+      <div class="flow-node n-green">Nsight Compute 深度分析</div>
+      <div class="flow-arrow">↓</div>
+      <div class="flow-node n-green">vs cuBLAS / cuDNN 性能对比</div>
+      <div class="flow-arrow">↓</div>
+      <div class="flow-node n-green">面试官印象：<strong>"工程师"</strong></div>
+    </div>
+  </div>
+</section>
+
+<!-- ============ SECTION 2: 四大亮点评估 ============ -->
+<section style="border-left-color: var(--s);">
+  <h2 style="border-bottom-color: var(--s);"><span class="icon">🎯</span> Section 2 · 四大亮点评估</h2>
+
+  <p>项目预设了四大亮点目标，逐一评估其可行性与面试价值：</p>
+
+  <!-- Highlight 1 -->
+  <div class="step-header">
+    <div class="step-num" style="background: var(--r);">1</div>
+    <h3>"比 NVIDIA 官方性能更快"</h3>
+    <span class="step-eval" style="color: var(--r);">⚠️ 风险高，需精准选择目标</span>
+  </div>
+
+  <div class="note">
+    <strong>⚠️ 现实评估：</strong><br>
+    <strong>cuBLAS GEMM</strong> 经过数十年工程优化，包含汇编级调优和硬件特定路径，几乎不可能在通用场景下超越。<br><br>
+    但是，<strong>Memory-bound 算子</strong>（如 GELU、RMSNorm）在<strong>特定 shape</strong> 下可以超越 cuDNN 的通用实现，因为 cuDNN 需要支持大量配置的通用性开销。<br><br>
+    <strong>建议调整表述：</strong>"针对特定 shape，在 memory-bound 算子上达到或超越 cuDNN 通用实现"，而非声称 "比 NVIDIA 更快"。
+  </div>
+
+  <!-- Highlight 2 -->
+  <div class="step-header">
+    <div class="step-num" style="background: var(--g);">2</div>
+    <h3>"Nsight 分析算子性能卡点"</h3>
+    <span class="step-eval" style="color: var(--g);">✅ 核心考察点，非常好</span>
+  </div>
+
+  <div class="info">
+    <strong>📊 面试中展示什么：</strong><br>
+    <ul style="margin: 0.5rem 0 0 1.2rem; list-style: disc;">
+      <li><strong>Warp Stall 分析</strong> — 识别 stall 原因（Long Scoreboard、MIO Throttle、Barrier 等）</li>
+      <li><strong>Memory Throughput</strong> — L1/L2/DRAM 带宽利用率，Global Load Efficiency</li>
+      <li><strong>Compute Utilization</strong> — SM 活跃度、指令吞吐（FMA pipe vs 其他）</li>
+      <li><strong>Occupancy</strong> — Achieved vs Theoretical Occupancy，及其限制因素（registers / shared memory）</li>
+    </ul>
+  </div>
+
+  <!-- Highlight 3 -->
+  <div class="step-header">
+    <div class="step-num" style="background: var(--o);">3</div>
+    <h3>"评估算子理论性能上限"</h3>
+    <span class="step-eval" style="color: var(--o);">✅ 非常好</span>
+  </div>
+
+  <p>基于 <strong>Roofline Model</strong>，通过计算算子的 <strong>Arithmetic Intensity</strong> 判断其瓶颈类型，并计算理论性能天花板：</p>
+
+  <div class="formula-box">
+    $$\text{Arithmetic Intensity} = \frac{\text{FLOPs}}{\text{Bytes Accessed}}$$
+    <div class="label">
+      若 AI &lt; Machine Balance Point → Memory-bound；否则 → Compute-bound
+    </div>
+  </div>
+
+  <div class="info-green">
+    <strong>💡 关键操作：</strong>每个算子的 README 中应包含 Roofline 分析，明确写出：FLOPs 计算量、内存访问量、Arithmetic Intensity、理论峰值性能，以及当前实现达到理论峰值的百分比。
+  </div>
+
+  <!-- Highlight 4 -->
+  <div class="step-header">
+    <div class="step-num" style="background: var(--s);">4</div>
+    <h3>"PTX / SASS / TensorRT 指令分析"</h3>
+    <span class="step-eval" style="color: var(--s);">💎 差异化亮点</span>
+  </div>
+
+  <div class="note" style="border-left-color: var(--beta); background: rgba(168,85,247,0.08);">
+    <strong style="color: var(--beta);">🔬 差异化建议：</strong><br>
+    大多数候选人停留在 CUDA C++ 层面。如果你能在面试中展示：
+    <ul style="margin: 0.5rem 0 0 1.2rem; list-style: disc;">
+      <li>使用 <code>cuobjdump --dump-sass</code> 查看实际执行的机器指令</li>
+      <li>对比不同优化版本的 SASS 指令数量和类型差异</li>
+      <li>解释 <code>LDG.E.128</code>（向量化加载）vs <code>LDG.E</code>（标量加载）的区别</li>
+      <li>展示 Tensor Core 指令（<code>HMMA</code>）在 V4 版本中的出现</li>
+    </ul>
+    这将显著区分你与其他候选人，展示底层硬件理解能力。
+  </div>
+
+</section>
+
+<!-- ============ SECTION 3: 三级优先级裁剪 ============ -->
+<section style="border-left-color: var(--r);">
+  <h2 style="border-bottom-color: var(--r);"><span class="icon">✂️</span> Section 3 · 三级优先级裁剪</h2>
+
+  <p>将 10 个算子按面试投入产出比裁剪为三个优先级层：</p>
+
+  <div class="matrix-container">
+    <div class="matrix-grid">
+      <div class="matrix-cell tier-green">
+        <h4>🟢 Tier 1 · 必做</h4>
+        <ul>
+          <li><code>GEMM</code> — Compute-bound 典型</li>
+          <li><code>Softmax</code> — Memory-bound，算法优化</li>
+          <li><code>RMSNorm</code> — LLM 核心算子</li>
+        </ul>
+      </div>
+      <div class="matrix-cell tier-yellow">
+        <h4>🟡 Tier 2 · 应做</h4>
+        <ul>
+          <li><code>GELU</code> — Elementwise 优化代表</li>
+          <li><code>TopK / ArgMax</code> — Reduction 模式</li>
+        </ul>
+      </div>
+      <div class="matrix-cell tier-gray">
+        <h4>⚪ Tier 3 · 可砍</h4>
+        <ul>
+          <li><code>Add</code> — 过于简单</li>
+          <li><code>Conv2D</code> — 过于复杂，ROI 低</li>
+          <li><code>Adaptive AvgPool</code> — 优化空间小</li>
+          <li><code>Embedding</code> — 优化空间小</li>
+        </ul>
+      </div>
+    </div>
+  </div>
+
+  <h3>Tier 1 详细选择依据</h3>
+
+  <table>
+    <thead>
+      <tr>
+        <th>算子</th>
+        <th>为何入选</th>
+        <th>优化路径</th>
+        <th>面试考察重点</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td><code>GEMM</code></td>
+        <td>深度学习基石，Compute-bound 代表；展示 Shared Memory、Bank Conflict、Thread Tiling、Tensor Core 全栈能力</td>
+        <td>Naive → Tiled SMEM → Bank Conflict Free → Thread Tiling → Tensor Core</td>
+        <td>内存层级、数据重用、Tensor Core 编程</td>
+      </tr>
+      <tr>
+        <td><code>Softmax</code></td>
+        <td>Attention 核心组件；涉及 Online Algorithm，数值稳定性，Warp 级 Reduction</td>
+        <td>Naive 3-pass → Shared Mem Reduce → Online Softmax → Warp Shuffle</td>
+        <td>算法创新（Online Softmax）、数值稳定性</td>
+      </tr>
+      <tr>
+        <td><code>RMSNorm</code></td>
+        <td>LLM 标配（LLaMA / GPT 系列）；Memory-bound 优化典型，向量化 + Warp Reduce</td>
+        <td>Naive → Warp Reduce → Vectorized float4 → Fused Kernel</td>
+        <td>Memory-bound 优化、向量化访存、Kernel Fusion</td>
+      </tr>
+    </tbody>
+  </table>
+
+</section>
+
+<!-- ============ SECTION 4: 每个核心算子的优化路线 ============ -->
+<section style="border-left-color: var(--g);">
+  <h2 style="border-bottom-color: var(--g);"><span class="icon">🗺️</span> Section 4 · 每个核心算子的优化路线</h2>
+
+  <p>每个 Tier 1 算子的渐进优化路径：每一步针对性解决前一版本中 Nsight 识别出的瓶颈。</p>
+
+  <!-- GEMM -->
+  <h3 style="color: var(--q);">GEMM（General Matrix Multiply）</h3>
+  <div class="opt-roadmap">
+    <div class="opt-flow">
+      <div class="opt-node highlight-q">
+        <span class="version">V0</span>
+        Naive
+        <span class="tech">1 thread / element</span>
+      </div>
+      <div class="opt-arrow">→</div>
+      <div class="opt-node highlight-q">
+        <span class="version">V1</span>
+        Tiled SMEM
+        <span class="tech">16×16 tile, data reuse</span>
+      </div>
+      <div class="opt-arrow">→</div>
+      <div class="opt-node highlight-q">
+        <span class="version">V2</span>
+        Bank Conflict Free
+        <span class="tech">+1 padding, __ldg</span>
+      </div>
+      <div class="opt-arrow">→</div>
+      <div class="opt-node highlight-q">
+        <span class="version">V3</span>
+        Thread Tiling
+        <span class="tech">4×4 per thread, register reuse</span>
+      </div>
+      <div class="opt-arrow">→</div>
+      <div class="opt-node highlight-q">
+        <span class="version">V4</span>
+        Tensor Core
+        <span class="tech">WMMA API, fp32 acc</span>
+      </div>
+    </div>
+  </div>
+
+  <div class="info">
+    <strong>🔑 GEMM 核心叙事线：</strong>从 "每个线程独立计算" 到 "利用内存层级" 到 "利用专用硬件"——展示你理解 GPU 架构的多个层次。
+  </div>
+
+  <!-- Softmax -->
+  <h3 style="color: var(--s);">Softmax</h3>
+  <div class="opt-roadmap">
+    <div class="opt-flow">
+      <div class="opt-node highlight-s">
+        <span class="version">V0</span>
+        Naive 3-pass
+        <span class="tech">max → sub+exp → sum → div</span>
+      </div>
+      <div class="opt-arrow">→</div>
+      <div class="opt-node highlight-s">
+        <span class="version">V1</span>
+        Shared Mem Reduce
+        <span class="tech">Block-level parallel reduction</span>
+      </div>
+      <div class="opt-arrow">→</div>
+      <div class="opt-node highlight-s">
+        <span class="version">V2</span>
+        Online Softmax
+        <span class="tech">Single-pass (Milakov 2018)</span>
+      </div>
+      <div class="opt-arrow">→</div>
+      <div class="opt-node highlight-s">
+        <span class="version">V3</span>
+        Warp Shuffle + Vec
+        <span class="tech">__shfl_sync, float4</span>
+      </div>
+    </div>
+  </div>
+
+  <div class="info">
+    <strong>🔑 Softmax 核心叙事线：</strong>从 "多次遍历数据" 到 "单次遍历"——展示算法层面的优化思维（Online Softmax 论文理解），以及 Warp 级原语掌握。
+  </div>
+
+  <!-- RMSNorm -->
+  <h3 style="color: var(--g);">RMSNorm</h3>
+  <div class="opt-roadmap">
+    <div class="opt-flow">
+      <div class="opt-node highlight-g">
+        <span class="version">V0</span>
+        Naive
+        <span class="tech">1 thread per row</span>
+      </div>
+      <div class="opt-arrow">→</div>
+      <div class="opt-node highlight-g">
+        <span class="version">V1</span>
+        Warp Reduce
+        <span class="tech">__shfl_sync for sq_sum</span>
+      </div>
+      <div class="opt-arrow">→</div>
+      <div class="opt-node highlight-g">
+        <span class="version">V2</span>
+        Vectorized float4
+        <span class="tech">float4 loads + cross-warp</span>
+      </div>
+      <div class="opt-arrow">→</div>
+      <div class="opt-node highlight-g">
+        <span class="version">V3</span>
+        Fused Kernel
+        <span class="tech">All threads write, __fmul_rn</span>
+      </div>
+    </div>
+  </div>
+
+  <div class="info-green">
+    <strong>🔑 RMSNorm 核心叙事线：</strong>从 "简单但低效" 到 "榨干内存带宽"——展示 Memory-bound 优化的系统方法，包括向量化访存和 Warp 级协作。
+  </div>
+
+</section>
+
+<!-- ============ SECTION 5: 面试展示策略 ============ -->
+<section style="border-left-color: var(--o);">
+  <h2 style="border-bottom-color: var(--o);"><span class="icon">🎤</span> Section 5 · 面试展示策略</h2>
+
+  <p>每个核心算子的 README 应当包含以下 <strong>5 个要素</strong>，形成完整的工程叙事：</p>
+
+  <ol class="checklist">
+    <li><strong>数学公式 + 理论性能分析 (Roofline)</strong> — 明确算子的 FLOPs、Bytes、AI、瓶颈类型和理论峰值</li>
+    <li><strong>3–5 个渐进优化版本</strong> — 每一步由 Profiling 数据驱动，不是盲目优化</li>
+    <li><strong>Nsight Compute 分析截图</strong> — 对比各版本的 Warp Stall、Memory Throughput、Occupancy</li>
+    <li><strong>vs cuBLAS / cuDNN 性能对比</strong> — 图表展示你的实现与工业标准的差距（或超越）</li>
+    <li><strong>达到理论峰值的百分比</strong> — 量化优化效果："V3 达到 DRAM 理论带宽的 87%"</li>
+  </ol>
+
+  <div class="info" style="border-left-color: var(--o); background: rgba(249,115,22,0.08);">
+    <strong style="color: var(--o);">🎯 核心原则：</strong><br>
+    "面试官想看到的是你<strong>解决问题的思路和深度</strong>，而不是你实现了多少个算子。"<br><br>
+    3 个深度优化过的算子，配合 Nsight 分析和理论性能评估，远胜 10 个 Naive 实现。展示你是一个能<strong>系统性分析和优化性能瓶颈</strong>的工程师，而不是一个只会写 CUDA kernel 的编码者。
+  </div>
+
+  <h3>面试叙事模板</h3>
+  <div class="code-block">
+"我选择了 GEMM / Softmax / RMSNorm 三个算子进行深度优化。
+
+以 GEMM 为例，V0 的 Naive 实现只达到 cuBLAS 的 X%。
+通过 Nsight 分析，我发现主要瓶颈是 Global Memory 延迟。
+
+V1 通过 Shared Memory Tiling 实现数据重用，性能提升了 Yx。
+但 Nsight 显示存在 Bank Conflict，导致 SMEM 利用率只有 Z%。
+
+V2 通过 +1 padding 消除 Bank Conflict ...
+V3 通过 Thread Tiling 增加寄存器重用 ...
+V4 使用 Tensor Core WMMA API 达到 cuBLAS 的 W%。
+
+最终 V4 在 M=N=K=4096 的 case 下达到理论 FLOPS 峰值的 P%。"
+  </div>
+
+</section>
+
+<!-- ============ SECTION 6: 额外加分项 ============ -->
+<section style="border-left-color: var(--beta);">
+  <h2 style="border-bottom-color: var(--beta);"><span class="icon">🚀</span> Section 6 · 额外加分项</h2>
+
+  <h3 style="color: var(--beta);">Flash Attention / Fused Attention</h3>
+
+  <p>如果时间允许，实现一个简化版的 <strong>Flash Attention</strong> 作为加分项目。这是当前 LLM 推理 / 训练中最关键的融合算子之一。</p>
+
+  <div class="info-purple">
+    <strong>💎 为什么 Flash Attention 是终极加分项：</strong>
+    <ul style="margin: 0.5rem 0 0 1.2rem; list-style: disc;">
+      <li><strong>融合了多个核心算子</strong> — GEMM + Softmax + Mask + Dropout 在一个 kernel 中完成</li>
+      <li><strong>算法创新</strong> — Online Softmax + Tiling 避免 $O(N^2)$ 中间结果的显存占用</li>
+      <li><strong>工程复杂度高</strong> — 需要精确的 Shared Memory 管理、寄存器分配和流水线设计</li>
+      <li><strong>直接关联工业实践</strong> — FlashAttention 论文（Dao et al.）是 LLM 推理优化的基石</li>
+    </ul>
+  </div>
+
+  <p>建议的实现路径：</p>
+  <div class="opt-roadmap">
+    <div class="opt-flow">
+      <div class="opt-node n-purple" style="border-color: var(--beta);">
+        <span class="version" style="color: var(--beta);">Step 1</span>
+        Standard Attention
+        <span class="tech">Q·K^T → Softmax → ·V</span>
+      </div>
+      <div class="opt-arrow">→</div>
+      <div class="opt-node n-purple" style="border-color: var(--beta);">
+        <span class="version" style="color: var(--beta);">Step 2</span>
+        Tiled / Blocked
+        <span class="tech">避免 N×N 显存分配</span>
+      </div>
+      <div class="opt-arrow">→</div>
+      <div class="opt-node n-purple" style="border-color: var(--beta);">
+        <span class="version" style="color: var(--beta);">Step 3</span>
+        Flash Attention
+        <span class="tech">Online Softmax + Tiling</span>
+      </div>
+    </div>
+  </div>
+
+  <div class="note" style="border-left-color: var(--k); background: rgba(245,158,11,0.08);">
+    <strong style="color: var(--k);">⏰ 优先级提醒：</strong>Flash Attention 是<strong>加分项</strong>，不是必做项。确保 Tier 1 的三个算子（GEMM、Softmax、RMSNorm）已经完成深度优化后，再考虑此项。追求广度不如追求深度。
+  </div>
+</section>
+
+</div>
+
+<!-- ============ FOOTER ============ -->
+<footer>
+  <span>CUDA 算子优化项目 — 策略规划指南</span> · Lisha GUO
+</footer>
+
+</body>
+</html>

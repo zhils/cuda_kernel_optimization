@@ -1,0 +1,39 @@
+# Build artifacts
+build/
+*.o
+*.exe
+*.out
+*.obj
+
+# CMake
+CMakeFiles/
+CMakeCache.txt
+cmake_install.cmake
+Makefile
+*.cmake
+
+# Auto-generated data
+data/
+*.csv
+*.dat
+*.npy
+
+# Nsight profiling output (large binary files)
+*.ncu-rep
+*.nsys-rep
+*.sqlite
+
+# IDE
+.vs/
+.vscode/
+*.user
+*.suo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Temporary
+*.tmp
+*.swp
+*~

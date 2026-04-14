@@ -1,0 +1,81 @@
+#include <cuda_runtime.h>
+
+#include <chrono>
+#include <cmath>
+#include <filesystem>
+#include <fstream>
+#include <vector>
+
+#include "common/benchmark.h"
+#include "common/cuda_utils.h"
+
+__global__ void RMSNormKernel(const float* x, float* y, const float* weight, int rows, int cols, float eps) {
+  int r = blockIdx.x * blockDim.x + threadIdx.x;
+  if (r >= rows) return;
+  float sq_sum = 0.f;
+  for (int c = 0; c < cols; ++c) {
+    float val = x[r * cols + c];
+    sq_sum += val * val;
+  }
+  float rms = rsqrtf(sq_sum / cols + eps);
+  for (int c = 0; c < cols; ++c) {
+    y[r * cols + c] = x[r * cols + c] * rms * weight[c];
+  }
+}
+
+static void RMSNormCPU(const float* x, float* y, const float* weight, int rows, int cols, float eps) {
+  for (int r = 0; r < rows; ++r) {
+    float sq_sum = 0.f;
+    for (int c = 0; c < cols; ++c) {
+      float val = x[r * cols + c];
+      sq_sum += val * val;
+    }
+    float rms = 1.f / sqrtf(sq_sum / cols + eps);
+    for (int c = 0; c < cols; ++c) {
+      y[r * cols + c] = x[r * cols + c] * rms * weight[c];
+    }
+  }
+}
+
+int main() {
+  constexpr float kEps = 1e-5f;
+  auto cs = common::LoadOrCreateTestCasesCsv("data/rmsnorm/test_cases.csv");
+  std::filesystem::create_directories("data/results");
+  std::ofstream ofs("data/results/rmsnorm_naive_results.csv");
+  ofs << "id,group,rows,cols,cpu_ms,gpu_ms,speedup,max_abs_diff,check\n";
+  for (size_t i = 0; i < cs.size(); ++i) {
+    int rows = cs[i].rows, cols = cs[i].cols, n = rows * cols;
+    std::vector<float> x(n), cpu(n), gpu(n), weight(cols);
+    common::InitMatrix(x, rows, cols);
+    common::InitMatrix(weight, 1, cols);
+    auto t0 = std::chrono::high_resolution_clock::now();
+    RMSNormCPU(x.data(), cpu.data(), weight.data(), rows, cols, kEps);
+    auto t1 = std::chrono::high_resolution_clock::now();
+    double cpu_ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
+    float *dx, *dy, *dweight;
+    CHECK_CUDA(cudaMalloc(&dx, n * sizeof(float)));
+    CHECK_CUDA(cudaMalloc(&dy, n * sizeof(float)));
+    CHECK_CUDA(cudaMalloc(&dweight, cols * sizeof(float)));
+    CHECK_CUDA(cudaMemcpy(dx, x.data(), n * sizeof(float), cudaMemcpyHostToDevice));
+    CHECK_CUDA(cudaMemcpy(dweight, weight.data(), cols * sizeof(float), cudaMemcpyHostToDevice));
+    cudaEvent_t s, e;
+    CHECK_CUDA(cudaEventCreate(&s));
+    CHECK_CUDA(cudaEventCreate(&e));
+    CHECK_CUDA(cudaEventRecord(s));
+    RMSNormKernel<<<(rows + 255) / 256, 256>>>(dx, dy, dweight, rows, cols, kEps);
+    CHECK_CUDA(cudaEventRecord(e));
+    CHECK_CUDA(cudaEventSynchronize(e));
+    float gpu_ms = 0.f;
+    CHECK_CUDA(cudaEventElapsedTime(&gpu_ms, s, e));
+    CHECK_CUDA(cudaMemcpy(gpu.data(), dy, n * sizeof(float), cudaMemcpyDeviceToHost));
+    ofs << i << "," << cs[i].group << "," << rows << "," << cols << "," << cpu_ms << "," << gpu_ms << ","
+        << (gpu_ms > 0 ? cpu_ms / gpu_ms : 0) << ","
+        << common::MaxAbsDiff(cpu, gpu) << "," << (common::CheckEqual(cpu, gpu, 1e-4f) ? "PASS" : "FAIL") << "\n";
+    CHECK_CUDA(cudaEventDestroy(s));
+    CHECK_CUDA(cudaEventDestroy(e));
+    CHECK_CUDA(cudaFree(dx));
+    CHECK_CUDA(cudaFree(dy));
+    CHECK_CUDA(cudaFree(dweight));
+  }
+  return 0;
+}
