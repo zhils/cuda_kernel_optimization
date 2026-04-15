@@ -251,69 +251,14 @@ static double RunCudnnRMSNorm(const float* h_x,
                                const float* h_weight,
                                float* h_y,
                                int rows, int cols) {
-    cudnnHandle_t cudnn;
-    CHECK_CUDNN(cudnnCreate(&cudnn));
-
-    int n = rows * cols;
-
-    float *d_x, *d_y, *d_weight, *d_var;
-    CHECK_CUDA(cudaMalloc(&d_x, n * sizeof(float)));
-    CHECK_CUDA(cudaMalloc(&d_y, n * sizeof(float)));
-    CHECK_CUDA(cudaMalloc(&d_weight, cols * sizeof(float)));
-    CHECK_CUDA(cudaMalloc(&d_var, rows * sizeof(float)));
-
-    CHECK_CUDA(cudaMemcpy(d_x, h_x, n * sizeof(float), cudaMemcpyHostToDevice));
-    CHECK_CUDA(cudaMemcpy(d_weight, h_weight, cols * sizeof(float), cudaMemcpyHostToDevice));
-
-    cudnnTensorDescriptor_t x_desc, y_desc;
-    CHECK_CUDNN(cudnnCreateTensorDescriptor(&x_desc));
-    CHECK_CUDNN(cudnnCreateTensorDescriptor(&y_desc));
-
-    CHECK_CUDNN(cudnnSetTensorDescriptorFromCudnnContiguous(x_desc, CUDNN_DATA_FLOAT, 4,
-        (int[]){rows, cols, cols, 1}));
-    CHECK_CUDNN(cudnnSetTensorDescriptorFromCudnnContiguous(y_desc, CUDNN_DATA_FLOAT, 4,
-        (int[]){rows, cols, cols, 1}));
-
-    cudnnNormDescriptor_t norm_desc;
-    CHECK_CUDNN(cudnnCreateNormDescriptor(&norm_desc));
-    CHECK_CUDNN(cudnnSetNormDescriptor(norm_desc, CUDNN_NORM_RMS, CUDNN_DATA_FLOAT, 0, kEps));
-
-    cudnnNormMode_t mode;
-    cudnnNormOps_t ops;
-    CHECK_CUDNN(cudnnGetNormModeFromDescriptor(norm_desc, &mode));
-
-    float alpha = 1.0f, beta = 0.0f;
-
-    cudaEvent_t s, e;
-    CHECK_CUDA(cudaEventCreate(&s));
-    CHECK_CUDA(cudaEventCreate(&e));
-    CHECK_CUDA(cudaEventRecord(s));
-
-    CHECK_CUDNN(cudnnNormalizationForward(cudnn, mode, &alpha, &beta,
-                                           x_desc, d_x, norm_desc, d_weight,
-                                           y_desc, d_y, kEps, CUDNN_NORM_ALGO_RNN_LN,
-                                           0, nullptr));
-
-    CHECK_CUDA(cudaEventRecord(e));
-    CHECK_CUDA(cudaEventSynchronize(e));
-
-    float ms = 0.0f;
-    CHECK_CUDA(cudaEventElapsedTime(&ms, s, e));
-
-    CHECK_CUDA(cudaMemcpy(h_y, d_y, n * sizeof(float), cudaMemcpyDeviceToHost));
-
-    CHECK_CUDA(cudaEventDestroy(s));
-    CHECK_CUDA(cudaEventDestroy(e));
-    CHECK_CUDA(cudaFree(d_x));
-    CHECK_CUDA(cudaFree(d_y));
-    CHECK_CUDA(cudaFree(d_weight));
-    CHECK_CUDA(cudaFree(d_var));
-    CHECK_CUDNN(cudnnDestroyTensorDescriptor(x_desc));
-    CHECK_CUDNN(cudnnDestroyTensorDescriptor(y_desc));
-    CHECK_CUDNN(cudnnDestroyNormDescriptor(norm_desc));
-    CHECK_CUDNN(cudnnDestroy(cudnn));
-
-    return ms;
+    (void)h_x;
+    (void)h_weight;
+    (void)h_y;
+    (void)rows;
+    (void)cols;
+    // cuDNN 9.x 移除了此文件中使用的旧 RMSNorm API（需要迁移到 frontend/backend graph API）。
+    // 先返回 -1 以保证 CUB/自研 kernel 基准链路可编译可运行。
+    return -1.0;
 }
 
 // ============================================================================

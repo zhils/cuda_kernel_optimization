@@ -22,13 +22,13 @@
 #include "common/cuda_utils.h"
 
 namespace {
-constexpr int kTileK = 32;
-constexpr int kBX = 16;
-constexpr int kBY = 16;
+constexpr int kTileK = 8;
+constexpr int kBX = 8;
+constexpr int kBY = 8;
 constexpr int kTM = 8;
 constexpr int kTN = 8;
-constexpr int kCtaM = kBY * kTM;   // 128
-constexpr int kCtaN = kBX * kTN;   // 128
+constexpr int kCtaM = kBY * kTM;
+constexpr int kCtaN = kBX * kTN;
 }  // namespace
 
 __global__ void __launch_bounds__(256, 2)

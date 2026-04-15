@@ -204,6 +204,22 @@ struct SumFunctor {
     }
 };
 
+__global__ void ExpShiftKernel(const float* __restrict__ x,
+                               float* __restrict__ e,
+                               int cols,
+                               float maxv) {
+    int c = blockIdx.x * blockDim.x + threadIdx.x;
+    if (c < cols) e[c] = expf(x[c] - maxv);
+}
+
+__global__ void NormalizeKernel(const float* __restrict__ e,
+                                float* __restrict__ y,
+                                int cols,
+                                float inv_sum) {
+    int c = blockIdx.x * blockDim.x + threadIdx.x;
+    if (c < cols) y[c] = e[c] * inv_sum;
+}
+
 static double RunCUBSoftmax(const float* h_x, float* h_y, int rows, int cols) {
     float *d_x, *d_y;
     CHECK_CUDA(cudaMalloc(&d_x, rows * cols * sizeof(float)));
@@ -219,28 +235,38 @@ static double RunCUBSoftmax(const float* h_x, float* h_y, int rows, int cols) {
         const float* row_x = d_x + r * cols;
         float* row_y = d_y + r * cols;
 
-        float d_max;
-        cub::DeviceReduce::Max(row_x, &d_max, cols);
-        CHECK_CUDA(cudaMemcpy(&d_max, &d_max, sizeof(float), cudaMemcpyDeviceToHost));
+        float *d_max = nullptr, *d_sum = nullptr, *d_exp = nullptr;
+        void *tmp_max = nullptr, *tmp_sum = nullptr;
+        size_t max_bytes = 0, sum_bytes = 0;
 
-        float* d_exp = nullptr;
-        float* d_sum = nullptr;
-        CHECK_CUDA(cudaMalloc(&d_exp, cols * sizeof(float)));
+        CHECK_CUDA(cudaMalloc(&d_max, sizeof(float)));
         CHECK_CUDA(cudaMalloc(&d_sum, sizeof(float)));
+        CHECK_CUDA(cudaMalloc(&d_exp, cols * sizeof(float)));
 
-        cub::DeviceTransform::Transform(row_x, d_exp, cols,
-            [] __device__(float v) { return expf(v - d_max); });
+        cub::DeviceReduce::Max(nullptr, max_bytes, row_x, d_max, cols);
+        CHECK_CUDA(cudaMalloc(&tmp_max, max_bytes));
+        cub::DeviceReduce::Max(tmp_max, max_bytes, row_x, d_max, cols);
 
-        cub::DeviceReduce::Sum(d_exp, d_sum, cols);
+        float h_max = 0.f;
+        CHECK_CUDA(cudaMemcpy(&h_max, d_max, sizeof(float), cudaMemcpyDeviceToHost));
+
+        const int threads = 256;
+        const int blocks = (cols + threads - 1) / threads;
+        ExpShiftKernel<<<blocks, threads>>>(row_x, d_exp, cols, h_max);
+
+        cub::DeviceReduce::Sum(nullptr, sum_bytes, d_exp, d_sum, cols);
+        CHECK_CUDA(cudaMalloc(&tmp_sum, sum_bytes));
+        cub::DeviceReduce::Sum(tmp_sum, sum_bytes, d_exp, d_sum, cols);
 
         float h_sum = 0.f;
         CHECK_CUDA(cudaMemcpy(&h_sum, d_sum, sizeof(float), cudaMemcpyDeviceToHost));
+        NormalizeKernel<<<blocks, threads>>>(d_exp, row_y, cols, 1.0f / h_sum);
 
-        cub::DeviceTransform::Transform(d_exp, row_y, cols,
-            [h_sum] __device__(float v) { return v / h_sum; });
-
-        CHECK_CUDA(cudaFree(d_exp));
+        CHECK_CUDA(cudaFree(tmp_max));
+        CHECK_CUDA(cudaFree(tmp_sum));
+        CHECK_CUDA(cudaFree(d_max));
         CHECK_CUDA(cudaFree(d_sum));
+        CHECK_CUDA(cudaFree(d_exp));
     }
 
     CHECK_CUDA(cudaEventRecord(e));
@@ -271,8 +297,8 @@ static double RunCuDNNSoftmax(cudnnHandle_t handle,
     cudnnTensorDescriptor_t x_desc, y_desc;
     CHECK_CUDNN(cudnnCreateTensorDescriptor(&x_desc));
     CHECK_CUDNN(cudnnCreateTensorDescriptor(&y_desc));
-    CHECK_CUDNN(cudnnSetTensor4dDescriptor(x_desc, CUDNN_TCHW, CUDNN_DATA_FLOAT, 1, 1, rows, cols));
-    CHECK_CUDNN(cudnnSetTensor4dDescriptor(y_desc, CUDNN_TCHW, CUDNN_DATA_FLOAT, 1, 1, rows, cols));
+    CHECK_CUDNN(cudnnSetTensor4dDescriptor(x_desc, CUDNN_TENSOR_NCHW, CUDNN_DATA_FLOAT, 1, 1, rows, cols));
+    CHECK_CUDNN(cudnnSetTensor4dDescriptor(y_desc, CUDNN_TENSOR_NCHW, CUDNN_DATA_FLOAT, 1, 1, rows, cols));
 
     cudaEvent_t s, e;
     CHECK_CUDA(cudaEventCreate(&s));
@@ -323,13 +349,13 @@ static void SoftmaxCPU(const float* x, float* y, int rows, int cols) {
 // ============ Benchmark Helpers ============
 template<typename KernelFunc>
 double RunKernel(KernelFunc kernel, const float* h_x, float* h_y,
-                  int rows, int cols, int iterations) {
+                  int rows, int cols, int iterations, size_t smem_bytes = 0) {
     float *d_x, *d_y;
     CHECK_CUDA(cudaMalloc(&d_x, rows * cols * sizeof(float)));
     CHECK_CUDA(cudaMalloc(&d_y, rows * cols * sizeof(float)));
     CHECK_CUDA(cudaMemcpy(d_x, h_x, rows * cols * sizeof(float), cudaMemcpyHostToDevice));
 
-    kernel<<<rows, 256>>>(d_x, d_y, rows, cols);
+    kernel<<<rows, 256, smem_bytes>>>(d_x, d_y, rows, cols);
     CHECK_CUDA(cudaDeviceSynchronize());
 
     std::vector<double> times;
@@ -339,7 +365,7 @@ double RunKernel(KernelFunc kernel, const float* h_x, float* h_y,
         CHECK_CUDA(cudaEventCreate(&e));
 
         CHECK_CUDA(cudaEventRecord(s));
-        kernel<<<rows, 256>>>(d_x, d_y, rows, cols);
+        kernel<<<rows, 256, smem_bytes>>>(d_x, d_y, rows, cols);
         CHECK_CUDA(cudaEventRecord(e));
         CHECK_CUDA(cudaEventSynchronize(e));
 
@@ -424,7 +450,8 @@ int main() {
         std::cout << std::fixed << std::setprecision(3)
                   << std::setw(12) << naive_ms;
 
-        double sharedmem_ms = RunKernel(SoftmaxSharedMemKernel, h_x.data(), h_gpu.data(), rows, cols, ITERATIONS);
+        double sharedmem_ms = RunKernel(SoftmaxSharedMemKernel, h_x.data(), h_gpu.data(),
+                                        rows, cols, ITERATIONS, 256 * sizeof(float));
         std::cout << std::setw(12) << sharedmem_ms;
 
         double warp_ms = RunKernel(SoftmaxWarpKernel, h_x.data(), h_gpu.data(), rows, cols, ITERATIONS);

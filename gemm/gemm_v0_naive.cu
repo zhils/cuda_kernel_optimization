@@ -9,10 +9,7 @@
 #include "common/benchmark.h"
 #include "common/cuda_utils.h"
 
-__global__ void GemmNaiveKernel(const float* A, const float* B, float* C, int M, int N,
-                                int K) {
-                                  
-  // 核心思想：每个线程生成最终的一个C[row, col]的值
+__global__ void GemmNaiveKernel(const float* A, const float* B, float* C, int M, int N, int K) {
   int col = blockIdx.x * blockDim.x + threadIdx.x;
   int row = blockIdx.y * blockDim.y + threadIdx.y;
   if (row < M && col < N) {

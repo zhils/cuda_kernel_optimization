@@ -19,13 +19,13 @@
 #include "common/cuda_utils.h"
 
 namespace {
-constexpr int kBlockM = 32;
-constexpr int kBlockN = 32;
+constexpr int kBlockM = 64;
+constexpr int kBlockN = 64;
 constexpr int kTileK = 8;
-constexpr int kTM = 4;
-constexpr int kTN = 4;
-constexpr int kBX = kBlockN / kTN;   // 8  threads along N
-constexpr int kBY = kBlockM / kTM;   // 8  threads along M
+constexpr int kTM = 8;
+constexpr int kTN = 8;
+constexpr int kBX = kBlockN / kTN;
+constexpr int kBY = kBlockM / kTM;
 }  // namespace
 
 __global__ void GemmV2Kernel(const float* __restrict__ A,
