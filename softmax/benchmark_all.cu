@@ -381,23 +381,49 @@ static double RunCuDNNSoftmax(cudnnHandle_t handle,
   cudnnTensorDescriptor_t x_desc, y_desc;
   CHECK_CUDNN(cudnnCreateTensorDescriptor(&x_desc));
   CHECK_CUDNN(cudnnCreateTensorDescriptor(&y_desc));
+  // Row-wise softmax mapping:
+  //   matrix[rows, cols] -> N=rows, C=cols, H=1, W=1
+  //   mode CHANNEL computes softmax over C for each N/H/W.
   CHECK_CUDNN(cudnnSetTensor4dDescriptor(
-      x_desc, CUDNN_TENSOR_NCHW, CUDNN_DATA_FLOAT, 1, 1, rows, cols));
+      x_desc, CUDNN_TENSOR_NCHW, CUDNN_DATA_FLOAT, rows, cols, 1, 1));
   CHECK_CUDNN(cudnnSetTensor4dDescriptor(
-      y_desc, CUDNN_TENSOR_NCHW, CUDNN_DATA_FLOAT, 1, 1, rows, cols));
+      y_desc, CUDNN_TENSOR_NCHW, CUDNN_DATA_FLOAT, rows, cols, 1, 1));
 
   cudaEvent_t s, e;
   CHECK_CUDA(cudaEventCreate(&s));
   CHECK_CUDA(cudaEventCreate(&e));
-  CHECK_CUDA(cudaEventRecord(s));
   float alpha = 1.f, beta = 0.f;
-  CHECK_CUDNN(cudnnSoftmaxForward(
-      handle, CUDNN_SOFTMAX_ACCURATE, CUDNN_SOFTMAX_MODE_INSTANCE,
-      &alpha, x_desc, d_x, &beta, y_desc, d_y));
-  CHECK_CUDA(cudaEventRecord(e));
-  CHECK_CUDA(cudaEventSynchronize(e));
+  constexpr int kWarmup = 3;
+  constexpr int kIters = 10;
+  for (int i = 0; i < kWarmup; ++i) {
+    CHECK_CUDNN(cudnnSoftmaxForward(
+        handle, CUDNN_SOFTMAX_ACCURATE, CUDNN_SOFTMAX_MODE_CHANNEL,
+        &alpha, x_desc, d_x, &beta, y_desc, d_y));
+  }
+  CHECK_CUDA(cudaDeviceSynchronize());
+
+  std::vector<float> times;
+  times.reserve(kIters);
+  for (int i = 0; i < kIters; ++i) {
+    CHECK_CUDA(cudaEventRecord(s));
+    CHECK_CUDNN(cudnnSoftmaxForward(
+        handle, CUDNN_SOFTMAX_ACCURATE, CUDNN_SOFTMAX_MODE_CHANNEL,
+        &alpha, x_desc, d_x, &beta, y_desc, d_y));
+    CHECK_CUDA(cudaEventRecord(e));
+    CHECK_CUDA(cudaEventSynchronize(e));
+    float ms = 0.f;
+    CHECK_CUDA(cudaEventElapsedTime(&ms, s, e));
+    times.push_back(ms);
+  }
+  std::sort(times.begin(), times.end());
   float ms = 0.f;
-  CHECK_CUDA(cudaEventElapsedTime(&ms, s, e));
+  if (times.size() > 2) {
+    for (size_t i = 1; i + 1 < times.size(); ++i) ms += times[i];
+    ms /= static_cast<float>(times.size() - 2);
+  } else if (!times.empty()) {
+    for (float t : times) ms += t;
+    ms /= static_cast<float>(times.size());
+  }
 
   CHECK_CUDA(cudaMemcpy(h_y, d_y, rows * cols * sizeof(float), cudaMemcpyDeviceToHost));
   CHECK_CUDNN(cudnnDestroyTensorDescriptor(x_desc));

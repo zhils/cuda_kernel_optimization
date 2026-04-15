@@ -87,8 +87,8 @@ RMSNorm（Root Mean Square Layer Normalization）在现代 LLM（如 LLaMA、Qwe
 
 > 数据来源：`data/results/rmsnorm_naive_results.csv`、`rmsnorm_v1_results.csv`、`rmsnorm_v2_results.csv`、`rmsnorm_v3_results.csv`
 
-| 矩阵规模 | V0 Naive | V1 Shared/Stream | V2 Vectorized | V3 Fused |
-|----------|----------|------------------|---------------|----------|
+| 矩阵规模 | V0 | V1 | V2 | V3 |
+|----------|-----|-----|-----|-----|
 | 128×128 | 0.2541 | 0.0060 | 0.0047 | 0.0047 |
 | 256×256 | 0.1108 | 0.0083 | 0.0076 | 0.0089 |
 | 512×512 | 0.1863 | 0.0102 | 0.0098 | 0.0074 |
