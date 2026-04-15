@@ -261,7 +261,7 @@ footer span{
         <tr><td>24</td><td><code>rmsnorm/README.md</code></td><td>RMSNorm 优化文档：逐版本原理分析与性能数据</td></tr>
         <tr><td>25</td><td><code>rmsnorm/CMakeLists.txt</code></td><td>RMSNorm 子目录构建配置</td></tr>
         <tr><td>26</td><td><code>rmsnorm/rmsnorm_v0_naive.cu</code></td><td>朴素实现：逐线程循环累加求 RMS</td></tr>
-        <tr><td>27</td><td><code>rmsnorm/rmsnorm_v1_warp_reduce.cu</code></td><td>Warp Shuffle 归约，warp 级并行</td></tr>
+        <tr><td>27</td><td><code>rmsnorm/rmsnorm_v1.cu</code></td><td>共享内存暂存/向量化，减少全局读 x</td></tr>
         <tr><td>28</td><td><code>rmsnorm/rmsnorm_v2_vectorized.cu</code></td><td>float4 向量化加载，128-bit 事务</td></tr>
         <tr><td>29</td><td><code>rmsnorm/rmsnorm_v3_fused.cu</code></td><td>融合 kernel + __fmul_rn 确定性舍入</td></tr>
         <tr><td>30</td><td><code>rmsnorm/benchmark_all.cu</code></td><td>统一跑全部 RMSNorm 版本对比</td></tr>

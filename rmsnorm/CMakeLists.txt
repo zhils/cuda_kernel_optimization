@@ -1,6 +1,6 @@
 set(RMSNORM_VARIANTS
     rmsnorm_v0_naive
-    rmsnorm_v1_warp_reduce
+    rmsnorm_v1
     rmsnorm_v2_vectorized
     rmsnorm_v3_fused
 )

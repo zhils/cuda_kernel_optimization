@@ -1,6 +1,6 @@
 set(SOFTMAX_VARIANTS
     softmax_v0_naive
-    softmax_v1_shared_mem
+    softmax_v1
     softmax_v2_online
     softmax_v3_warp_shuffle
 )
