@@ -1,15 +1,19 @@
-// RMSNorm V2: Vectorized memory access (float4) + warp reduction
+// RMSNorm V2: On top of V1, add vectorized + warp/block reduction.
 //
-// Key optimizations over V1:
-//   - float4 vectorized loads for sq_sum computation (4x fewer transactions)
-//   - float4 vectorized stores for output writing
-//   - All threads participate in both reduction and output writing
-//   - Shared memory for cross-warp reduction
+// Keep V1 optimizations:
+//   - staged path for small cols (single global read of x)
+//   - stream path fallback for large cols
+//   - __ldg and alignment-guarded float4 access
+//
+// Additional V2 optimizations:
+//   - warp + cross-warp reduction for sq_sum
+//   - float4 vectorized load/store in both paths
 
 #include <cuda_runtime.h>
 
 #include <algorithm>
 #include <cmath>
+#include <cstdint>
 #include <filesystem>
 #include <fstream>
 #include <iomanip>
@@ -21,68 +25,171 @@
 
 static constexpr float kEps = 1e-5f;
 static constexpr int WARP_SIZE = 32;
+static constexpr int kThreads = 256;
+static constexpr std::size_t kMaxDynamicSmemBytes = 40 * 1024;
+
+inline bool CanStageRow(int cols) {
+    const std::size_t need =
+        (static_cast<std::size_t>(cols) + static_cast<std::size_t>(kThreads)) * sizeof(float);
+    return need <= kMaxDynamicSmemBytes;
+}
+
+__device__ __forceinline__ float4 LoadFloat4(const float* p) {
+    return __ldg(reinterpret_cast<const float4*>(p));
+}
+
+__device__ __forceinline__ void StoreFloat4(float* p, const float4& v) {
+    *reinterpret_cast<float4*>(p) = v;
+}
 
 __device__ __forceinline__ float warpReduceSum(float val) {
     for (int offset = WARP_SIZE / 2; offset > 0; offset >>= 1)
-        val += __shfl_sync(0xffffffff, val, offset);
+        val += __shfl_down_sync(0xffffffff, val, offset);
     return val;
 }
 
-__global__ void RMSNormVectorizedKernel(const float* __restrict__ x,
-                                         float* __restrict__ y,
-                                         const float* __restrict__ weight,
-                                         int rows, int cols, float eps) {
+__device__ __forceinline__ float blockReduceSum(float val) {
+    __shared__ float warp_sums[kThreads / WARP_SIZE];
+    const int tid = threadIdx.x;
+    const int lane = tid % WARP_SIZE;
+    const int warp_id = tid / WARP_SIZE;
+    const int warp_count = (blockDim.x + WARP_SIZE - 1) / WARP_SIZE;
+
+    val = warpReduceSum(val);
+    if (lane == 0) warp_sums[warp_id] = val;
+    __syncthreads();
+
+    float sum = 0.f;
+    if (warp_id == 0) {
+        sum = (lane < warp_count) ? warp_sums[lane] : 0.f;
+        sum = warpReduceSum(sum);
+    }
+    __syncthreads();
+    return sum;
+}
+
+__global__ void RMSNormV2StagedKernel(const float* __restrict__ x,
+                                      float* __restrict__ y,
+                                      const float* __restrict__ weight,
+                                      int rows, int cols, float eps) {
+    extern __shared__ float sdata[];
+    float* s_row = sdata;
+    float* s_red = sdata + cols;
+
     int tid = threadIdx.x;
     int r = blockIdx.x;
     if (r >= rows) return;
 
-    int offset = r * cols;
-    int n4 = cols / 4;
+    const int offset = r * cols;
+    const float* row_x = x + static_cast<std::size_t>(offset);
+    float* row_y = y + static_cast<std::size_t>(offset);
+    const int n4 = cols / 4;
 
-    const float4* x4 = reinterpret_cast<const float4*>(x + offset);
-    float4* y4 = reinterpret_cast<float4*>(y + offset);
+    const bool align4 =
+        (cols % 4 == 0) &&
+        (reinterpret_cast<std::uintptr_t>(row_x) % 16u == 0u) &&
+        (reinterpret_cast<std::uintptr_t>(row_y) % 16u == 0u) &&
+        (reinterpret_cast<std::uintptr_t>(weight) % 16u == 0u);
+
+    if (align4) {
+        int c = tid * 4;
+        for (; c + 3 < cols; c += blockDim.x * 4) {
+            StoreFloat4(s_row + c, LoadFloat4(row_x + c));
+        }
+        for (int c1 = c; c1 < cols; ++c1) s_row[c1] = __ldg(row_x + c1);
+    } else {
+        for (int c = tid; c < cols; c += blockDim.x) s_row[c] = __ldg(row_x + c);
+    }
+    __syncthreads();
 
     float sq_sum = 0.f;
-    for (int c = tid; c < n4; c += blockDim.x) {
-        float4 val4 = x4[c];
-        sq_sum += val4.x * val4.x + val4.y * val4.y +
-                  val4.z * val4.z + val4.w * val4.w;
+    if (align4) {
+        int c = tid * 4;
+        for (; c + 3 < cols; c += blockDim.x * 4) {
+            const float4 v = *reinterpret_cast<const float4*>(s_row + c);
+            sq_sum += v.x * v.x + v.y * v.y + v.z * v.z + v.w * v.w;
+        }
+        for (int c1 = c; c1 < cols; ++c1) {
+            const float v = s_row[c1];
+            sq_sum += v * v;
+        }
+    } else {
+        for (int c = tid; c < cols; c += blockDim.x) {
+            const float v = s_row[c];
+            sq_sum += v * v;
+        }
     }
 
-    sq_sum = warpReduceSum(sq_sum);
-
-    // Cross-warp reduction via shared memory
-    __shared__ float warp_sums[8];
-    int warp_id = tid / WARP_SIZE;
-    int lane = tid % WARP_SIZE;
-    if (lane == 0) warp_sums[warp_id] = sq_sum;
+    sq_sum = blockReduceSum(sq_sum);
+    if (tid == 0) s_red[0] = rsqrtf(sq_sum / static_cast<float>(cols) + eps);
     __syncthreads();
+    const float rms = s_red[0];
 
-    if (warp_id == 0) {
-        sq_sum = (lane < (blockDim.x + WARP_SIZE - 1) / WARP_SIZE)
-                     ? warp_sums[lane]
-                     : 0.f;
-        sq_sum = warpReduceSum(sq_sum);
+    if (align4) {
+        int c = tid * 4;
+        for (; c + 3 < cols; c += blockDim.x * 4) {
+            const float4 vx = *reinterpret_cast<const float4*>(s_row + c);
+            const float4 vw = LoadFloat4(weight + c);
+            StoreFloat4(row_y + c, make_float4(vx.x * rms * vw.x, vx.y * rms * vw.y,
+                                               vx.z * rms * vw.z, vx.w * rms * vw.w));
+        }
+        for (int c1 = c; c1 < cols; ++c1) row_y[c1] = s_row[c1] * rms * __ldg(weight + c1);
+    } else {
+        for (int c = tid; c < cols; c += blockDim.x) {
+            row_y[c] = s_row[c] * rms * __ldg(weight + c);
+        }
+    }
+}
+
+__global__ void RMSNormV2StreamKernel(const float* __restrict__ x,
+                                      float* __restrict__ y,
+                                      const float* __restrict__ weight,
+                                      int rows, int cols, float eps) {
+    __shared__ float s_red[kThreads / WARP_SIZE];
+    int tid = threadIdx.x;
+    int r = blockIdx.x;
+    if (r >= rows) return;
+
+    const int offset = r * cols;
+    const float* row_x = x + static_cast<std::size_t>(offset);
+    float* row_y = y + static_cast<std::size_t>(offset);
+    const int n4 = cols / 4;
+
+    const bool align4 =
+        (cols % 4 == 0) &&
+        (reinterpret_cast<std::uintptr_t>(row_x) % 16u == 0u) &&
+        (reinterpret_cast<std::uintptr_t>(row_y) % 16u == 0u) &&
+        (reinterpret_cast<std::uintptr_t>(weight) % 16u == 0u);
+
+    float sq_sum = 0.f;
+    if (align4) {
+        for (int c = tid; c < n4; c += blockDim.x) {
+            const float4 v = LoadFloat4(row_x + c * 4);
+            sq_sum += v.x * v.x + v.y * v.y + v.z * v.z + v.w * v.w;
+        }
+    } else {
+        for (int c = tid; c < cols; c += blockDim.x) {
+            const float v = __ldg(row_x + c);
+            sq_sum += v * v;
+        }
     }
 
-    __shared__ float rms_val;
-    if (tid == 0) rms_val = rsqrtf(sq_sum / cols + eps);
+    sq_sum = blockReduceSum(sq_sum);
+    if (tid == 0) s_red[0] = rsqrtf(sq_sum / static_cast<float>(cols) + eps);
     __syncthreads();
+    const float rms = s_red[0];
 
-    float rms = rms_val;
-
-    for (int c = tid; c < n4; c += blockDim.x) {
-        float4 val4 = x4[c];
-        float4 res4;
-        res4.x = val4.x * rms * weight[c * 4];
-        res4.y = val4.y * rms * weight[c * 4 + 1];
-        res4.z = val4.z * rms * weight[c * 4 + 2];
-        res4.w = val4.w * rms * weight[c * 4 + 3];
-        y4[c] = res4;
-    }
-
-    for (int c = n4 * 4 + tid; c < cols; c += blockDim.x) {
-        y[offset + c] = x[offset + c] * rms * weight[c];
+    if (align4) {
+        for (int c = tid; c < n4; c += blockDim.x) {
+            const float4 vx = LoadFloat4(row_x + c * 4);
+            const float4 vw = LoadFloat4(weight + c * 4);
+            StoreFloat4(row_y + c * 4, make_float4(vx.x * rms * vw.x, vx.y * rms * vw.y,
+                                                   vx.z * rms * vw.z, vx.w * rms * vw.w));
+        }
+    } else {
+        for (int c = tid; c < cols; c += blockDim.x) {
+            row_y[c] = __ldg(row_x + c) * rms * __ldg(weight + c);
+        }
     }
 }
 
@@ -121,16 +228,25 @@ int main() {
         CHECK_CUDA(cudaMemcpy(dx, x.data(), n * sizeof(float), cudaMemcpyHostToDevice));
         CHECK_CUDA(cudaMemcpy(dw, w.data(), cols * sizeof(float), cudaMemcpyHostToDevice));
 
-        int threads = 256;
-        RMSNormVectorizedKernel<<<rows, threads>>>(dx, dy, dw, rows, cols, kEps);
+        const std::size_t smem_staged =
+            (static_cast<std::size_t>(cols) + kThreads) * sizeof(float);
+        auto dispatch = [&]() {
+            if (CanStageRow(cols)) {
+                RMSNormV2StagedKernel<<<rows, kThreads, smem_staged>>>(dx, dy, dw, rows, cols,
+                                                                       kEps);
+            } else {
+                RMSNormV2StreamKernel<<<rows, kThreads>>>(dx, dy, dw, rows, cols, kEps);
+            }
+        };
+
+        dispatch();
         CHECK_CUDA(cudaDeviceSynchronize());
 
         cudaEvent_t s, e;
         CHECK_CUDA(cudaEventCreate(&s));
         CHECK_CUDA(cudaEventCreate(&e));
         CHECK_CUDA(cudaEventRecord(s));
-        for (int rep = 0; rep < kRepeat; ++rep)
-            RMSNormVectorizedKernel<<<rows, threads>>>(dx, dy, dw, rows, cols, kEps);
+        for (int rep = 0; rep < kRepeat; ++rep) dispatch();
         CHECK_CUDA(cudaEventRecord(e));
         CHECK_CUDA(cudaEventSynchronize(e));
         float gpu_ms_total = 0;
@@ -140,7 +256,8 @@ int main() {
         CHECK_CUDA(cudaMemcpy(gpu.data(), dy, n * sizeof(float), cudaMemcpyDeviceToHost));
         bool ok = common::CheckEqual(cpu, gpu, 1e-4f);
 
-        double bytes = static_cast<double>(n) * sizeof(float) * 2.0 + cols * sizeof(float);
+        const double bytes =
+            static_cast<double>(n) * sizeof(float) * (CanStageRow(cols) ? 3.0 : 4.0);
         double bw = bytes / (gpu_ms * 1e6);
 
         std::cout << rows << "x" << cols

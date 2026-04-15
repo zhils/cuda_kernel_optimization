@@ -4,6 +4,7 @@ set(GEMM_VARIANTS
     gemm_v2
     gemm_v3
     gemm_v4
+    gemm_v5
     gemm_cublas_ref
 )
 
@@ -26,7 +27,3 @@ target_link_libraries(gemm_benchmark_v2_blocks PRIVATE cuda_common cublas)
 set_target_properties(gemm_benchmark_v2_blocks PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
 
-add_executable(gemm_benchmark_v2v3v4 benchmark_v2v3v4.cu)
-target_link_libraries(gemm_benchmark_v2v3v4 PRIVATE cuda_common)
-set_target_properties(gemm_benchmark_v2v3v4 PROPERTIES
-    RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)

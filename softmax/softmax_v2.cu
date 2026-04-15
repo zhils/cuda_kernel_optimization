@@ -5,6 +5,8 @@
 //   - Maintains running max and sum simultaneously
 //   - Rescales partial sums on-the-fly when a new max is found
 //   - Reduces memory traffic by ~3x
+//   - Uses __ldg (read-only cache) for global memory reads
+//   - Uses float4 vectorized loads when memory is 16-byte aligned
 //
 // Reference: Milakov & Gimelshein, "Online normalizer calculation for softmax", 2018
 
@@ -12,6 +14,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdint>
 #include <filesystem>
 #include <fstream>
 #include <iomanip>
@@ -21,6 +24,27 @@
 #include "common/benchmark.h"
 #include "common/cuda_utils.h"
 
+namespace {
+
+constexpr int kThreads = 256;
+
+__device__ inline float4 LoadX4(const float* __restrict__ ptr) {
+    return __ldg(reinterpret_cast<const float4*>(ptr));
+}
+
+__device__ inline void OnlineMaxSum4(const float4& v, float& local_max, float& local_sum) {
+    float vals[4] = {v.x, v.y, v.z, v.w};
+    for (int i = 0; i < 4; ++i) {
+        float val = vals[i];
+        if (val > local_max) {
+            local_sum = local_sum * expf(local_max - val) + expf(0.0f);
+            local_max = val;
+        } else {
+            local_sum += expf(val - local_max);
+        }
+    }
+}
+
 __global__ void SoftmaxOnlineKernel(const float* __restrict__ x,
                                      float* __restrict__ y,
                                      int rows, int cols) {
@@ -29,24 +53,41 @@ __global__ void SoftmaxOnlineKernel(const float* __restrict__ x,
 
     int tid = threadIdx.x;
     int blockSize = blockDim.x;
-    const float* row_x = x + r * cols;
-    float* row_y = y + r * cols;
+    const float* row_x = x + static_cast<std::size_t>(r) * cols;
+    float* row_y = y + static_cast<std::size_t>(r) * cols;
 
-    // Phase 1: online max + sum in a single pass
+    const bool align4 = ((reinterpret_cast<std::uintptr_t>(row_x) % 16u) == 0u) && ((cols % 4) == 0);
+
     float local_max = -INFINITY;
     float local_sum = 0.0f;
 
-    for (int c = tid; c < cols; c += blockSize) {
-        float val = row_x[c];
-        if (val > local_max) {
-            local_sum = local_sum * expf(local_max - val) + expf(0.0f);
-            local_max = val;
-        } else {
-            local_sum += expf(val - local_max);
+    if (align4) {
+        int c = tid * 4;
+        for (; c + 3 < cols; c += blockSize * 4) {
+            const float4 v = LoadX4(row_x + c);
+            OnlineMaxSum4(v, local_max, local_sum);
+        }
+        for (int c = c; c < cols; ++c) {
+            float val = __ldg(row_x + c);
+            if (val > local_max) {
+                local_sum = local_sum * expf(local_max - val) + 1.0f;
+                local_max = val;
+            } else {
+                local_sum += expf(val - local_max);
+            }
+        }
+    } else {
+        for (int c = tid; c < cols; c += blockSize) {
+            float val = __ldg(row_x + c);
+            if (val > local_max) {
+                local_sum = local_sum * expf(local_max - val) + 1.0f;
+                local_max = val;
+            } else {
+                local_sum += expf(val - local_max);
+            }
         }
     }
 
-    // Block-level reduction of (max, sum) pairs
     __shared__ float s_max[256];
     __shared__ float s_sum[256];
     s_max[tid] = local_max;
@@ -68,10 +109,32 @@ __global__ void SoftmaxOnlineKernel(const float* __restrict__ x,
     float row_max = s_max[0];
     float row_sum = s_sum[0];
 
-    // Phase 2: write normalized output
-    for (int c = tid; c < cols; c += blockSize) {
-        row_y[c] = expf(row_x[c] - row_max) / row_sum;
+    if (align4) {
+        const float inv = 1.0f / row_sum;
+        int c = tid * 4;
+        for (; c + 3 < cols; c += blockSize * 4) {
+            const float4 v = LoadX4(row_x + c);
+            const float4 out = make_float4(
+                expf(v.x - row_max) * inv,
+                expf(v.y - row_max) * inv,
+                expf(v.z - row_max) * inv,
+                expf(v.w - row_max) * inv
+            );
+            *reinterpret_cast<float4*>(row_y + c) = out;
+        }
+        for (int c2 = c; c2 < cols; ++c2) {
+            row_y[c2] = expf(__ldg(row_x + c2) - row_max) * inv;
+        }
+    } else {
+        const float inv = 1.0f / row_sum;
+        for (int c = tid; c < cols; c += blockSize) {
+            row_y[c] = expf(__ldg(row_x + c) - row_max) * inv;
+        }
     }
+}
+
+inline bool IsAligned4(int cols) {
+    return (cols % 4) == 0;
 }
 
 static void SoftmaxCPU(const float* x, float* y, int rows, int cols) {
@@ -126,11 +189,10 @@ int main() {
         CHECK_CUDA(cudaMemcpy(gpu.data(), dy, n * sizeof(float), cudaMemcpyDeviceToHost));
         bool ok = common::CheckEqual(cpu, gpu, 1e-4f);
 
-        // Online: 1 read pass + 1 read+write pass = 3N reads/writes total
         double bytes = static_cast<double>(n) * sizeof(float) * 3.0;
         double bw = bytes / (gpu_ms * 1e6);
 
-        std::cout << rows << "x" << cols
+        std::cout << rows << "x" << cols << (IsAligned4(cols) ? " [align4]" : " [scalar]")
                   << " | " << std::fixed << std::setprecision(4) << gpu_ms << " ms"
                   << " | " << std::setprecision(1) << bw << " GB/s"
                   << " | " << (ok ? "PASS" : "FAIL") << "\n";

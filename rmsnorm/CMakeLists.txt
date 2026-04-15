@@ -17,7 +17,7 @@ foreach(variant ${RMSNORM_VARIANTS})
 endforeach()
 
 add_executable(rmsnorm_benchmark_all benchmark_all.cu)
-target_link_libraries(rmsnorm_benchmark_all PRIVATE cuda_common cudnn)
+target_link_libraries(rmsnorm_benchmark_all PRIVATE cuda_common cudnn cublas)
 target_include_directories(rmsnorm_benchmark_all PRIVATE "${CUDNN_INCLUDE_DIR}")
 target_link_directories(rmsnorm_benchmark_all PRIVATE "${CUDNN_LIB_DIR}")
 if(MSVC)
