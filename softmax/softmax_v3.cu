@@ -38,7 +38,7 @@ constexpr int kThreads = 256;
 constexpr int kWarpSize = 32;
 constexpr std::size_t kMaxSmemBytes = 40 * 1024;
 
-inline bool CanStageExp(int cols) {
+__device__ inline bool CanStageExp(int cols) {
     return static_cast<std::size_t>(cols) * sizeof(float) <= kMaxSmemBytes;
 }
 
@@ -214,7 +214,7 @@ inline bool IsAligned4(int cols) {
 }
 
 inline bool CanStage(int cols) {
-    return CanStageExp(cols);
+    return static_cast<std::size_t>(cols) * sizeof(float) <= kMaxSmemBytes;
 }
 
 static void SoftmaxCPU(const float* x, float* y, int rows, int cols) {
@@ -250,9 +250,7 @@ int main() {
         CHECK_CUDA(cudaMemcpy(dx, x.data(), n * sizeof(float), cudaMemcpyHostToDevice));
 
         std::size_t smem_size = (kWarpSize + 1) * 2 * sizeof(float);
-        if (CanStageExp(cols)) {
-            smem_size += static_cast<std::size_t>(cols) * sizeof(float);
-        } else {
+        {
             smem_size += static_cast<std::size_t>(cols) * sizeof(float);
         }
 

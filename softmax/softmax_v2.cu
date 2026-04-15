@@ -67,8 +67,8 @@ __global__ void SoftmaxOnlineKernel(const float* __restrict__ x,
             const float4 v = LoadX4(row_x + c);
             OnlineMaxSum4(v, local_max, local_sum);
         }
-        for (int c = c; c < cols; ++c) {
-            float val = __ldg(row_x + c);
+        for (int cc = c; cc < cols; ++cc) {
+            float val = __ldg(row_x + cc);
             if (val > local_max) {
                 local_sum = local_sum * expf(local_max - val) + 1.0f;
                 local_max = val;
@@ -149,6 +149,8 @@ static void SoftmaxCPU(const float* x, float* y, int rows, int cols) {
         }
         for (int c = 0; c < cols; ++c) y[r * cols + c] /= sum;
     }
+}
+
 }
 
 int main() {
