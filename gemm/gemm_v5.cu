@@ -5,6 +5,7 @@
 // - Switch compute core to Tensor Core via WMMA (TF32)
 
 #include <cuda_runtime.h>
+#include <cuda_fp16.h>
 #include <mma.h>
 
 #include <algorithm>
@@ -22,7 +23,7 @@ using namespace nvcuda;
 namespace {
 constexpr int kWmmaM = 16;
 constexpr int kWmmaN = 16;
-constexpr int kWmmaK = 8;  // TF32 uses m16n16k8
+constexpr int kWmmaK = 16;  // FP16 WMMA uses m16n16k16
 
 constexpr int kCtaM = 128;
 constexpr int kCtaN = 128;
@@ -30,8 +31,8 @@ constexpr int kWarpsPerBlock = 8;
 constexpr int kThreadsPerBlock = kWarpsPerBlock * 32;  // 256
 }  // namespace
 
-__global__ void GemmV5WmmaTf32Kernel(const float* __restrict__ A,
-                                     const float* __restrict__ B,
+__global__ void GemmV5WmmaFp16Kernel(const half* __restrict__ A,
+                                     const half* __restrict__ B,
                                      float* __restrict__ C,
                                      int M, int N, int K) {
   const int warp_id = threadIdx.x / 32;   // [0,7]
@@ -55,13 +56,13 @@ __global__ void GemmV5WmmaTf32Kernel(const float* __restrict__ A,
     wmma::fill_fragment(c_frag, 0.0f);
 
     for (int kk = 0; kk < K; kk += kWmmaK) {
-      const float* a_ptr = A + row * K + kk;
-      const float* b_ptr = B + kk * N + col;
+      const half* a_ptr = A + row * K + kk;
+      const half* b_ptr = B + kk * N + col;
 
       wmma::fragment<wmma::matrix_a, kWmmaM, kWmmaN, kWmmaK,
-                     wmma::precision::tf32, wmma::row_major> a_frag;
+                     half, wmma::row_major> a_frag;
       wmma::fragment<wmma::matrix_b, kWmmaM, kWmmaN, kWmmaK,
-                     wmma::precision::tf32, wmma::row_major> b_frag;
+                     half, wmma::row_major> b_frag;
 
       wmma::load_matrix_sync(a_frag, a_ptr, K);
       wmma::load_matrix_sync(b_frag, b_ptr, N);
@@ -99,8 +100,12 @@ int main() {
                        B(static_cast<size_t>(K) * N),
                        cpu(static_cast<size_t>(M) * N),
                        gpu(static_cast<size_t>(M) * N);
+    std::vector<half> A_half(static_cast<size_t>(M) * K),
+                      B_half(static_cast<size_t>(K) * N);
     common::InitMatrix(A, M, K);
     common::InitMatrix(B, K, N);
+    for (size_t idx = 0; idx < A.size(); ++idx) A_half[idx] = __float2half(A[idx]);
+    for (size_t idx = 0; idx < B.size(); ++idx) B_half[idx] = __float2half(B[idx]);
 
     const bool do_cpu_verify =
         (M <= kMaxCpuVerifyDim && N <= kMaxCpuVerifyDim && K <= kMaxCpuVerifyDim);
@@ -110,17 +115,18 @@ int main() {
 
     float gpu_ms = 0.0f;
     if (do_gpu_run && aligned) {
-      float *dA, *dB, *dC;
-      CHECK_CUDA(cudaMalloc(&dA, A.size() * sizeof(float)));
-      CHECK_CUDA(cudaMalloc(&dB, B.size() * sizeof(float)));
+      half *dA, *dB;
+      float* dC;
+      CHECK_CUDA(cudaMalloc(&dA, A_half.size() * sizeof(half)));
+      CHECK_CUDA(cudaMalloc(&dB, B_half.size() * sizeof(half)));
       CHECK_CUDA(cudaMalloc(&dC, gpu.size() * sizeof(float)));
-      CHECK_CUDA(cudaMemcpy(dA, A.data(), A.size() * sizeof(float), cudaMemcpyHostToDevice));
-      CHECK_CUDA(cudaMemcpy(dB, B.data(), B.size() * sizeof(float), cudaMemcpyHostToDevice));
+      CHECK_CUDA(cudaMemcpy(dA, A_half.data(), A_half.size() * sizeof(half), cudaMemcpyHostToDevice));
+      CHECK_CUDA(cudaMemcpy(dB, B_half.data(), B_half.size() * sizeof(half), cudaMemcpyHostToDevice));
 
       dim3 block(kThreadsPerBlock);
       dim3 grid((N + kCtaN - 1) / kCtaN, (M + kCtaM - 1) / kCtaM);
 
-      GemmV5WmmaTf32Kernel<<<grid, block>>>(dA, dB, dC, M, N, K);
+      GemmV5WmmaFp16Kernel<<<grid, block>>>(dA, dB, dC, M, N, K);
       CHECK_CUDA(cudaDeviceSynchronize());
 
       cudaEvent_t s, e;
@@ -130,7 +136,7 @@ int main() {
       gpu_times.reserve(kRepeat);
       for (int rep = 0; rep < kRepeat; ++rep) {
         CHECK_CUDA(cudaEventRecord(s));
-        GemmV5WmmaTf32Kernel<<<grid, block>>>(dA, dB, dC, M, N, K);
+        GemmV5WmmaFp16Kernel<<<grid, block>>>(dA, dB, dC, M, N, K);
         CHECK_CUDA(cudaEventRecord(e));
         CHECK_CUDA(cudaEventSynchronize(e));
         CHECK_CUDA(cudaGetLastError());
@@ -163,7 +169,7 @@ int main() {
     } else if (!aligned) {
       check = "SKIP_UNALIGNED";
     } else if (do_cpu_verify) {
-      // TF32 has lower mantissa precision than FP32; relax threshold.
+      // FP16 input with FP32 accumulate: keep a relaxed threshold for fair check.
       ok = common::CheckEqual(cpu, gpu, 5e-2f);
       max_abs_diff = common::MaxAbsDiff(cpu, gpu);
       check = ok ? "PASS" : "FAIL";

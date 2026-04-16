@@ -32,7 +32,7 @@ int main() {
   constexpr int kWarmup = 1;
   constexpr int kRepeat = 10;
   constexpr int kMaxCpuVerifyDim = 1024;
-  constexpr int kMaxGpuRunDim = 2048;
+  constexpr int kMaxGpuRunDim = 4096;
   auto cases = common::LoadOrCreateTestCasesCsv("data/gemm/test_cases.csv");
   std::filesystem::create_directories("data/results");
   std::ofstream ofs("data/results/gemm_naive_results.csv");
