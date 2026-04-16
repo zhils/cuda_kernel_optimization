@@ -1,13 +1,13 @@
-// RMSNorm V3: Based on V2 + auto-select block size by cols.
+// RMSNorm V3: 基于 V2 + 根据 cols 自动选择 block 大小
 //
-// Keep V2 optimizations:
-//   - staged path + stream fallback
-//   - alignment-guarded float4 vectorization
-//   - warp + cross-warp reduction
+// 保留 V2 的优化:
+// — 分阶段路径 + 流式回退方案
+// — 对齐保护的 float4 向量化
+// — warp + 跨-warp 归约
 //
-// V3 adds:
-//   - runtime block-size selection by cols
-//   - same kernel path with better launch configuration adaptability
+// V3 新增:
+// — 根据 cols 运行时选择 block 大小
+// — 相同 kernel 路径但具有更好的 launch 配置适应性
 
 #include <cuda_runtime.h>
 

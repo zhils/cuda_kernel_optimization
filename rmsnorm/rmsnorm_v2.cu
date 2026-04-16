@@ -1,13 +1,13 @@
-// RMSNorm V2: On top of V1, add vectorized + warp/block reduction.
+// RMSNorm V2: 在 V1 基础上, 添加向量化 + warp/block 归约
 //
-// Keep V1 optimizations:
-//   - staged path for small cols (single global read of x)
-//   - stream path fallback for large cols
-//   - __ldg and alignment-guarded float4 access
+// 保留 V1 的优化:
+// — 小 cols 的分阶段路径 (单次全局读取 x)
+// — 大 cols 的流式路径回退方案
+// — __ldg 和对齐保护的 float4 访问
 //
-// Additional V2 optimizations:
-//   - warp + cross-warp reduction for sq_sum
-//   - float4 vectorized load/store in both paths
+// 额外的 V2 优化:
+// — sq_sum 的 warp + 跨-warp 归约
+// — 两种路径都使用 float4 向量化加载/存储
 
 #include <cuda_runtime.h>
 

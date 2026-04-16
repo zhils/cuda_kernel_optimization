@@ -1,22 +1,22 @@
-// Softmax V3: Warp-level reduction + full staged mode
+// Softmax V3: Warp 级归约 + 完全分阶段模式
 //
-// Key optimizations over V2:
-//   P0: Warp-Level Reduction using __shfl_down_sync - reduces 8 syncthreads to 2
-//   P0: Staged mode: compute exp once, store in smem, reuse in normalization
-//   P1: Bank conflict avoided with shared memory padding (+1 offset)
+// 相对于 V2 的关键优化:
+// P0: 使用 __shfl_down_sync 的 Warp 级归约 - 将 8 次 syncthreads 减少到 2 次
+// P0: 分阶段模式: 计算一次 exp, 存入 smem, 在归一化时复用
+// P1: 通过共享内存 padding (+1 偏移) 避免 bank conflict
 //
-// Performance:
-//   - Staged (cols <= 10K): 2N reads + 1N writes + 2 syncthreads (optimal)
-//   - Streaming (cols > 10K): 3N reads + 1N writes + 2 syncthreads (fallback)
+// 性能:
+// — 分阶段 (cols <= 10K): 2N 读取 + 1N 写入 + 2 次 syncthreads (最优)
+// — 流式 (cols > 10K): 3N 读取 + 1N 写入 + 2 次 syncthreads (回退方案)
 //
-// Memory access patterns:
-//   - Staged: max(1N) + exp_sum(1N+smem write) + norm(1N smem read + 1N write)
-//   - Streaming: max(1N) + exp_sum(1N, compute x-max, store in smem) + exp_sum(read smem) + norm(1N smem read + 1N write)
+// 内存访问模式:
+// — 分阶段: max(1N) + exp_sum(1N+smem 写入) + norm(1N smem 读取 + 1N 写入)
+// — 流式: max(1N) + exp_sum(1N, 计算 x-max, 存入 smem) + exp_sum(读取 smem) + norm(1N smem 读取 + 1N 写入)
 //
-// Note: When cols > 10K (can't fit exp in smem), we store x-max diffs instead
-// to avoid redundant exp calculations at cost of extra memory bandwidth.
+// 注意: 当 cols > 10K (exp 数据无法放入 smem) 时, 我们改为存储 x-max 差值
+// 以避免冗余的 exp 计算, 代价是额外的内存带宽
 //
-// Reference: Milakov & Gimelshein, "Online normalizer calculation for softmax", 2018
+// 参考: Milakov & Gimelshein, "Online normalizer calculation for softmax", 2018
 
 #include <cuda_runtime.h>
 

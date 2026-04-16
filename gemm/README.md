@@ -1,4 +1,4 @@
-# GEMM CUDA 优化复盘（面试版）
+# GEMM CUDA 优化复盘
 
 ## 1. 项目目标
 
@@ -10,7 +10,6 @@
   - 为什么这一步是合理更新？
   - 改完后数据是否支持结论？
 
-这是面试时最关键的能力展示：不仅“会写 kernel”，还要“会定位瓶颈、会做工程取舍、会用数据闭环”。
 
 ---
 
@@ -47,7 +46,6 @@ A ∈ R^{M×K}, B ∈ R^{K×N}, C ∈ R^{M×N}
 
 ### Nsight 补图位（你后续补）
 
-- [TODO-NSIGHT-GEMM-1] `v0` 的 stall 饼图（Long Scoreboard / LG Throttle / Not Selected）
 - [TODO-NSIGHT-GEMM-2] `v1/v2` 的 global memory transaction 对比
 - [TODO-NSIGHT-GEMM-3] `v3/v4/v5` 的 SM 利用率与 Tensor Core 指标对比
 - [TODO-NSIGHT-GEMM-4] 与 cuBLAS 的 roofline 点位图
@@ -57,19 +55,21 @@ A ∈ R^{M×K}, B ∈ R^{K×N}, C ∈ R^{M×N}
 ## 3. 版本演进（上一版问题 -> 为什么升级 -> 改动）
 
 ## 3.1 v0：朴素基线
-
 **文件：** `gemm_v0_naive.cu`
 
 ### 问题
-
 - 每线程只算一个 `C` 元素；
 - A/B 元素被大量重复从全局内存读取；
-- 访存延迟主导，算力几乎吃不满。
+- 访存延迟主导，算力几乎吃不满。理论上应该是计算受限的内容，现在在roofline中却处于memory受限状态。可以参考文档中，gemm_v0_roofline.png文件。
+
+### 下一步规划：
+- 减少从全局内存的读写次数：v0版本读写次数为2x（MxK + KxN + MxN）。在v1版本中，通过共享内存复用，将读写次数减少为1x（MxK + KxN + MxN）。
+- 优化数据加载形势：通过向量化加载，数据对齐，访存对齐等策略，减少数据加载指令数量，提升访存效率。
+
 
 ### 价值
+- 给后续优化提供正确性与性能下限。
 
-- 给后续优化提供正确性与性能下限；
-- 方便用 Nsight 建立第一轮瓶颈证据。
 
 ## 3.2 v1：共享内存分块
 

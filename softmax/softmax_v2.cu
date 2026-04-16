@@ -1,14 +1,14 @@
-// Softmax V2: Online softmax (single-pass algorithm)
+// Softmax V2: 在线 softmax (单遍算法)
 //
-// Key optimizations over V1:
-//   - Single pass over data instead of three (max, exp-sum, normalize)
-//   - Maintains running max and sum simultaneously
-//   - Rescales partial sums on-the-fly when a new max is found
-//   - Reduces memory traffic by ~3x
-//   - Uses __ldg (read-only cache) for global memory reads
-//   - Uses float4 vectorized loads when memory is 16-byte aligned
+// 相对于 V1 的关键优化:
+// — 单遍遍历数据而非三遍 (max, exp-sum, normalize)
+// — 同时维护运行中的 max 和 sum
+// — 当发现新 max 时即时重新缩放部分和
+// — 内存流量减少约 3x
+// — 使用 __ldg (只读缓存) 读取全局内存
+// — 当内存 16 字节对齐时使用 float4 向量化加载
 //
-// Reference: Milakov & Gimelshein, "Online normalizer calculation for softmax", 2018
+// 参考: Milakov & Gimelshein, "Online normalizer calculation for softmax", 2018
 
 #include <cuda_runtime.h>
 

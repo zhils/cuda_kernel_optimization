@@ -1,9 +1,9 @@
-// GEMM V4: Larger tile on top of V3 (128x128, K-tile=32)
+// GEMM V4: 基于 V3 增大 tile 大小 (128x128, K-tile=32)
 //
-// Design goals:
-// 1) Increase CTA tile from 64x64 to 128x128
-// 2) Increase K tile from 8 to 32 for higher arithmetic intensity
-// 3) Keep register prefetch software pipeline from V3
+// 设计目标:
+// 1) 将 CTA tile 从 64x64 增大到 128x128
+// 2) 将 K tile 从 8 增大到 32 以提高算术强度
+// 3) 保留 V3 的寄存器预取软件流水线
 
 #include <cuda_runtime.h>
 
@@ -27,11 +27,9 @@ constexpr int kCtaM = kBY * kTM;  // 128
 constexpr int kCtaN = kBX * kTN;  // 128
 }  // namespace
 
-__global__ void __launch_bounds__(256, 2)
-GemmV4Kernel(const float* __restrict__ A,
-             const float* __restrict__ B,
-             float* __restrict__ C,
-             int M, int N, int K) {
+__global__ void __launch_bounds__(256, 2) GemmV4Kernel(const float* __restrict__ A,
+  const float* __restrict__ B, float* __restrict__ C, int M, int N, int K) {
+    
   constexpr int kThreads = kBX * kBY;  // 256
   constexpr int kALoads = (kCtaM * (kTileK / 4)) / kThreads;  // 4
   constexpr int kBLoads = (kTileK * (kCtaN / 4)) / kThreads;  // 4

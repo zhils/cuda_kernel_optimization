@@ -1,8 +1,8 @@
-// GEMM V5: Tensor Core TF32 WMMA implementation.
+// GEMM V5: Tensor Core TF32 WMMA 实现
 //
-// Built on V4 direction:
-// - Keep large CTA tile idea (128x128)
-// - Switch compute core to Tensor Core via WMMA (TF32)
+// 基于 V4 方向:
+// — 保持大 CTA tile 理念 (128x128)
+// — 通过 WMMA 切换计算核心到 Tensor Core (TF32)
 
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
