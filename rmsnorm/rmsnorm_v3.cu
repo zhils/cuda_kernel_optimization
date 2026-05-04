@@ -22,6 +22,7 @@
 
 #include "common/benchmark.h"
 #include "common/cuda_utils.h"
+#include "rmsnorm/test_utils.h"
 
 namespace {
 static constexpr float kEps = 1e-5f;
@@ -217,16 +218,17 @@ static void RMSNormCPU(const float* x, float* y, const float* weight,
 
 int main() {
     constexpr int kRepeat = 10;
-    auto cases = common::LoadOrCreateTestCasesCsv("data/rmsnorm/test_cases.csv");
+    constexpr int kTestCases = 5;
     std::filesystem::create_directories("data/results");
     std::ofstream ofs("data/results/rmsnorm_v3_results.csv");
     ofs << "id,rows,cols,threads,gpu_ms,bandwidth_gb_s,max_abs_diff,check\n";
 
-    for (size_t i = 0; i < cases.size(); ++i) {
-        int rows = cases[i].rows, cols = cases[i].cols, n = rows * cols;
-        std::vector<float> x(n), w(cols), cpu(n), gpu(n);
-        common::InitMatrix(x, rows, cols);
-        common::InitMatrix(w, 1, cols);
+    for (int i = 0; i < kTestCases; ++i) {
+        auto cfg = rmsnorm::RandomTestConfig(2026 + i);
+        int rows = cfg.rows, cols = cfg.cols, n = rows * cols;
+        std::vector<float> x = rmsnorm::RandomMatrix(rows, cols, 2026 + i);
+        std::vector<float> w = rmsnorm::RandomWeight(cols, 2026 + i + 100);
+        std::vector<float> cpu(n), gpu(n);
         RMSNormCPU(x.data(), cpu.data(), w.data(), rows, cols, kEps);
 
         float *dx, *dy, *dw;

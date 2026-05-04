@@ -2,9 +2,9 @@
 //
 // 1) 减少全局内存读写
 //    - V0 每行对 x 遍历两次（先算平方和，再缩放），全局读 x 为 2×cols。
-//    - 当单行长度 cols 可在共享内存中暂存整行 x 时：全局只读一遍 x 到共享内存，
-//      平方和与写 y 均从共享读，全局读 x 降为 1×cols。
+//    - 当单行长度 cols 可在共享内存中暂存整行 x 时：全局只读一遍 x 到共享内存，平方和与写 y 均从共享读，全局读 x 降为 1×cols。
 //    - cols 过大时回退为两阶段 stream 路径，仍用 block 内树形归约得到 sq_sum（修正仅单 warp 归约的错误）。
+//    - 测试场景，一行最多4096个数据，也就是4K,float 2个字节，也就是8K，符合共享内存限制。
 //
 // 2) 优化全局内存读写形式
 //    - 只读路径对 x、weight 使用 __ldg
@@ -23,6 +23,7 @@
 
 #include "common/benchmark.h"
 #include "common/cuda_utils.h"
+#include "rmsnorm/test_utils.h"
 
 namespace {
 
@@ -45,9 +46,12 @@ __device__ inline void StoreFloat4(float* p, const float4& v) {
 }
 
 // ---------- Staged: 整行 x 驻留共享内存，全局只读一次 x ----------
-__global__ void RMSNormV1StagedKernel(const float* __restrict__ x, float* __restrict__ y,
-                                      const float* __restrict__ weight, int rows, int cols,
-                                      float eps) {
+__global__ void RMSNormV1StagedKernel(
+    const float* __restrict__ x, 
+    float* __restrict__ y,
+    const float* __restrict__ weight, 
+    int rows, int cols,float eps
+) {
     extern __shared__ float sdata[];
     float* s_row = sdata;
     float* s_red = sdata + cols;
@@ -199,16 +203,17 @@ static void RMSNormCPU(const float* x, float* y, const float* weight, int rows, 
 
 int main() {
     constexpr int kRepeat = 10;
-    auto cases = common::LoadOrCreateTestCasesCsv("data/rmsnorm/test_cases.csv");
+    constexpr int kTestCases = 5;
     std::filesystem::create_directories("data/results");
     std::ofstream ofs("data/results/rmsnorm_v1_results.csv");
     ofs << "id,rows,cols,gpu_ms,bandwidth_gb_s,max_abs_diff,check\n";
 
-    for (size_t i = 0; i < cases.size(); ++i) {
-        int rows = cases[i].rows, cols = cases[i].cols, n = rows * cols;
-        std::vector<float> x(n), w(cols), cpu(n), gpu(n);
-        common::InitMatrix(x, rows, cols);
-        common::InitMatrix(w, 1, cols);
+    for (int i = 0; i < kTestCases; ++i) {
+        auto cfg = rmsnorm::RandomTestConfig(2026 + i);
+        int rows = cfg.rows, cols = cfg.cols, n = rows * cols;
+        std::vector<float> x = rmsnorm::RandomMatrix(rows, cols, 2026 + i);
+        std::vector<float> w = rmsnorm::RandomWeight(cols, 2026 + i + 100);
+        std::vector<float> cpu(n), gpu(n);
         RMSNormCPU(x.data(), cpu.data(), w.data(), rows, cols, kEps);
 
         float *dx, *dy, *dw;

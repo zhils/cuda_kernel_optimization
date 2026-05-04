@@ -8,6 +8,7 @@
 
 #include "common/benchmark.h"
 #include "common/cuda_utils.h"
+#include "rmsnorm/test_utils.h"
 
 __global__ void RMSNormKernel(const float* x, float* y, const float* weight, int rows, int cols, float eps) {
   int r = blockIdx.x * blockDim.x + threadIdx.x;
@@ -39,15 +40,16 @@ static void RMSNormCPU(const float* x, float* y, const float* weight, int rows, 
 
 int main() {
   constexpr float kEps = 1e-5f;
-  auto cs = common::LoadOrCreateTestCasesCsv("data/rmsnorm/test_cases.csv");
+  constexpr int kTestCases = 5;
   std::filesystem::create_directories("data/results");
   std::ofstream ofs("data/results/rmsnorm_naive_results.csv");
   ofs << "id,group,rows,cols,cpu_ms,gpu_ms,speedup,max_abs_diff,check\n";
-  for (size_t i = 0; i < cs.size(); ++i) {
-    int rows = cs[i].rows, cols = cs[i].cols, n = rows * cols;
-    std::vector<float> x(n), cpu(n), gpu(n), weight(cols);
-    common::InitMatrix(x, rows, cols);
-    common::InitMatrix(weight, 1, cols);
+  for (int i = 0; i < kTestCases; ++i) {
+    auto cfg = rmsnorm::RandomTestConfig(2026 + i);
+    int rows = cfg.rows, cols = cfg.cols, n = rows * cols;
+    std::vector<float> x = rmsnorm::RandomMatrix(rows, cols, 2026 + i);
+    std::vector<float> weight = rmsnorm::RandomWeight(cols, 2026 + i + 100);
+    std::vector<float> cpu(n), gpu(n);
     auto t0 = std::chrono::high_resolution_clock::now();
     RMSNormCPU(x.data(), cpu.data(), weight.data(), rows, cols, kEps);
     auto t1 = std::chrono::high_resolution_clock::now();
@@ -68,7 +70,7 @@ int main() {
     float gpu_ms = 0.f;
     CHECK_CUDA(cudaEventElapsedTime(&gpu_ms, s, e));
     CHECK_CUDA(cudaMemcpy(gpu.data(), dy, n * sizeof(float), cudaMemcpyDeviceToHost));
-    ofs << i << "," << cs[i].group << "," << rows << "," << cols << "," << cpu_ms << "," << gpu_ms << ","
+    ofs << i << ",A," << rows << "," << cols << "," << cpu_ms << "," << gpu_ms << ","
         << (gpu_ms > 0 ? cpu_ms / gpu_ms : 0) << ","
         << common::MaxAbsDiff(cpu, gpu) << "," << (common::CheckEqual(cpu, gpu, 1e-4f) ? "PASS" : "FAIL") << "\n";
     CHECK_CUDA(cudaEventDestroy(s));
