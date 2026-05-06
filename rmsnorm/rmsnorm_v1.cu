@@ -1,97 +1,90 @@
-// RMSNorm V1: 2维 block + float4 协作加载 + 共享内存 staging
+// RMSNorm V1: 1维 block + float4 向量化 + 共享内存 staging
 //
 // 核心设计:
-// — 2维 block: br 行 × bc 列线程, 每个 block 同时处理 br 行数据
-// — float4 向量化: 每个线程每次加载 4 个 float, 全局内存带宽最大化
-// — 共享内存 staging: 整行数据先加载到 smem, 计算和写回都从 smem 进行
-// — 串行归约: 每行第一个线程串行计算 sq_sum
+// — 1维 block: 128 线程 = 4 个 warp，每个 warp 处理一行数据
+// — 共享内存 staging: 数据先加载到共享内存，后续计算从共享内存读取
+// — 串行归约: 每个 warp 的 lane 0 计算该行的 sq_sum
+// — float4 向量化: 使用 float4 加载和写回，提升内存带宽
 
 #include <cuda_runtime.h>
 
-#include <algorithm>
 #include <cmath>
-#include <cstdint>
 #include <filesystem>
 #include <fstream>
 #include <iomanip>
 #include <iostream>
 #include <vector>
 
-#include "common/benchmark.h"
-#include "common/cuda_utils.h"
-#include "rmsnorm/test_utils.h"
+#include "../common/include/common/benchmark.h"
+#include "../common/include/common/cuda_utils.h"
+#include "test_utils.h"
 
 #define EPS 1e-5f
-#define BR 8
-#define BC 32
+#define BLOCK_SIZE 128
+#define WARP_SIZE 32
+#define WARPS_PER_BLOCK 4
 
-// ---------- 2D Block Kernel: 协作加载 + 共享内存计算 ----------
-// 每个 block 处理 BR 行, 每行由 BC 个线程协作
-// 共享内存布局: [BR][cols + padding] 存储输入数据
-__global__ void RMSNormV1Kernel(const float* __restrict__ x,
-                                float* __restrict__ y,
-                                const float* __restrict__ weight,
-                                int rows, int cols, float eps) {
-    // 共享内存: 存储 BR 行数据, 每行 +1 padding 避免 bank conflict
-    extern __shared__ float smem[];
-    float* sdata = smem;  // [BR][cols + 1]
-
-    const int tx = threadIdx.x;  // 列方向线程 id [0, BC)
-    const int ty = threadIdx.y;  // 行方向线程 id [0, BR)
-    const int row_base = blockIdx.x * BR;  // block 负责的起始行
-    const int row = row_base + ty;          // 当前线程负责的行
-
+// ---------- 1D Block Kernel: 每个 warp 处理一行 ----------
+__global__ void RMSNormV1Kernel(
+    const float* __restrict__ x,
+    float* __restrict__ y,
+    const float* __restrict__ weight,
+    int rows, int cols, float eps
+) {
+    const int warp_id = threadIdx.x / WARP_SIZE;
+    const int lane = threadIdx.x % WARP_SIZE;
+    const int row = blockIdx.x * WARPS_PER_BLOCK + warp_id;
     if (row >= rows) return;
 
-    const float* row_x = x + static_cast<std::size_t>(row) * cols;
-    float* row_y = y + static_cast<std::size_t>(row) * cols;
-    float* s_row = sdata + ty * (cols + 1);  // 当前行在 smem 中的起始位置
+    const float* row_x = x + row * cols;
+    float* row_y = y + row * cols;
 
-    // ---- Step 1: 协作加载全局内存 → 共享内存 (float4) ----
-    // 每行 BC 个线程协作, 每个线程加载 float4
+    // 静态共享内存: 存储每个 warp 的 sq_sum (4 个 float)
+    __shared__ float s_sq_sum[WARPS_PER_BLOCK];
+    // 动态共享内存: 存储 4 行数据，每行 cols 个 float
+    extern __shared__ float s_data[];
+    float* s_row = s_data + warp_id * cols;  // 每个 warp 指向自己的行
+
+    // Step 1: 每个 warp 协作加载一行数据到共享内存 (float4 向量化)
     const int cols4 = cols / 4;
-    for (int c = tx; c < cols4; c += BC) {
+    for (int c = lane; c < cols4; c += WARP_SIZE) {
         const float4 v = *reinterpret_cast<const float4*>(row_x + c * 4);
         s_row[c * 4 + 0] = v.x;
         s_row[c * 4 + 1] = v.y;
         s_row[c * 4 + 2] = v.z;
         s_row[c * 4 + 3] = v.w;
     }
-    // 处理尾部 (cols 不是 4 的倍数时)
-    for (int c = cols4 * 4 + tx; c < cols; c += BC) {
+    // 处理尾巴 (cols 不是 4 的倍数)
+    for (int c = cols4 * 4 + lane; c < cols; c += WARP_SIZE) {
         s_row[c] = row_x[c];
     }
     __syncthreads();
 
-    // ---- Step 2: 串行计算平方和 (仅每行第一个线程执行) ----
-    if (tx == 0) {
+    // Step 2: 每个 warp 的 lane 0 串行计算平方和 (从共享内存读取)
+    if (lane == 0) {
         float sq_sum = 0.f;
-        const int c4 = cols / 4;
-        for (int c = 0; c < c4; ++c) {
-            const float4 v = *reinterpret_cast<const float4*>(s_row + c * 4);
-            sq_sum += v.x * v.x + v.y * v.y + v.z * v.z + v.w * v.w;
+        for (int c = 0; c < cols; ++c) {
+            const float val = s_row[c];
+            sq_sum += val * val;
         }
-        for (int c = c4 * 4; c < cols; ++c) {
-            const float v = s_row[c];
-            sq_sum += v * v;
-        }
-        s_row[cols] = sq_sum;  // 暂存到行尾 (预留的 cols+1 空间)
+        s_sq_sum[warp_id] = sq_sum;
     }
     __syncthreads();
 
-    // 计算 RMS
-    const float sq_sum = s_row[cols];
-    const float rms = rsqrtf(sq_sum / static_cast<float>(cols) + eps);
-
-    // ---- Step 3: 写回结果 (共享内存 → 全局内存, float4) ----
-    for (int c = tx; c < cols4; c += BC) {
+    // Step 3: 计算 RMS 并写回结果 (从共享内存读取，float4 向量化写回)
+    const float rms = rsqrtf(s_sq_sum[warp_id] / static_cast<float>(cols) + eps);
+    for (int c = lane; c < cols4; c += WARP_SIZE) {
         const float4 vx = *reinterpret_cast<const float4*>(s_row + c * 4);
         const float4 vw = *reinterpret_cast<const float4*>(weight + c * 4);
-        *reinterpret_cast<float4*>(row_y + c * 4) =
-            make_float4(vx.x * rms * vw.x, vx.y * rms * vw.y,
-                        vx.z * rms * vw.z, vx.w * rms * vw.w);
+        float4 vy;
+        vy.x = vx.x * rms * vw.x;
+        vy.y = vx.y * rms * vw.y;
+        vy.z = vx.z * rms * vw.z;
+        vy.w = vx.w * rms * vw.w;
+        *reinterpret_cast<float4*>(row_y + c * 4) = vy;
     }
-    for (int c = cols4 * 4 + tx; c < cols; c += BC) {
+    // 处理尾巴 (cols 不是 4 的倍数)
+    for (int c = cols4 * 4 + lane; c < cols; c += WARP_SIZE) {
         row_y[c] = s_row[c] * rms * weight[c];
     }
 }
@@ -133,10 +126,11 @@ int main() {
         CHECK_CUDA(cudaMemcpy(dx, x.data(), n * sizeof(float), cudaMemcpyHostToDevice));
         CHECK_CUDA(cudaMemcpy(dw, w.data(), cols * sizeof(float), cudaMemcpyHostToDevice));
 
-        const std::size_t smem_size = BR * (cols + 1) * sizeof(float);
-        dim3 block(BC, BR);
-        dim3 grid((rows + BR - 1) / BR);
+        const size_t smem_size = WARPS_PER_BLOCK * cols * sizeof(float);
+        dim3 block(BLOCK_SIZE);
+        dim3 grid((rows + WARPS_PER_BLOCK - 1) / WARPS_PER_BLOCK);
 
+        cudaFuncSetAttribute(RMSNormV1Kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size);
         RMSNormV1Kernel<<<grid, block, smem_size>>>(dx, dy, dw, rows, cols, EPS);
         CHECK_CUDA(cudaDeviceSynchronize());
 

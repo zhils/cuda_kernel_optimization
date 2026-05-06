@@ -1,10 +1,10 @@
 #include <cuda_runtime.h>
 #include <cublas_v2.h>
 
-#include <chrono>
 #include <algorithm>
 #include <filesystem>
 #include <fstream>
+#include <iomanip>
 #include <iostream>
 #include <vector>
 
@@ -30,85 +30,108 @@ static void GemmCPU(const float* A, const float* B, float* C, int M, int N, int 
     }
 }
 
+static inline __half float2half(float f) { return __float2half(f); }
+static inline float half2float(__half h) { return __half2float(h); }
+
 int main() {
   constexpr int kWarmup = 3;
   constexpr int kRepeat = 10;
   constexpr int kMaxCpuVerifyDim = 1024;
   auto cases = common::LoadOrCreateTestCasesCsv("data/gemm/test_cases.csv");
   std::filesystem::create_directories("data/results");
-  std::ofstream ofs("data/results/gemm_nvidia_ref_results.csv");
-  ofs << "id,group,M,N,K,cpu_ms,cublas_ms,speedup,max_abs_diff,check\n";
+  std::ofstream ofs("data/results/gemm_cublas_tensor_results.csv");
+  ofs << "id,group,M,N,K,gpu_ms,gflops,max_abs_diff,check\n";
 
   cublasHandle_t handle;
   CHECK_CUBLAS(cublasCreate(&handle));
+
+  CHECK_CUBLAS(cublasSetMathMode(handle, CUBLAS_TENSOR_OP_MATH));
+
+  std::cout << "cuBLAS GEMM Ex (Tensor Core FP16, FP32 accumulate)\n";
+  std::cout << "====================================================\n\n";
+
   for (size_t i = 0; i < cases.size(); ++i) {
-    int M = cases[i].rows, N = cases[i].cols, K = (M + N) / 2;
-    std::vector<float> A(M * K), B(K * N), cpu(M * N), ref(M * N);
+    int M = cases[i].rows, N = cases[i].cols, K = M;
+    std::vector<float> A(M * K), B(K * N), cpu(M * N);
     common::InitMatrix(A, M, K);
     common::InitMatrix(B, K, N);
 
-    const bool do_cpu_verify = (M <= kMaxCpuVerifyDim && N <= kMaxCpuVerifyDim && K <= kMaxCpuVerifyDim);
-    double cpu_ms = 0.0;
+    const bool do_cpu_verify = (M <= kMaxCpuVerifyDim && N <= kMaxCpuVerifyDim);
     if (do_cpu_verify) {
-      auto t0 = std::chrono::high_resolution_clock::now();
       GemmCPU(A.data(), B.data(), cpu.data(), M, N, K);
-      auto t1 = std::chrono::high_resolution_clock::now();
-      cpu_ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
     }
 
-    float *dA, *dB, *dC;
-    CHECK_CUDA(cudaMalloc(&dA, A.size() * sizeof(float)));
-    CHECK_CUDA(cudaMalloc(&dB, B.size() * sizeof(float)));
-    CHECK_CUDA(cudaMalloc(&dC, ref.size() * sizeof(float)));
-    CHECK_CUDA(cudaMemcpy(dA, A.data(), A.size() * sizeof(float), cudaMemcpyHostToDevice));
-    CHECK_CUDA(cudaMemcpy(dB, B.data(), B.size() * sizeof(float), cudaMemcpyHostToDevice));
+    std::vector<__half> dA_half(M * K), dB_half(K * N);
+    for (int j = 0; j < M * K; ++j) dA_half[j] = float2half(A[j]);
+    for (int j = 0; j < K * N; ++j) dB_half[j] = float2half(B[j]);
 
-    // cuBLAS uses column-major; we use transposed ops to match row-major GEMM.
+    __half *dA, *dB;
+    float *dC;
+    CHECK_CUDA(cudaMalloc(&dA, M * K * sizeof(__half)));
+    CHECK_CUDA(cudaMalloc(&dB, K * N * sizeof(__half)));
+    CHECK_CUDA(cudaMalloc(&dC, M * N * sizeof(float)));
+    CHECK_CUDA(cudaMemcpy(dA, dA_half.data(), M * K * sizeof(__half), cudaMemcpyHostToDevice));
+    CHECK_CUDA(cudaMemcpy(dB, dB_half.data(), K * N * sizeof(__half), cudaMemcpyHostToDevice));
+
     float alpha = 1.0f, beta = 0.0f;
+
+    for (int w = 0; w < kWarmup; ++w) {
+      CHECK_CUBLAS(cublasGemmEx(handle,
+                                CUBLAS_OP_N, CUBLAS_OP_N,
+                                N, M, K,
+                                &alpha,
+                                dB, CUDA_R_16F, N,
+                                dA, CUDA_R_16F, K,
+                                &beta,
+                                dC, CUDA_R_32F, N,
+                                CUDA_R_32F,
+                                CUBLAS_GEMM_DEFAULT_TENSOR_OP));
+    }
+    CHECK_CUDA(cudaDeviceSynchronize());
+
     cudaEvent_t s, e;
     CHECK_CUDA(cudaEventCreate(&s));
     CHECK_CUDA(cudaEventCreate(&e));
-    for (int w = 0; w < kWarmup; ++w) {
-      CHECK_CUBLAS(cublasSgemm(handle, CUBLAS_OP_N, CUBLAS_OP_N, N, M, K, &alpha, dB, N, dA, K,
-                               &beta, dC, N));
-    }
-    CHECK_CUDA(cudaDeviceSynchronize());
-    std::vector<float> cublas_times;
-    cublas_times.reserve(kRepeat);
+    CHECK_CUDA(cudaEventRecord(s));
     for (int rep = 0; rep < kRepeat; ++rep) {
-      CHECK_CUDA(cudaEventRecord(s));
-      CHECK_CUBLAS(cublasSgemm(handle, CUBLAS_OP_N, CUBLAS_OP_N, N, M, K, &alpha, dB, N, dA, K,
-                               &beta, dC, N));
-      CHECK_CUDA(cudaEventRecord(e));
-      CHECK_CUDA(cudaEventSynchronize(e));
-      float ms = 0.f;
-      CHECK_CUDA(cudaEventElapsedTime(&ms, s, e));
-      cublas_times.push_back(ms);
+      CHECK_CUBLAS(cublasGemmEx(handle,
+                                CUBLAS_OP_N, CUBLAS_OP_N,
+                                N, M, K,
+                                &alpha,
+                                dB, CUDA_R_16F, N,
+                                dA, CUDA_R_16F, K,
+                                &beta,
+                                dC, CUDA_R_32F, N,
+                                CUDA_R_32F,
+                                CUBLAS_GEMM_DEFAULT_TENSOR_OP));
     }
-    std::sort(cublas_times.begin(), cublas_times.end());
-    float cublas_ms = 0.f;
-    if (cublas_times.size() > 2) {
-      for (size_t t = 1; t + 1 < cublas_times.size(); ++t) {
-        cublas_ms += cublas_times[t];
-      }
-      cublas_ms /= static_cast<float>(cublas_times.size() - 2);
-    } else if (!cublas_times.empty()) {
-      for (float t : cublas_times) cublas_ms += t;
-      cublas_ms /= static_cast<float>(cublas_times.size());
-    }
-    CHECK_CUDA(cudaMemcpy(ref.data(), dC, ref.size() * sizeof(float), cudaMemcpyDeviceToHost));
+    CHECK_CUDA(cudaEventRecord(e));
+    CHECK_CUDA(cudaEventSynchronize(e));
+    float ms = 0.f;
+    CHECK_CUDA(cudaEventElapsedTime(&ms, s, e));
+    ms /= kRepeat;
+
+    std::vector<float> ref(M * N);
+    CHECK_CUDA(cudaMemcpy(ref.data(), dC, M * N * sizeof(float), cudaMemcpyDeviceToHost));
 
     bool ok = true;
     double max_abs_diff = 0.0;
     const char* check = "SKIP";
     if (do_cpu_verify) {
-      ok = common::CheckEqual(cpu, ref, 1e-3f);
+      ok = common::CheckEqual(cpu, ref, 1e-2f);
       max_abs_diff = common::MaxAbsDiff(cpu, ref);
       check = ok ? "PASS" : "FAIL";
     }
-    ofs << cases[i].id << "," << cases[i].group << "," << M << "," << N << "," << K << "," << cpu_ms << "," << cublas_ms
-        << "," << (cublas_ms > 0 ? cpu_ms / cublas_ms : 0) << "," << max_abs_diff << "," << check
-        << "\n";
+
+    double gflops = (2.0 * M * N * K) / (ms * 1e6);
+
+    std::cout << M << "x" << N << "x" << K << " | " << std::fixed << std::setprecision(4) << ms << " ms"
+              << " | " << std::setprecision(1) << gflops << " GFLOP/s"
+              << " | " << check << "\n";
+
+    ofs << i << ",cublas_tensor," << M << "," << N << "," << K << ","
+        << ms << "," << gflops << ","
+        << max_abs_diff << "," << check << "\n";
 
     CHECK_CUDA(cudaEventDestroy(s));
     CHECK_CUDA(cudaEventDestroy(e));
@@ -116,6 +139,7 @@ int main() {
     CHECK_CUDA(cudaFree(dB));
     CHECK_CUDA(cudaFree(dC));
   }
+
   CHECK_CUBLAS(cublasDestroy(handle));
   return 0;
 }

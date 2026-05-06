@@ -116,10 +116,10 @@ inline bool CanStageRowV1V2(int cols) {
 }
 
 inline int PickThreadsByColsV3(int cols) {
-  if (cols <= 128) return 64;
-  if (cols <= 512) return 128;
-  if (cols <= 2048) return 256;
-  return 512;
+  if (cols <= 256) return 128;
+  if (cols <= 1024) return 256;
+  if (cols <= 4096) return 512;
+  return 64;
 }
 
 inline bool CanStageRowV3(int cols, int threads) {

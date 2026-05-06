@@ -6,6 +6,7 @@
 #include <cmath>
 #include <filesystem>
 #include <fstream>
+#include <iomanip>
 #include <iostream>
 #include <vector>
 
@@ -38,6 +39,7 @@ static void SoftmaxCPU(const float* x, float* y, int rows, int cols) {
 }
 
 int main() {
+  constexpr int kRepeat = 10;
   auto cs = common::LoadOrCreateTestCasesCsv("data/softmax/test_cases.csv");
   std::filesystem::create_directories("data/results");
   std::ofstream ofs("data/results/softmax_nvidia_ref_results.csv");
@@ -65,24 +67,33 @@ int main() {
     CHECK_CUDNN(cudnnCreateTensorDescriptor(&desc));
     CHECK_CUDNN(cudnnSetTensor4dDescriptor(desc, CUDNN_TENSOR_NCHW, CUDNN_DATA_FLOAT, rows, cols, 1, 1));
 
+    float alpha = 1.f, beta = 0.f;
+    CHECK_CUDNN(cudnnSoftmaxForward(cudnn, CUDNN_SOFTMAX_ACCURATE, CUDNN_SOFTMAX_MODE_INSTANCE,
+                                      &alpha, desc, dx, &beta, desc, dy));
+    CHECK_CUDA(cudaDeviceSynchronize());
+
     cudaEvent_t s, e;
     CHECK_CUDA(cudaEventCreate(&s));
     CHECK_CUDA(cudaEventCreate(&e));
-
-    float alpha = 1.f, beta = 0.f;
     CHECK_CUDA(cudaEventRecord(s));
-    CHECK_CUDNN(cudnnSoftmaxForward(cudnn, CUDNN_SOFTMAX_ACCURATE, CUDNN_SOFTMAX_MODE_INSTANCE,
-                                      &alpha, desc, dx, &beta, desc, dy));
+    for (int rep = 0; rep < kRepeat; ++rep) {
+      CHECK_CUDNN(cudnnSoftmaxForward(cudnn, CUDNN_SOFTMAX_ACCURATE, CUDNN_SOFTMAX_MODE_INSTANCE,
+                                        &alpha, desc, dx, &beta, desc, dy));
+    }
     CHECK_CUDA(cudaEventRecord(e));
     CHECK_CUDA(cudaEventSynchronize(e));
-    float cudnn_ms = 0.f;
-    CHECK_CUDA(cudaEventElapsedTime(&cudnn_ms, s, e));
+    float cudnn_ms_total = 0.f;
+    CHECK_CUDA(cudaEventElapsedTime(&cudnn_ms_total, s, e));
+    const float cudnn_ms = cudnn_ms_total / static_cast<float>(kRepeat);
     CHECK_CUDA(cudaMemcpy(ref_gpu.data(), dy, n * sizeof(float), cudaMemcpyDeviceToHost));
 
     ofs << i << "," << cs[i].group << "," << rows << "," << cols << "," << cpu_ms << "," << 0 << "," << cudnn_ms << ","
         << 0 << ","
         << (cudnn_ms > 0 ? cpu_ms / cudnn_ms : 0) << ","
         << common::MaxAbsDiff(cpu, ref_gpu) << "," << (common::CheckEqual(cpu, ref_gpu, 1e-4f) ? "PASS" : "FAIL") << "\n";
+
+    std::cout << rows << "x" << cols << " | " << std::fixed << std::setprecision(4) << cudnn_ms << " ms"
+              << " | " << (common::CheckEqual(cpu, ref_gpu, 1e-4f) ? "PASS" : "FAIL") << "\n";
 
     CHECK_CUDNN(cudnnDestroyTensorDescriptor(desc));
     CHECK_CUDA(cudaEventDestroy(s));

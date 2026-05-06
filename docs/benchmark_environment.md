@@ -26,7 +26,7 @@
 | NVIDIA Driver | 550.90+ |
 | nvcc | 12.9 |
 | CMake | 3.18+ |
-| OS | Windows 11 / Linux |
+| OS | Windows 11（文档与复现步骤以 Windows 为准） |
 
 ## Benchmark Methodology
 
@@ -37,20 +37,26 @@
 5. **Correctness:** Every kernel output is verified against CPU reference (`max_abs_diff < threshold`)
 6. **Throttling:** Ensure GPU is at base clock (no thermal throttling) via `nvidia-smi`
 
-## How to Reproduce
+## How to Reproduce (Windows, PowerShell)
 
-```bash
-# Verify GPU status
+From the **repository root**:
+
+```powershell
 nvidia-smi
 
-# Build
-mkdir build && cd build
-cmake .. -DCMAKE_CUDA_ARCHITECTURES=120
-make -j$(nproc)
+New-Item -ItemType Directory -Force build | Out-Null
+Set-Location build
+cmake .. -G "Visual Studio 17 2022" -A x64 -DCMAKE_CUDA_ARCHITECTURES=120
+cmake --build . --config Release
+Set-Location ..
 
-# Run benchmarks from project root
-cd ..
-./build/bin/gemm_benchmark_all
-./build/bin/softmax_benchmark_all
-./build/bin/rmsnorm_benchmark_all
+.\build\bin\Release\gemm_benchmark_all.exe
+.\build\bin\Release\softmax_benchmark_all.exe
+.\build\bin\Release\rmsnorm_benchmark_all.exe
 ```
+
+Executables are under `build/bin/Release/` when using the **Visual Studio** multi-config generator. With **Ninja**, use `build/bin/*.exe` instead.
+
+## Repository hygiene (GitHub)
+
+What to commit, what to keep local, and cuDNN path notes: see **[github_repository_guidelines.md](github_repository_guidelines.md)** (Chinese).

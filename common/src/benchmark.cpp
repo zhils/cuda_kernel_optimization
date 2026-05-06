@@ -3,13 +3,36 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
-#include <filesystem>
 #include <fstream>
 #include <limits>
 #include <random>
 #include <sstream>
 
+#ifdef _WIN32
+#include <direct.h>
+#else
+#include <sys/stat.h>
+#endif
+
 namespace common {
+
+namespace {
+void CreateDirectories(const std::string& path) {
+  size_t pos = 0;
+  std::string dir;
+  while ((pos = path.find_first_of("/\\", pos)) != std::string::npos) {
+    dir = path.substr(0, pos);
+    if (!dir.empty()) {
+#ifdef _WIN32
+      _mkdir(dir.c_str());
+#else
+      mkdir(dir.c_str(), 0755);
+#endif
+    }
+    pos++;
+  }
+}
+}  // namespace
 
 std::vector<TestCase> BuildDefaultTestCases(int min_dim, int max_dim, int total_cases,
                                             int max_elements, uint32_t seed) {
@@ -29,8 +52,7 @@ std::vector<TestCase> BuildDefaultTestCases(int min_dim, int max_dim, int total_
 
 bool WriteTestCasesCsv(const std::string& file_path,
                        const std::vector<TestCase>& test_cases) {
-  std::filesystem::path path(file_path);
-  std::filesystem::create_directories(path.parent_path());
+  CreateDirectories(file_path);
 
   std::ofstream ofs(file_path, std::ios::out | std::ios::trunc);
   if (!ofs.is_open()) {

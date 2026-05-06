@@ -1,20 +1,14 @@
-// Softmax V2: 在线 softmax (单遍算法)
+// Softmax V2: 在 V1 基础上使用 Warp 归约
 //
-// 相对于 V1 的关键优化:
-// — 单遍遍历数据而非三遍 (max, exp-sum, normalize)
-// — 同时维护运行中的 max 和 sum
-// — 当发现新 max 时即时重新缩放部分和
-// — 内存流量减少约 3x
-// — 使用 __ldg (只读缓存) 读取全局内存
-// — 当内存 16 字节对齐时使用 float4 向量化加载
-//
-// 参考: Milakov & Gimelshein, "Online normalizer calculation for softmax", 2018
+// 核心设计:
+// - 1维 block: 128 线程 = 4 个 warp，每个 warp 处理一行数据
+// - 共享内存缓存: exp 结果存入共享内存，避免全局内存中间读写
+// - Warp 归约: 使用 __shfl_down_sync 进行 warp shuffle 归约
+// - float4 向量化: 使用 float4 加载和写回，提升内存带宽
 
 #include <cuda_runtime.h>
 
-#include <algorithm>
 #include <cmath>
-#include <cstdint>
 #include <filesystem>
 #include <fstream>
 #include <iomanip>
@@ -24,117 +18,81 @@
 #include "common/benchmark.h"
 #include "common/cuda_utils.h"
 
-namespace {
+#define WARP_SIZE 32
+#define WARPS_PER_BLOCK 4
+#define BLOCK_SIZE (WARP_SIZE * WARPS_PER_BLOCK)
 
-constexpr int kThreads = 256;
+__global__ void SoftmaxV2Kernel(
+    const float* __restrict__ x, 
+    float* __restrict__ y,
+    int rows, int cols
+) {
+    
+    const int warp_id = threadIdx.x / WARP_SIZE;
+    const int lane = threadIdx.x % WARP_SIZE;
+    const int row = blockIdx.x * WARPS_PER_BLOCK + warp_id;
+    if (row >= rows) return;
 
-__device__ inline float4 LoadX4(const float* __restrict__ ptr) {
-    return __ldg(reinterpret_cast<const float4*>(ptr));
-}
+    const float* row_x = x + row * cols;
+    float* row_y = y + row * cols;
 
-__device__ inline void OnlineMaxSum4(const float4& v, float& local_max, float& local_sum) {
-    float vals[4] = {v.x, v.y, v.z, v.w};
-    for (int i = 0; i < 4; ++i) {
-        float val = vals[i];
-        if (val > local_max) {
-            local_sum = local_sum * expf(local_max - val) + expf(0.0f);
-            local_max = val;
-        } else {
-            local_sum += expf(val - local_max);
-        }
+    extern __shared__ float smem[];
+    float* s_exp = smem + warp_id * cols;
+    __shared__ float s_max[WARPS_PER_BLOCK];
+    __shared__ float s_sum[WARPS_PER_BLOCK];
+
+    const int cols4 = cols / 4;
+
+    for (int c = lane; c < cols4; c += WARP_SIZE) {
+        const float4 v = __ldg(reinterpret_cast<const float4*>(row_x + c * 4));
+        s_exp[c * 4 + 0] = v.x;
+        s_exp[c * 4 + 1] = v.y;
+        s_exp[c * 4 + 2] = v.z;
+        s_exp[c * 4 + 3] = v.w;
     }
-}
-
-__global__ void SoftmaxOnlineKernel(const float* __restrict__ x,
-                                     float* __restrict__ y,
-                                     int rows, int cols) {
-    int r = blockIdx.x;
-    if (r >= rows) return;
-
-    int tid = threadIdx.x;
-    int blockSize = blockDim.x;
-    const float* row_x = x + static_cast<std::size_t>(r) * cols;
-    float* row_y = y + static_cast<std::size_t>(r) * cols;
-
-    const bool align4 = ((reinterpret_cast<std::uintptr_t>(row_x) % 16u) == 0u) && ((cols % 4) == 0);
-
-    float local_max = -INFINITY;
-    float local_sum = 0.0f;
-
-    if (align4) {
-        int c = tid * 4;
-        for (; c + 3 < cols; c += blockSize * 4) {
-            const float4 v = LoadX4(row_x + c);
-            OnlineMaxSum4(v, local_max, local_sum);
-        }
-        for (int cc = c; cc < cols; ++cc) {
-            float val = __ldg(row_x + cc);
-            if (val > local_max) {
-                local_sum = local_sum * expf(local_max - val) + 1.0f;
-                local_max = val;
-            } else {
-                local_sum += expf(val - local_max);
-            }
-        }
-    } else {
-        for (int c = tid; c < cols; c += blockSize) {
-            float val = __ldg(row_x + c);
-            if (val > local_max) {
-                local_sum = local_sum * expf(local_max - val) + 1.0f;
-                local_max = val;
-            } else {
-                local_sum += expf(val - local_max);
-            }
-        }
+    for (int c = cols4 * 4 + lane; c < cols; c += WARP_SIZE) {
+        s_exp[c] = __ldg(row_x + c);
     }
-
-    __shared__ float s_max[256];
-    __shared__ float s_sum[256];
-    s_max[tid] = local_max;
-    s_sum[tid] = local_sum;
     __syncthreads();
 
-    for (int s = blockSize / 2; s > 0; s >>= 1) {
-        if (tid < s) {
-            float m1 = s_max[tid];
-            float m2 = s_max[tid + s];
-            float new_max = fmaxf(m1, m2);
-            s_sum[tid] = s_sum[tid] * expf(m1 - new_max) +
-                         s_sum[tid + s] * expf(m2 - new_max);
-            s_max[tid] = new_max;
-        }
-        __syncthreads();
+    float local_max = -INFINITY;
+    for (int c = lane; c < cols; c += WARP_SIZE) {
+        local_max = fmaxf(local_max, s_exp[c]);
     }
-
-    float row_max = s_max[0];
-    float row_sum = s_sum[0];
-
-    if (align4) {
-        const float inv = 1.0f / row_sum;
-        int c = tid * 4;
-        for (; c + 3 < cols; c += blockSize * 4) {
-            const float4 v = LoadX4(row_x + c);
-            const float4 out = make_float4(
-                expf(v.x - row_max) * inv,
-                expf(v.y - row_max) * inv,
-                expf(v.z - row_max) * inv,
-                expf(v.w - row_max) * inv
-            );
-            *reinterpret_cast<float4*>(row_y + c) = out;
-        }
-        for (int c2 = c; c2 < cols; ++c2) {
-            row_y[c2] = expf(__ldg(row_x + c2) - row_max) * inv;
-        }
-    } else {
-        const float inv = 1.0f / row_sum;
-        for (int c = tid; c < cols; c += blockSize) {
-            row_y[c] = expf(__ldg(row_x + c) - row_max) * inv;
-        }
+    #pragma unroll
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        local_max = fmaxf(local_max, __shfl_down_sync(0xffffffff, local_max, offset));
     }
-}
+    if (lane == 0) s_max[warp_id] = local_max;
+    __syncthreads();
+    const float row_max = s_max[warp_id];
 
-inline bool IsAligned4(int cols) {
-    return (cols % 4) == 0;
+    float local_sum = 0.f;
+    for (int c = lane; c < cols; c += WARP_SIZE) {
+        const float e = __expf(s_exp[c] - row_max);
+        s_exp[c] = e;
+        local_sum += e;
+    }
+    #pragma unroll
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        local_sum += __shfl_down_sync(0xffffffff, local_sum, offset);
+    }
+    if (lane == 0) s_sum[warp_id] = local_sum;
+    __syncthreads();
+    const float inv = 1.f / s_sum[warp_id];
+
+    for (int c = lane; c < cols4; c += WARP_SIZE) {
+        const float4 e = *reinterpret_cast<const float4*>(s_exp + c * 4);
+        float4 out;
+        out.x = e.x * inv;
+        out.y = e.y * inv;
+        out.z = e.z * inv;
+        out.w = e.w * inv;
+        *reinterpret_cast<float4*>(row_y + c * 4) = out;
+    }
+    for (int c = cols4 * 4 + lane; c < cols; c += WARP_SIZE) {
+        row_y[c] = s_exp[c] * inv;
+    }
 }
 
 static void SoftmaxCPU(const float* x, float* y, int rows, int cols) {
@@ -149,8 +107,6 @@ static void SoftmaxCPU(const float* x, float* y, int rows, int cols) {
         }
         for (int c = 0; c < cols; ++c) y[r * cols + c] /= sum;
     }
-}
-
 }
 
 int main() {
@@ -171,36 +127,41 @@ int main() {
         CHECK_CUDA(cudaMalloc(&dy, n * sizeof(float)));
         CHECK_CUDA(cudaMemcpy(dx, x.data(), n * sizeof(float), cudaMemcpyHostToDevice));
 
-        int threads = 256;
+        const size_t smem_size = WARPS_PER_BLOCK * cols * sizeof(float);
+        CHECK_CUDA(cudaFuncSetAttribute(SoftmaxV2Kernel,
+                                        cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                        smem_size));
 
-        SoftmaxOnlineKernel<<<rows, threads>>>(dx, dy, rows, cols);
+        dim3 block(BLOCK_SIZE);
+        dim3 grid((rows + WARPS_PER_BLOCK - 1) / WARPS_PER_BLOCK);
+        SoftmaxV2Kernel<<<grid, block, smem_size>>>(dx, dy, rows, cols);
         CHECK_CUDA(cudaDeviceSynchronize());
 
         cudaEvent_t s, e;
         CHECK_CUDA(cudaEventCreate(&s));
         CHECK_CUDA(cudaEventCreate(&e));
         CHECK_CUDA(cudaEventRecord(s));
-        for (int rep = 0; rep < kRepeat; ++rep)
-            SoftmaxOnlineKernel<<<rows, threads>>>(dx, dy, rows, cols);
+        for (int rep = 0; rep < kRepeat; ++rep) {
+            SoftmaxV2Kernel<<<grid, block, smem_size>>>(dx, dy, rows, cols);
+        }
         CHECK_CUDA(cudaEventRecord(e));
         CHECK_CUDA(cudaEventSynchronize(e));
-        float gpu_ms_total = 0;
+        float gpu_ms_total = 0.f;
         CHECK_CUDA(cudaEventElapsedTime(&gpu_ms_total, s, e));
-        float gpu_ms = gpu_ms_total / kRepeat;
+        const float gpu_ms = gpu_ms_total / static_cast<float>(kRepeat);
 
         CHECK_CUDA(cudaMemcpy(gpu.data(), dy, n * sizeof(float), cudaMemcpyDeviceToHost));
         bool ok = common::CheckEqual(cpu, gpu, 1e-4f);
 
-        double bytes = static_cast<double>(n) * sizeof(float) * 3.0;
-        double bw = bytes / (gpu_ms * 1e6);
+        const double bytes = static_cast<double>(n) * sizeof(float) * 3.0;
+        const double bw = bytes / (static_cast<double>(gpu_ms) * 1e6);
 
-        std::cout << rows << "x" << cols << (IsAligned4(cols) ? " [align4]" : " [scalar]")
+        std::cout << rows << "x" << cols
                   << " | " << std::fixed << std::setprecision(4) << gpu_ms << " ms"
                   << " | " << std::setprecision(1) << bw << " GB/s"
                   << " | " << (ok ? "PASS" : "FAIL") << "\n";
 
-        ofs << i << "," << rows << "," << cols << ","
-            << gpu_ms << "," << bw << ","
+        ofs << i << "," << rows << "," << cols << "," << gpu_ms << "," << bw << ","
             << common::MaxAbsDiff(cpu, gpu) << "," << (ok ? "PASS" : "FAIL") << "\n";
 
         CHECK_CUDA(cudaEventDestroy(s));

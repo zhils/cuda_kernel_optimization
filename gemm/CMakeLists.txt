@@ -1,11 +1,18 @@
 set(GEMM_VARIANTS
-    gemm_v0_naive
+    gemm_v0
     gemm_v1
     gemm_v2
     gemm_v3
     gemm_v4
-    gemm_v5
     gemm_cublas_ref
+)
+
+set(GEMM_VARIANTS_ASM
+    gemm_v0
+    gemm_v1
+    gemm_v2
+    gemm_v3
+    gemm_v4
 )
 
 foreach(variant ${GEMM_VARIANTS})
@@ -22,10 +29,7 @@ target_link_libraries(gemm_benchmark_all PRIVATE cuda_common cublas)
 set_target_properties(gemm_benchmark_all PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
 
-add_executable(gemm_benchmark_v2_blocks benchmark_v2_blocks.cu)
-target_link_libraries(gemm_benchmark_v2_blocks PRIVATE cuda_common cublas)
-set_target_properties(gemm_benchmark_v2_blocks PROPERTIES
-    RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
+
 
 set(ASM_OUTPUT_DIR ${CMAKE_SOURCE_DIR}/gemm/asm)
 set(NVCC_FLAGS -Xcompiler=-Wno-deprecated-declarations)
@@ -61,10 +65,10 @@ foreach(variant IN LISTS GEMM_VARIANTS)
 endforeach()
 
 add_custom_target(gen_asm_ptx ALL DEPENDS
-    gemm_v0_naive gemm_v1 gemm_v2 gemm_v3 gemm_v4 gemm_v5
+    gemm_v0 gemm_v1 gemm_v2 gemm_v3 gemm_v4
 )
 
 add_custom_target(gen_asm_sass ALL DEPENDS
-    gemm_v0_naive gemm_v1 gemm_v2 gemm_v3 gemm_v4 gemm_v5
+    gemm_v0 gemm_v1 gemm_v2 gemm_v3 gemm_v4
 )
 

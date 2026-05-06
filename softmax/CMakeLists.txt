@@ -1,5 +1,5 @@
 set(SOFTMAX_VARIANTS
-    softmax_v0_naive
+    softmax_v0
     softmax_v1
     softmax_v2
     softmax_v3
@@ -13,7 +13,8 @@ foreach(variant ${SOFTMAX_VARIANTS})
     add_executable(${variant} ${variant}.cu)
     target_link_libraries(${variant} PRIVATE cuda_common)
     set_target_properties(${variant} PROPERTIES
-        RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
+        RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin
+        CUDA_ARCHITECTURES "120")
 endforeach()
 
 add_executable(softmax_cudnn_ref softmax_cudnn_ref.cu)
@@ -33,3 +34,5 @@ if(MSVC)
 endif()
 set_target_properties(softmax_benchmark_all PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
+
+

@@ -37,3 +37,12 @@ Thumbs.db
 *.tmp
 *.swp
 *~
+
+# Generated ISA / disassembly (nvcc -ptx / -cubin outputs; regenerate from .cu)
+gemm/asm/
+softmax/asm/
+rmsnorm/asm/
+
+# MSVC link byproducts if ever placed next to sources
+*.lib
+*.exp

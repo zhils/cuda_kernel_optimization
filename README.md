@@ -1,109 +1,156 @@
 # CUDA Kernel 优化
 
-本项目逐步优化深度学习核心算子：从朴素基线实现到接近硬件峰值利用率的 CUDA Kernel，并在 **RTX 5060 Ti（Blackwell，sm_120）** 上与 cuBLAS/cuDNN 做基准对比。
+本项目逐步优化深度学习核心算子：从朴素基线到更高利用率的 CUDA Kernel，并在 **NVIDIA GeForce RTX 5060 Ti（Blackwell，sm_120）** 上与 cuBLAS / cuDNN 做对比实验。
+
+**环境与文档约定：** 命令与路径默认 **Windows 11**、**PowerShell**、**Visual Studio 多配置生成器**；可执行文件一般在 `build/bin/Release/`。若使用 **Ninja** 等单配置生成器，可执行文件通常在 `build/bin/`（无 `Release` 子目录）。
+
+---
+
+## 文档索引
+
+| 文档 | 内容 |
+|------|------|
+| [gemm/README.md](gemm/README.md) | GEMM 版本演进、可执行文件对照、`gemm_benchmark_all` 范围说明 |
+| [softmax/README.md](softmax/README.md) | Softmax 各版本与参考实现 |
+| [rmsnorm/README.md](rmsnorm/README.md) | RMSNorm 各版本与参考实现 |
+| [docs/benchmark_environment.md](docs/benchmark_environment.md) | 硬件、软件版本与复现命令（Windows） |
+| [docs/github_repository_guidelines.md](docs/github_repository_guidelines.md) | 适合提交到 GitHub 的内容与 `.gitignore` 约定 |
+
+---
 
 ## 性能总览
 
-<!-- TODO: 在你的 GPU 上运行基准后补充 -->
+<!-- 在目标 GPU 上跑完 benchmark 后可更新具体数字 -->
 
-| 算子 | 瓶颈 | 朴素版 → 最优版 | 相对 cuBLAS/cuDNN | 硬件峰值利用率 |
-|------|------|----------------|-------------------|----------------|
-| **GEMM** | 计算 | 2.48x（1024³，V0→V2） | V2 为 cuBLAS 的 3.25x 耗时（1024³） | 待补充（需 Nsight 统计） |
-| **Softmax** | 内存 | _x | _% of cuDNN | _% DRAM bandwidth |
-| **RMSNorm** | 内存 | _x | _% of cuDNN | _% DRAM bandwidth |
+| 算子 | 瓶颈类型 | 说明 |
+|------|----------|------|
+| **GEMM** | 计算为主 | 演进见 [gemm/README.md](gemm/README.md)；`gemm_benchmark_all` 对比 V0–V3 与 **FP32 `cublasSgemm`** |
+| **Softmax** | 内存为主 | 见 [softmax/README.md](softmax/README.md) |
+| **RMSNorm** | 内存为主 | 见 [rmsnorm/README.md](rmsnorm/README.md) |
+
+---
 
 ## 优化方法论
 
-每个算子都遵循一致的系统化优化流程：
+每个算子遵循同一套流程：
 
 ```
-理论分析 → 基线实现 → 性能剖析（Nsight）→ 定向优化 → 正确性验证 → 循环迭代
+理论分析 → 基线实现 → 性能剖析（Nsight）→ 定向优化 → 正确性验证 → 迭代
 ```
 
-1. **Roofline 分析** —— 计算算术强度，判断计算受限/内存受限，并给出理论性能上限
-2. **朴素基线** —— 保证正确但未优化的 CUDA Kernel
-3. **Nsight Compute 剖析** —— 定位真实瓶颈：warp stall、内存吞吐、占用率、指令构成
-4. **渐进优化** —— 通常实现 3-5 个版本，每版聚焦一个剖析得到的瓶颈
-5. **验证评估** —— 与 CPU 参考结果比对正确性，和 cuBLAS/cuDNN 比性能，报告达到理论峰值的百分比
+1. **Roofline**：算术强度，判断计算/访存主导  
+2. **朴素基线**：正确、未调优  
+3. **Nsight Compute**：stall、带宽、占用率、指令构成  
+4. **渐进版本**：每版针对一个瓶颈  
+5. **验证**：相对 CPU 或库参考的误差与计时  
 
-## 算子列表
+---
 
-### GEMM（通用矩阵乘）— 计算受限
+## 算子与版本速览
 
-[详细分析 →](gemm/README.md)
+### GEMM（通用矩阵乘）
 
-| 版本 | 优化点 | 关键技术 |
-|------|--------|----------|
-| V0 | 朴素实现 | 每个线程计算一个输出元素 |
-| V1 | 共享内存分块 | 16×16 tile，在 SMEM 中复用数据 |
-| V2 | 线程级分块 | 每线程计算 4×4 输出块，寄存器复用 |
-| V4 | Tensor Core | WMMA API（fp32 累加） |
-| Ref | cuBLAS | `cublasSgemm` 参考实现 |
-
-### Softmax — 内存受限
-
-[详细分析 →](softmax/README.md)
+[详细说明 →](gemm/README.md)
 
 | 版本 | 优化点 | 关键技术 |
 |------|--------|----------|
-| V0 | 朴素实现 | 每行单线程，3-pass |
-| V1 | 共享内存归约 | block 级并行 max/sum |
-| V2 | Online softmax | 单次扫描算法（Milakov 2018） |
-| V3 | Warp shuffle + 向量化 | `__shfl_sync` 归约，`float4` 读取 |
-| Ref | cuDNN | `cudnnSoftmaxForward` 参考实现 |
+| V0 | 朴素基线 | 每线程一个输出元素 |
+| V1 | 共享内存分块 | 16×16 tile，`float4` / `__ldg` |
+| V2 | 线程级寄存器分块 | 每线程 **8×8** 子块，CTA **128×128**，`kTileK=16` |
+| V3 | 双缓冲 | 在 V2 几何上双缓冲 A/B SMEM，重叠加载与计算 |
+| V4 | 大 tile FP32（主线） | 128×128 CTA，`kTileK=32`，`__launch_bounds__(256,2)` |
+| Ref | cuBLAS Tensor | `gemm_cublas_ref`：`cublasGemmEx`，FP16 输入、FP32 累加 |
 
-### RMSNorm — 内存受限
+**注意：** `gemm_benchmark_all.exe` **仅**汇总 **V0–V3** 与 **`cublasSgemm`**；不包含独立 **`gemm_v4`** 与 **`gemm_cublas_ref`**，需分别运行对应 `.exe`。
 
-[详细分析 →](rmsnorm/README.md)
+### Softmax
+
+[详细说明 →](softmax/README.md)
 
 | 版本 | 优化点 | 关键技术 |
 |------|--------|----------|
-| V0 | 朴素实现 | 每行单线程 |
-| V1 | Warp 归约 | 使用 `__shfl_sync` 计算 sq_sum |
-| V2 | 向量化 | `float4` 读取 + 跨 warp 归约 |
-| V3 | 融合实现 | 全线程写回输出，`__fmul_rn` |
-| Ref | cuDNN | `cudnnNormalizationForward` 参考实现 |
+| V0 | 朴素 | 每行单线程，3-pass |
+| V1 | Block 归约 | 共享内存 max / sum |
+| V2 | Online softmax | 单遍 Milakov 风格 |
+| V3 | Warp shuffle + 向量化 | `__shfl_sync`，`float4` |
+| Ref | cuDNN | `cudnnSoftmaxForward` |
+
+### RMSNorm
+
+[详细说明 →](rmsnorm/README.md)
+
+| 版本 | 优化点 | 关键技术 |
+|------|--------|----------|
+| V0 | 朴素 | 每行单线程 |
+| V1 | Warp 归约 | `__shfl_sync` 求 sq_sum |
+| V2 | 向量化 | `float4` + 跨 warp 归约 |
+| V3 | 融合写回 | 全线程参与输出 |
+| Ref | cuDNN | `cudnnNormalizationForward` |
+
+---
 
 ## 构建与运行
 
-```bash
-# 构建全部目标
-mkdir build && cd build
-cmake .. -DCMAKE_CUDA_ARCHITECTURES=120
-make -j$(nproc)
+在**仓库根目录**打开 **PowerShell**：
 
-# 运行单个 kernel（用于 Nsight 剖析）
-cd ..
-./build/bin/gemm_v0_naive
-./build/bin/gemm_v2_thread_tiling
+```powershell
+# 构建（示例：sm_120；请按本机 GPU 修改 CMAKE_CUDA_ARCHITECTURES）
+New-Item -ItemType Directory -Force build | Out-Null
+Set-Location build
+cmake .. -G "Visual Studio 17 2022" -A x64 -DCMAKE_CUDA_ARCHITECTURES=120
+cmake --build . --config Release
+Set-Location ..
 
-# 运行完整对比基准
-./build/bin/gemm_benchmark_all
-./build/bin/softmax_benchmark_all
-./build/bin/rmsnorm_benchmark_all
+# 单个可执行文件（Nsight 或调试）
+.\build\bin\Release\gemm_v0.exe
+.\build\bin\Release\gemm_v3.exe
 
-# 使用 Nsight Compute 做性能分析
-ncu --set full ./build/bin/gemm_v0_naive
-ncu --set full ./build/bin/gemm_v2_thread_tiling
+# GEMM 汇总（V0–V3 + cuBLAS FP32）；V4 / Tensor 参考需单独运行
+.\build\bin\Release\gemm_benchmark_all.exe
+.\build\bin\Release\gemm_v4.exe
+.\build\bin\Release\gemm_cublas_ref.exe
+
+# 其他算子汇总（需 cuDNN 路径在 CMake 中配置正确）
+.\build\bin\Release\softmax_benchmark_all.exe
+.\build\bin\Release\rmsnorm_benchmark_all.exe
+
+# Nsight Compute 示例（需安装 NCU）
+ncu --set full .\build\bin\Release\gemm_v2.exe
 ```
 
-## 环境信息
+**softmax / rmsnorm** 若 CMake 中写死本机 cuDNN 路径，克隆后需在本地修改或改为 CMake 变量；见 [docs/github_repository_guidelines.md](docs/github_repository_guidelines.md)。
+
+---
+
+## 开源与 GitHub
+
+- 提交范围、忽略规则与合规注意： **[docs/github_repository_guidelines.md](docs/github_repository_guidelines.md)**  
+- 概要：提交源码、`CMakeLists.txt`、文档；不要提交 `build/`、大体积剖析报告、生成 ISA 目录（如 `gemm/asm/`）及含密钥或个人路径的配置。
+
+---
+
+## 环境信息（参考）
 
 | 项目 | 配置 |
 |------|------|
 | GPU | NVIDIA GeForce RTX 5060 Ti 16GB |
-| 架构 | Blackwell (sm_120) |
-| CUDA Toolkit | 13.2（本次实测） |
-| cuBLAS / cuDNN | 最新版（随 toolkit 提供） |
-| 计时方式 | `cudaEvent`，10 次迭代去极值均值，3 次 warmup |
+| 架构 | Blackwell（sm_120） |
+| CUDA Toolkit | 以本机安装为准（文档示例曾用 13.x） |
+| cuBLAS / cuDNN | 随 Toolkit / 独立安装包 |
+| 计时 | 各子项目 `common::` 与 `cudaEvent` 组合（见各 `*.cu`） |
+
+更细的版本表见 [docs/benchmark_environment.md](docs/benchmark_environment.md)。
+
+---
 
 ## 项目结构
 
 ```
-├── common/              通用基准工具（测试用例、计时、正确性校验）
-├── gemm/                GEMM：V0–V4 + cuBLAS 参考 + benchmark
-├── softmax/             Softmax：V0–V3 + cuDNN 参考 + benchmark
-├── rmsnorm/             RMSNorm：V0–V3 + cuDNN 参考 + benchmark
-├── docs/                环境与方法论文档
-└── CMakeLists.txt       顶层构建文件
+├── common/              通用基准与工具（头文件 + 源文件）
+├── gemm/                GEMM：v0–v4、cuBLAS 参考、benchmark_all
+├── softmax/             Softmax：v0–v3、cuDNN 参考、benchmark_all
+├── rmsnorm/             RMSNorm：v0–v3、cuDNN 参考、benchmark_all
+├── docs/                环境、复现、GitHub 约定等
+├── data/                测试用例 / 结果 CSV（默认可能被 gitignore）
+└── CMakeLists.txt       顶层构建入口
 ```

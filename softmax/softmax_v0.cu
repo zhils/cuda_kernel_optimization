@@ -16,7 +16,7 @@ __global__ void SoftmaxNaiveKernel(const float* x, float* y, int rows, int cols)
   for (int c = 1; c < cols; ++c) maxv = fmaxf(maxv, x[r * cols + c]);
   float sum = 0.f;
   for (int c = 0; c < cols; ++c) {
-    float v = expf(x[r * cols + c] - maxv);
+    float v = __expf(x[r * cols + c] - maxv);
     y[r * cols + c] = v;
     sum += v;
   }

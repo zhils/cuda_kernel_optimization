@@ -4,6 +4,8 @@
 #include <chrono>
 #include <filesystem>
 #include <fstream>
+#include <iomanip>
+#include <iostream>
 #include <vector>
 
 #include "common/benchmark.h"
@@ -37,6 +39,9 @@ int main() {
   std::filesystem::create_directories("data/results");
   std::ofstream ofs("data/results/gemm_naive_results.csv");
   ofs << "id,group,M,N,K,cpu_ms,gpu_ms,speedup,max_abs_diff,check\n";
+
+  std::cout << "=== GEMM V0 (Naive) ===\n";
+
   for (size_t i = 0; i < cases.size(); ++i) {
     int M = cases[i].rows, N = cases[i].cols, K = M;
     const bool do_gpu_run = (M <= kMaxGpuRunDim && N <= kMaxGpuRunDim && K <= kMaxGpuRunDim);
@@ -52,6 +57,10 @@ int main() {
       cpu_ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
     }
     float gpu_ms = 0.0f;
+    bool ok = true;
+    double max_abs_diff = 0.0;
+    const char* check = "SKIP";
+
     if (do_gpu_run) {
       float *dA, *dB, *dC;
       CHECK_CUDA(cudaMalloc(&dA, A.size() * sizeof(float)));
@@ -92,17 +101,21 @@ int main() {
       CHECK_CUDA(cudaFree(dA));
       CHECK_CUDA(cudaFree(dB));
       CHECK_CUDA(cudaFree(dC));
-    }
-    bool ok = true;
-    double max_abs_diff = 0.0;
-    const char* check = "SKIP";
-    if (!do_gpu_run) {
+
+      if (do_cpu_verify) {
+        ok = common::CheckEqual(cpu, gpu, 1e-3f);
+        max_abs_diff = common::MaxAbsDiff(cpu, gpu);
+        check = ok ? "PASS" : "FAIL";
+      }
+    } else {
       check = "SKIP_GPU_LARGE";
-    } else if (do_cpu_verify) {
-      ok = common::CheckEqual(cpu, gpu, 1e-3f);
-      max_abs_diff = common::MaxAbsDiff(cpu, gpu);
-      check = ok ? "PASS" : "FAIL";
     }
+
+    double gflops = (2.0 * M * N * K) / (gpu_ms * 1e6);
+    std::cout << M << "x" << N << "x" << K << " | " << std::fixed << std::setprecision(4) << gpu_ms << " ms"
+              << " | " << std::setprecision(1) << gflops << " GFLOP/s"
+              << " | " << check << "\n";
+
     ofs << cases[i].id << "," << cases[i].group << "," << M << "," << N << "," << K << "," << cpu_ms << "," << gpu_ms
         << "," << (gpu_ms > 0 ? cpu_ms / gpu_ms : 0) << "," << max_abs_diff << "," << check
         << "\n";
