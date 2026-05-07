@@ -24,13 +24,6 @@ endforeach()
 
 target_link_libraries(gemm_cublas_ref PRIVATE cublas)
 
-add_executable(gemm_benchmark_all benchmark_all.cu)
-target_link_libraries(gemm_benchmark_all PRIVATE cuda_common cublas)
-set_target_properties(gemm_benchmark_all PROPERTIES
-    RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
-
-
-
 set(ASM_OUTPUT_DIR ${CMAKE_SOURCE_DIR}/gemm/asm)
 set(NVCC_FLAGS -Xcompiler=-Wno-deprecated-declarations)
 

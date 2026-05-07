@@ -1,8 +1,10 @@
-// RMSNorm V3: Weight in shared memory, x from global memory
-// Fixed block size = 64
+// RMSNorm V3: weight 缓存在共享内存，x/y 走全局内存；每 warp 一行，warp shuffle 归约平方和
+// Block: 128 线程 = 4 warps，每 block 最多处理 4 行
 
 #include <cuda_runtime.h>
 
+#include <cstddef>
+#include <cstdint>
 #include <cmath>
 #include <fstream>
 #include <iomanip>
@@ -41,19 +43,26 @@ __global__ void RMSNormV3Kernel(
 
     if (row >= rows) return;
 
-    const float* row_x = x + row * cols;
-    float* row_y = y + row * cols;
+    const float* row_x = x + static_cast<std::size_t>(row) * static_cast<std::size_t>(cols);
+    float* row_y = y + static_cast<std::size_t>(row) * static_cast<std::size_t>(cols);
 
     const int cols4 = cols / 4;
-    float local_sum = 0.f;
+    const bool align4 = (cols % 4 == 0) &&
+                        (reinterpret_cast<std::uintptr_t>(row_x) % 16u == 0u) &&
+                        (reinterpret_cast<std::uintptr_t>(row_y) % 16u == 0u) &&
+                        (reinterpret_cast<std::uintptr_t>(weight) % 16u == 0u);
 
-    for (int c = lane; c < cols4; c += WARP_SIZE) {
-        const float4 v = __ldg(reinterpret_cast<const float4*>(row_x + c * 4));
-        local_sum += v.x * v.x + v.y * v.y + v.z * v.z + v.w * v.w;
-    }
-    for (int c = cols4 * 4 + lane; c < cols; c += WARP_SIZE) {
-        const float val = __ldg(row_x + c);
-        local_sum += val * val;
+    float local_sum = 0.f;
+    if (align4) {
+        for (int c = lane; c < cols4; c += WARP_SIZE) {
+            const float4 v = __ldg(reinterpret_cast<const float4*>(row_x + c * 4));
+            local_sum += v.x * v.x + v.y * v.y + v.z * v.z + v.w * v.w;
+        }
+    } else {
+        for (int c = lane; c < cols; c += WARP_SIZE) {
+            const float val = __ldg(row_x + c);
+            local_sum += val * val;
+        }
     }
 
     #pragma unroll
@@ -63,18 +72,18 @@ __global__ void RMSNormV3Kernel(
     const float sq_sum = __shfl_sync(0xffffffff, local_sum, 0);
     const float rms = rsqrtf(sq_sum / static_cast<float>(cols) + eps);
 
-    for (int c = lane; c < cols4; c += WARP_SIZE) {
-        const float4 vx = __ldg(reinterpret_cast<const float4*>(row_x + c * 4));
-        const float4 vw = *reinterpret_cast<const float4*>(s_weight + c * 4);
-        float4 vy;
-        vy.x = vx.x * rms * vw.x;
-        vy.y = vx.y * rms * vw.y;
-        vy.z = vx.z * rms * vw.z;
-        vy.w = vx.w * rms * vw.w;
-        *reinterpret_cast<float4*>(row_y + c * 4) = vy;
-    }
-    for (int c = cols4 * 4 + lane; c < cols; c += WARP_SIZE) {
-        row_y[c] = __ldg(row_x + c) * rms * s_weight[c];
+    if (align4) {
+        for (int c = lane; c < cols4; c += WARP_SIZE) {
+            const float4 vx = __ldg(reinterpret_cast<const float4*>(row_x + c * 4));
+            const float4 vw = *reinterpret_cast<const float4*>(s_weight + c * 4);
+            *reinterpret_cast<float4*>(row_y + c * 4) =
+                make_float4(vx.x * rms * vw.x, vx.y * rms * vw.y, vx.z * rms * vw.z,
+                            vx.w * rms * vw.w);
+        }
+    } else {
+        for (int c = lane; c < cols; c += WARP_SIZE) {
+            row_y[c] = __ldg(row_x + c) * rms * s_weight[c];
+        }
     }
 }
 

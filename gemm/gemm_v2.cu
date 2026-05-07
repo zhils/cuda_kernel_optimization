@@ -1,14 +1,3 @@
-// GEMM V2: thread-level register tiling with vectorized loads
-//
-// Design:
-// - Block size: 16x16 threads (256 threads)
-// - Each thread computes a 8x8 sub-block of C (TM=8, TN=8)
-// - Block handles 128x128 of C (16*8 x 16*8)
-// - Tile K = 16, loop over K in tiles
-// - Use float4 to load A and B tiles into shared memory
-// - Each thread keeps 8x8 = 64 accumulators in registers
-// - Arithmetic intensity: 64 FMA / (8+8) shared mem loads = 4 FMA per load
-
 #include <cuda_runtime.h>
 
 #include <algorithm>
@@ -21,37 +10,40 @@
 #include "common/benchmark.h"
 #include "common/cuda_utils.h"
 
-// Tile config: each thread computes TM x TN sub-block
 constexpr int kTM = 8;
 constexpr int kTN = 8;
 
-// Block dimensions in threads
 constexpr int kBlockThreadsX = 16;
 constexpr int kBlockThreadsY = 16;
 
-// Block handles kBlockThreadsY * kTM rows x kBlockThreadsX * kTN cols of C
-constexpr int kBlockM = kBlockThreadsY * kTM;  // 128
-constexpr int kBlockN = kBlockThreadsX * kTN;  // 128
+constexpr int kBlockM = kBlockThreadsY * kTM;
+constexpr int kBlockN = kBlockThreadsX * kTN;
 
-// Tile size along K dimension
 constexpr int kTileK = 16;
+constexpr int kPadA = 1;
+constexpr int kPadB = 1;
+constexpr int kTotalAFloat4 = (kBlockM * kTileK) / 4;
+constexpr int kTotalBFloat4 = (kTileK * kBlockN) / 4;
+constexpr int kThreads = kBlockThreadsX * kBlockThreadsY;
+constexpr int kALoadsPerThread = (kTotalAFloat4 + kThreads - 1) / kThreads;
+constexpr int kBLoadsPerThread = (kTotalBFloat4 + kThreads - 1) / kThreads;
 
-__global__ void GemmV2Kernel(const float* __restrict__ A, const float* __restrict__ B,
-    float* __restrict__ C, int M, int N, int K) {
+__global__ void GemmV2Kernel(
+    const float* __restrict__ A, 
+    const float* __restrict__ B,
+    float* __restrict__ C, 
+    int M, int N, int K) {
 
-    // Shared memory tiles
-    __shared__ float As[kBlockM][kTileK];
-    __shared__ float Bs[kTileK][kBlockN];
+    __shared__ float As[kBlockM][kTileK + kPadA];
+    __shared__ float Bs[kTileK + kPadB][kBlockN];
 
     const int tx = threadIdx.x;
     const int ty = threadIdx.y;
     const int tid = ty * kBlockThreadsX + tx;
 
-    // Starting row/col in C for this thread's sub-block
     const int row_start = blockIdx.y * kBlockM + ty * kTM;
     const int col_start = blockIdx.x * kBlockN + tx * kTN;
 
-    // Register accumulators: TM x TN
     float sum[kTM][kTN] = {};
 
     const int num_k_tiles = (K + kTileK - 1) / kTileK;
@@ -59,15 +51,10 @@ __global__ void GemmV2Kernel(const float* __restrict__ A, const float* __restric
     for (int t = 0; t < num_k_tiles; ++t) {
         const int k0 = t * kTileK;
 
-        // Collaborative loading of A tile into shared memory using float4
-        // Total A elements: kBlockM * kTileK = 128 * 16 = 2048
-        // float4 count: 2048 / 4 = 512
-        const int total_a_float4 = (kBlockM * kTileK) / 4;
-        const int a_float4_per_thread = (total_a_float4 + (kBlockThreadsX * kBlockThreadsY) - 1) / (kBlockThreadsX * kBlockThreadsY);
-
-        for (int l = 0; l < a_float4_per_thread; ++l) {
-            int idx = tid * a_float4_per_thread + l;
-            if (idx < total_a_float4) {
+        #pragma unroll
+        for (int l = 0; l < kALoadsPerThread; ++l) {
+            int idx = tid * kALoadsPerThread + l;
+            if (idx < kTotalAFloat4) {
                 int r = idx / (kTileK / 4);
                 int k_offset = (idx % (kTileK / 4)) * 4;
                 int g_r = blockIdx.y * kBlockM + r;
@@ -80,23 +67,18 @@ __global__ void GemmV2Kernel(const float* __restrict__ A, const float* __restric
                     As[r][k_offset + 2] = v.z;
                     As[r][k_offset + 3] = v.w;
                 } else {
-                    As[r][k_offset + 0] = (g_r < M && g_k + 0 < K) ? A[g_r * K + g_k + 0] : 0.0f;
-                    As[r][k_offset + 1] = (g_r < M && g_k + 1 < K) ? A[g_r * K + g_k + 1] : 0.0f;
-                    As[r][k_offset + 2] = (g_r < M && g_k + 2 < K) ? A[g_r * K + g_k + 2] : 0.0f;
-                    As[r][k_offset + 3] = (g_r < M && g_k + 3 < K) ? A[g_r * K + g_k + 3] : 0.0f;
+                    As[r][k_offset + 0] = (g_r < M && g_k + 0 < K) ? __ldg(A + g_r * K + g_k + 0) : 0.0f;
+                    As[r][k_offset + 1] = (g_r < M && g_k + 1 < K) ? __ldg(A + g_r * K + g_k + 1) : 0.0f;
+                    As[r][k_offset + 2] = (g_r < M && g_k + 2 < K) ? __ldg(A + g_r * K + g_k + 2) : 0.0f;
+                    As[r][k_offset + 3] = (g_r < M && g_k + 3 < K) ? __ldg(A + g_r * K + g_k + 3) : 0.0f;
                 }
             }
         }
 
-        // Collaborative loading of B tile into shared memory using float4
-        // Total B elements: kTileK * kBlockN = 16 * 128 = 2048
-        // float4 count: 2048 / 4 = 512
-        const int total_b_float4 = (kTileK * kBlockN) / 4;
-        const int b_float4_per_thread = (total_b_float4 + (kBlockThreadsX * kBlockThreadsY) - 1) / (kBlockThreadsX * kBlockThreadsY);
-
-        for (int l = 0; l < b_float4_per_thread; ++l) {
-            int idx = tid * b_float4_per_thread + l;
-            if (idx < total_b_float4) {
+        #pragma unroll
+        for (int l = 0; l < kBLoadsPerThread; ++l) {
+            int idx = tid * kBLoadsPerThread + l;
+            if (idx < kTotalBFloat4) {
                 int k_idx = idx / (kBlockN / 4);
                 int c_offset = (idx % (kBlockN / 4)) * 4;
                 int g_k = k0 + k_idx;
@@ -109,20 +91,18 @@ __global__ void GemmV2Kernel(const float* __restrict__ A, const float* __restric
                     Bs[k_idx][c_offset + 2] = v.z;
                     Bs[k_idx][c_offset + 3] = v.w;
                 } else {
-                    Bs[k_idx][c_offset + 0] = (g_k < K && g_c + 0 < N) ? B[g_k * N + g_c + 0] : 0.0f;
-                    Bs[k_idx][c_offset + 1] = (g_k < K && g_c + 1 < N) ? B[g_k * N + g_c + 1] : 0.0f;
-                    Bs[k_idx][c_offset + 2] = (g_k < K && g_c + 2 < N) ? B[g_k * N + g_c + 2] : 0.0f;
-                    Bs[k_idx][c_offset + 3] = (g_k < K && g_c + 3 < N) ? B[g_k * N + g_c + 3] : 0.0f;
+                    Bs[k_idx][c_offset + 0] = (g_k < K && g_c + 0 < N) ? __ldg(B + g_k * N + g_c + 0) : 0.0f;
+                    Bs[k_idx][c_offset + 1] = (g_k < K && g_c + 1 < N) ? __ldg(B + g_k * N + g_c + 1) : 0.0f;
+                    Bs[k_idx][c_offset + 2] = (g_k < K && g_c + 2 < N) ? __ldg(B + g_k * N + g_c + 2) : 0.0f;
+                    Bs[k_idx][c_offset + 3] = (g_k < K && g_c + 3 < N) ? __ldg(B + g_k * N + g_c + 3) : 0.0f;
                 }
             }
         }
 
         __syncthreads();
 
-        // Compute: each thread processes its TM x TN sub-block
         #pragma unroll
         for (int kk = 0; kk < kTileK; ++kk) {
-            // Load B values for this thread's TN columns into registers
             float b_vals[kTN];
             #pragma unroll
             for (int j = 0; j < kTN; ++j) {
@@ -142,14 +122,12 @@ __global__ void GemmV2Kernel(const float* __restrict__ A, const float* __restric
         __syncthreads();
     }
 
-    // Write results to C using float4 (8 elements = 2 float4 per row)
     #pragma unroll
     for (int i = 0; i < kTM; ++i) {
         int g_r = row_start + i;
         if (g_r >= M) continue;
 
         int g_c = col_start;
-        // First float4 (columns 0-3)
         if (g_c + 3 < N) {
             float4 v;
             v.x = sum[i][0];
@@ -162,7 +140,6 @@ __global__ void GemmV2Kernel(const float* __restrict__ A, const float* __restric
                 C[g_r * N + g_c + j] = sum[i][j];
             }
         }
-        // Second float4 (columns 4-7)
         if (g_c + 7 < N) {
             float4 v;
             v.x = sum[i][4];
@@ -215,7 +192,6 @@ int main() {
         dim3 block(kBlockThreadsX, kBlockThreadsY);
         dim3 grid((N + kBlockN - 1) / kBlockN, (M + kBlockM - 1) / kBlockM);
 
-        // Warmup
         GemmV2Kernel<<<grid, block>>>(d_A, d_B, d_C, M, N, K);
         CHECK_CUDA(cudaDeviceSynchronize());
 

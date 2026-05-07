@@ -9,20 +9,7 @@
 #include "common/benchmark.h"
 #include "common/cuda_utils.h"
 #include "rmsnorm/test_utils.h"
-
-__global__ void RMSNormKernel(const float* x, float* y, const float* weight, int rows, int cols, float eps) {
-  int r = blockIdx.x * blockDim.x + threadIdx.x;
-  if (r >= rows) return;
-  float sq_sum = 0.f;
-  for (int c = 0; c < cols; ++c) {
-    float val = x[r * cols + c];
-    sq_sum += val * val;
-  }
-  float rms = rsqrtf(sq_sum / cols + eps);
-  for (int c = 0; c < cols; ++c) {
-    y[r * cols + c] = x[r * cols + c] * rms * weight[c];
-  }
-}
+#include "rmsnorm_kernels.cuh"
 
 static void RMSNormCPU(const float* x, float* y, const float* weight, int rows, int cols, float eps) {
   for (int r = 0; r < rows; ++r) {
@@ -64,7 +51,7 @@ int main() {
     CHECK_CUDA(cudaEventCreate(&s));
     CHECK_CUDA(cudaEventCreate(&e));
     CHECK_CUDA(cudaEventRecord(s));
-    RMSNormKernel<<<(rows + 255) / 256, 256>>>(dx, dy, dweight, rows, cols, kEps);
+    RMSNormV0Kernel<<<(rows + 255) / 256, 256>>>(dx, dy, dweight, rows, cols, kEps);
     CHECK_CUDA(cudaEventRecord(e));
     CHECK_CUDA(cudaEventSynchronize(e));
     float gpu_ms = 0.f;

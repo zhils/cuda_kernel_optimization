@@ -1,10 +1,3 @@
-// GEMM V1: classic tiling approach with 16x16 tile
-//
-// Design:
-// - Each block handles a 16x16 tile of C
-// - Load tile from A and B into shared memory
-// - Each thread computes 1 element of C
-
 #include <cuda_runtime.h>
 
 #include <algorithm>
@@ -17,63 +10,51 @@
 #include "common/benchmark.h"
 #include "common/cuda_utils.h"
 
-#define TILE_M 16
-#define TILE_N 16
-#define TILE_K 16
+constexpr int kTileM = 16;
+constexpr int kTileN = 16;
+constexpr int kTileK = 16;
 
 __global__ void GemmV1Kernel(const float* __restrict__ A, const float* __restrict__ B,
     float* __restrict__ C, int M, int N, int K) {
-
-    // Block position in C
-    const int block_row = blockIdx.y * TILE_M;
-    const int block_col = blockIdx.x * TILE_N;
-
-    // Thread position within tile
+    const int block_row = blockIdx.y * kTileM;
+    const int block_col = blockIdx.x * kTileN;
     const int thread_row = threadIdx.y;
     const int thread_col = threadIdx.x;
-
-    // Global position in C
     const int row = block_row + thread_row;
     const int col = block_col + thread_col;
 
     if (row >= M || col >= N) return;
 
-    // Shared memory for A tile and B tile
-    __shared__ float As[TILE_M][TILE_K];
-    __shared__ float Bs[TILE_K][TILE_N];
+    __shared__ float As[kTileM][kTileK];
+    __shared__ float Bs[kTileK][kTileN];
 
     float sum = 0.0f;
 
-    // Loop over K dimension in tiles
-    const int num_k_tiles = (K + TILE_K - 1) / TILE_K;
+    const int num_k_tiles = (K + kTileK - 1) / kTileK;
 
     for (int t = 0; t < num_k_tiles; ++t) {
-        const int k_start = t * TILE_K;
+        const int k_start = t * kTileK;
 
-        // Load A tile: As[thread_row][thread_col] = A[row][k_start + thread_col]
-        if (thread_col < TILE_K && k_start + thread_col < K) {
+        if (thread_col < kTileK && k_start + thread_col < K) {
             As[thread_row][thread_col] = A[row * K + (k_start + thread_col)];
         } else {
             As[thread_row][thread_col] = 0.0f;
         }
 
-        // Load B tile: Bs[thread_row][thread_col] = B[k_start + thread_row][col]
-        if (thread_row < TILE_K && k_start + thread_row < K) {
+        if (thread_row < kTileK && k_start + thread_row < K) {
             Bs[thread_row][thread_col] = B[(k_start + thread_row) * N + col];
         } else {
             Bs[thread_row][thread_col] = 0.0f;
         }
         __syncthreads();
 
-        // Compute partial dot product
         #pragma unroll
-        for (int k = 0; k < TILE_K; ++k) {
+        for (int k = 0; k < kTileK; ++k) {
             sum += As[thread_row][k] * Bs[k][thread_col];
         }
         __syncthreads();
     }
 
-    // Write result to C
     C[row * N + col] = sum;
 }
 
@@ -113,10 +94,9 @@ int main() {
         CHECK_CUDA(cudaMemcpy(d_A, A.data(), M * K * sizeof(float), cudaMemcpyHostToDevice));
         CHECK_CUDA(cudaMemcpy(d_B, B.data(), K * N * sizeof(float), cudaMemcpyHostToDevice));
 
-        dim3 block(TILE_N, TILE_M);
-        dim3 grid((N + TILE_N - 1) / TILE_N, (M + TILE_M - 1) / TILE_M);
+        dim3 block(kTileN, kTileM);
+        dim3 grid((N + kTileN - 1) / kTileN, (M + kTileM - 1) / kTileM);
 
-        // Warmup
         GemmV1Kernel<<<grid, block>>>(d_A, d_B, d_C, M, N, K);
         CHECK_CUDA(cudaDeviceSynchronize());
 
