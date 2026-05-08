@@ -1,14 +1,14 @@
-// GEMM V3: double-buffered shared memory with pipelined loads
+// GEMM V3: cp.async + 8×4 sub-block + TileK=32
 //
-// Design:
-// - Based on V2: 16x16 threads, each thread computes 8x8 sub-block
-// - Block handles 128x128 of C, TileK = 16
-// - DOUBLE BUFFERING: two sets of shared memory tiles
-//   - While computing from buffer 0, threads collaboratively load next tile into buffer 1
-//   - Then swap and continue, hiding global memory latency behind computation
-// - Requires 2x shared memory: 2 * (128*16 + 16*128) * 4B = 32KB
+// 关键参数调优：
+//   1. kTN=4 (8×4): 累加器从 64 降到 32 寄存器 → 更高 occupancy
+//   2. kBlockN=64 (128×64): B SMEM 减半 → 48KB → 2 blocks/SM
+//   3. kTileK=32: 外循环从 256 次减到 128 次 → 更少 __syncthreads
+//   4. cp.async: DMA 异步加载与计算重叠
+//   5. __launch_bounds__(256,2): 预留 2 blocks/SM 的寄存器
 
 #include <cuda_runtime.h>
+#include <cuda_pipeline.h>
 
 #include <algorithm>
 #include <filesystem>
@@ -20,28 +20,30 @@
 #include "common/benchmark.h"
 #include "common/cuda_utils.h"
 
-// Tile config: each thread computes TM x TN sub-block
 constexpr int kTM = 8;
-constexpr int kTN = 8;
+constexpr int kTN = 4;
 
-// Block dimensions in threads
 constexpr int kBlockThreadsX = 16;
 constexpr int kBlockThreadsY = 16;
+constexpr int kBlockThreads = kBlockThreadsX * kBlockThreadsY;
 
-// Block handles kBlockThreadsY * kTM rows x kBlockThreadsX * kTN cols of C
 constexpr int kBlockM = kBlockThreadsY * kTM;  // 128
-constexpr int kBlockN = kBlockThreadsX * kTN;  // 128
+constexpr int kBlockN = kBlockThreadsX * kTN;  // 64
 
-// Tile size along K dimension
-constexpr int kTileK = 16;
+constexpr int kTileK = 32;
 
-// Double buffer shared memory layout
-// As[2][kBlockM][kTileK], Bs[2][kTileK][kBlockN]
-__shared__ float As[2][kBlockM][kTileK];
-__shared__ float Bs[2][kTileK][kBlockN];
+constexpr int kSmemABuf = kBlockM * kTileK;  // 4096 floats
+constexpr int kSmemBBuf = kTileK * kBlockN;  // 2048 floats
 
-__global__ void GemmV3Kernel(const float* __restrict__ A, const float* __restrict__ B,
+__global__ __launch_bounds__(kBlockThreads, 2)
+void GemmV3Kernel(const float* __restrict__ A, const float* __restrict__ B,
     float* __restrict__ C, int M, int N, int K) {
+
+    extern __shared__ float smem[];
+    float* As_buf0 = smem;
+    float* As_buf1 = smem + kSmemABuf;
+    float* Bs_buf0 = smem + 2 * kSmemABuf;
+    float* Bs_buf1 = smem + 2 * kSmemABuf + kSmemBBuf;
 
     const int tx = threadIdx.x;
     const int ty = threadIdx.y;
@@ -50,198 +52,101 @@ __global__ void GemmV3Kernel(const float* __restrict__ A, const float* __restric
     const int row_start = blockIdx.y * kBlockM + ty * kTM;
     const int col_start = blockIdx.x * kBlockN + tx * kTN;
 
-    // Register accumulators
     float sum[kTM][kTN] = {};
 
     const int num_k_tiles = (K + kTileK - 1) / kTileK;
 
-    // Preload first tile into buffer 0
-    {
-        const int k0 = 0;
-
-        // Load A tile
-        // Total A elements: kBlockM * kTileK = 128 * 16 = 2048
-        // float4 count: 2048 / 4 = 512
-        const int total_a_float4 = (kBlockM * kTileK) / 4;
-        const int a_float4_per_thread = (total_a_float4 + (kBlockThreadsX * kBlockThreadsY) - 1) / (kBlockThreadsX * kBlockThreadsY);
-
-        for (int l = 0; l < a_float4_per_thread; ++l) {
-            int idx = tid * a_float4_per_thread + l;
-            if (idx < total_a_float4) {
-                int r = idx / (kTileK / 4);
-                int k_offset = (idx % (kTileK / 4)) * 4;
-                int g_r = blockIdx.y * kBlockM + r;
-                int g_k = k0 + k_offset;
-
-                if (g_r < M && g_k + 3 < K) {
-                    float4 v = __ldg(reinterpret_cast<const float4*>(A + g_r * K + g_k));
-                    As[0][r][k_offset + 0] = v.x;
-                    As[0][r][k_offset + 1] = v.y;
-                    As[0][r][k_offset + 2] = v.z;
-                    As[0][r][k_offset + 3] = v.w;
-                } else {
-                    As[0][r][k_offset + 0] = (g_r < M && g_k + 0 < K) ? A[g_r * K + g_k + 0] : 0.0f;
-                    As[0][r][k_offset + 1] = (g_r < M && g_k + 1 < K) ? A[g_r * K + g_k + 1] : 0.0f;
-                    As[0][r][k_offset + 2] = (g_r < M && g_k + 2 < K) ? A[g_r * K + g_k + 2] : 0.0f;
-                    As[0][r][k_offset + 3] = (g_r < M && g_k + 3 < K) ? A[g_r * K + g_k + 3] : 0.0f;
-                }
+    auto load_tile_async = [&](int tile_k_start, float* As_buf, float* Bs_buf) {
+        const int total_a_f4 = (kBlockM * kTileK) / 4;
+        const int a_f4_per_th = (total_a_f4 + kBlockThreads - 1) / kBlockThreads;
+        for (int l = 0; l < a_f4_per_th; ++l) {
+            int idx = tid * a_f4_per_th + l;
+            if (idx >= total_a_f4) continue;
+            int r      = idx / (kTileK / 4);
+            int k_off  = (idx % (kTileK / 4)) * 4;
+            int g_r    = blockIdx.y * kBlockM + r;
+            int g_k    = tile_k_start + k_off;
+            float* dst = As_buf + r * kTileK + k_off;
+            if (g_r < M && g_k + 3 < K)
+                __pipeline_memcpy_async(dst, &A[static_cast<size_t>(g_r) * K + g_k], 16);
+            else {
+                dst[0] = (g_r < M && g_k+0 < K) ? A[g_r * K + g_k+0] : 0.0f;
+                dst[1] = (g_r < M && g_k+1 < K) ? A[g_r * K + g_k+1] : 0.0f;
+                dst[2] = (g_r < M && g_k+2 < K) ? A[g_r * K + g_k+2] : 0.0f;
+                dst[3] = (g_r < M && g_k+3 < K) ? A[g_r * K + g_k+3] : 0.0f;
             }
         }
-
-        // Load B tile
-        // Total B elements: kTileK * kBlockN = 16 * 128 = 2048
-        // float4 count: 2048 / 4 = 512
-        const int total_b_float4 = (kTileK * kBlockN) / 4;
-        const int b_float4_per_thread = (total_b_float4 + (kBlockThreadsX * kBlockThreadsY) - 1) / (kBlockThreadsX * kBlockThreadsY);
-
-        for (int l = 0; l < b_float4_per_thread; ++l) {
-            int idx = tid * b_float4_per_thread + l;
-            if (idx < total_b_float4) {
-                int k_idx = idx / (kBlockN / 4);
-                int c_offset = (idx % (kBlockN / 4)) * 4;
-                int g_k = k0 + k_idx;
-                int g_c = blockIdx.x * kBlockN + c_offset;
-
-                if (g_k < K && g_c + 3 < N) {
-                    float4 v = __ldg(reinterpret_cast<const float4*>(B + g_k * N + g_c));
-                    Bs[0][k_idx][c_offset + 0] = v.x;
-                    Bs[0][k_idx][c_offset + 1] = v.y;
-                    Bs[0][k_idx][c_offset + 2] = v.z;
-                    Bs[0][k_idx][c_offset + 3] = v.w;
-                } else {
-                    Bs[0][k_idx][c_offset + 0] = (g_k < K && g_c + 0 < N) ? B[g_k * N + g_c + 0] : 0.0f;
-                    Bs[0][k_idx][c_offset + 1] = (g_k < K && g_c + 1 < N) ? B[g_k * N + g_c + 1] : 0.0f;
-                    Bs[0][k_idx][c_offset + 2] = (g_k < K && g_c + 2 < N) ? B[g_k * N + g_c + 2] : 0.0f;
-                    Bs[0][k_idx][c_offset + 3] = (g_k < K && g_c + 3 < N) ? B[g_k * N + g_c + 3] : 0.0f;
-                }
+        const int total_b_f4 = (kTileK * kBlockN) / 4;
+        const int b_f4_per_th = (total_b_f4 + kBlockThreads - 1) / kBlockThreads;
+        for (int l = 0; l < b_f4_per_th; ++l) {
+            int idx = tid * b_f4_per_th + l;
+            if (idx >= total_b_f4) continue;
+            int k_idx   = idx / (kBlockN / 4);
+            int c_off   = (idx % (kBlockN / 4)) * 4;
+            int g_k     = tile_k_start + k_idx;
+            int g_c     = blockIdx.x * kBlockN + c_off;
+            float* dst  = Bs_buf + k_idx * kBlockN + c_off;
+            if (g_k < K && g_c + 3 < N)
+                __pipeline_memcpy_async(dst, &B[static_cast<size_t>(g_k) * N + g_c], 16);
+            else {
+                dst[0] = (g_k < K && g_c+0 < N) ? B[g_k * N + g_c+0] : 0.0f;
+                dst[1] = (g_k < K && g_c+1 < N) ? B[g_k * N + g_c+1] : 0.0f;
+                dst[2] = (g_k < K && g_c+2 < N) ? B[g_k * N + g_c+2] : 0.0f;
+                dst[3] = (g_k < K && g_c+3 < N) ? B[g_k * N + g_c+3] : 0.0f;
             }
         }
-    }
+    };
+
+    load_tile_async(0, As_buf0, Bs_buf0);
+    __pipeline_commit();
+    __pipeline_wait_prior(0);
     __syncthreads();
 
-    int read_buf = 0;
-    int write_buf = 1;
-
     for (int t = 0; t < num_k_tiles; ++t) {
-        const int k0 = t * kTileK;
-        const int next_k0 = (t + 1) * kTileK;
+        float* As_read = (t & 1) ? As_buf1 : As_buf0;
+        float* Bs_read = (t & 1) ? Bs_buf1 : Bs_buf0;
 
-        // Compute from read_buf
+        if (t + 1 < num_k_tiles) {
+            float* As_write = (t & 1) ? As_buf0 : As_buf1;
+            float* Bs_write = (t & 1) ? Bs_buf0 : Bs_buf1;
+            load_tile_async((t + 1) * kTileK, As_write, Bs_write);
+            __pipeline_commit();
+        }
+
         #pragma unroll
         for (int kk = 0; kk < kTileK; ++kk) {
             float b_vals[kTN];
             #pragma unroll
-            for (int j = 0; j < kTN; ++j) {
-                b_vals[j] = Bs[read_buf][kk][tx * kTN + j];
-            }
+            for (int j = 0; j < kTN; ++j)
+                b_vals[j] = Bs_read[kk * kBlockN + tx * kTN + j];
 
             #pragma unroll
             for (int i = 0; i < kTM; ++i) {
-                float a_val = As[read_buf][ty * kTM + i][kk];
+                float a_val = As_read[(ty * kTM + i) * kTileK + kk];
                 #pragma unroll
-                for (int j = 0; j < kTN; ++j) {
+                for (int j = 0; j < kTN; ++j)
                     sum[i][j] += a_val * b_vals[j];
-                }
             }
         }
 
-        // If not last iteration, preload next tile into write_buf
         if (t + 1 < num_k_tiles) {
-            // Load A tile into write_buf
-            const int total_a_float4 = (kBlockM * kTileK) / 4;
-            const int a_float4_per_thread = (total_a_float4 + (kBlockThreadsX * kBlockThreadsY) - 1) / (kBlockThreadsX * kBlockThreadsY);
-
-            for (int l = 0; l < a_float4_per_thread; ++l) {
-                int idx = tid * a_float4_per_thread + l;
-                if (idx < total_a_float4) {
-                    int r = idx / (kTileK / 4);
-                    int k_offset = (idx % (kTileK / 4)) * 4;
-                    int g_r = blockIdx.y * kBlockM + r;
-                    int g_k = next_k0 + k_offset;
-
-                    if (g_r < M && g_k + 3 < K) {
-                        float4 v = __ldg(reinterpret_cast<const float4*>(A + g_r * K + g_k));
-                        As[write_buf][r][k_offset + 0] = v.x;
-                        As[write_buf][r][k_offset + 1] = v.y;
-                        As[write_buf][r][k_offset + 2] = v.z;
-                        As[write_buf][r][k_offset + 3] = v.w;
-                    } else {
-                        As[write_buf][r][k_offset + 0] = (g_r < M && g_k + 0 < K) ? A[g_r * K + g_k + 0] : 0.0f;
-                        As[write_buf][r][k_offset + 1] = (g_r < M && g_k + 1 < K) ? A[g_r * K + g_k + 1] : 0.0f;
-                        As[write_buf][r][k_offset + 2] = (g_r < M && g_k + 2 < K) ? A[g_r * K + g_k + 2] : 0.0f;
-                        As[write_buf][r][k_offset + 3] = (g_r < M && g_k + 3 < K) ? A[g_r * K + g_k + 3] : 0.0f;
-                    }
-                }
-            }
-
-            // Load B tile into write_buf
-            const int total_b_float4 = (kTileK * kBlockN) / 4;
-            const int b_float4_per_thread = (total_b_float4 + (kBlockThreadsX * kBlockThreadsY) - 1) / (kBlockThreadsX * kBlockThreadsY);
-
-            for (int l = 0; l < b_float4_per_thread; ++l) {
-                int idx = tid * b_float4_per_thread + l;
-                if (idx < total_b_float4) {
-                    int k_idx = idx / (kBlockN / 4);
-                    int c_offset = (idx % (kBlockN / 4)) * 4;
-                    int g_k = next_k0 + k_idx;
-                    int g_c = blockIdx.x * kBlockN + c_offset;
-
-                    if (g_k < K && g_c + 3 < N) {
-                        float4 v = __ldg(reinterpret_cast<const float4*>(B + g_k * N + g_c));
-                        Bs[write_buf][k_idx][c_offset + 0] = v.x;
-                        Bs[write_buf][k_idx][c_offset + 1] = v.y;
-                        Bs[write_buf][k_idx][c_offset + 2] = v.z;
-                        Bs[write_buf][k_idx][c_offset + 3] = v.w;
-                    } else {
-                        Bs[write_buf][k_idx][c_offset + 0] = (g_k < K && g_c + 0 < N) ? B[g_k * N + g_c + 0] : 0.0f;
-                        Bs[write_buf][k_idx][c_offset + 1] = (g_k < K && g_c + 1 < N) ? B[g_k * N + g_c + 1] : 0.0f;
-                        Bs[write_buf][k_idx][c_offset + 2] = (g_k < K && g_c + 2 < N) ? B[g_k * N + g_c + 2] : 0.0f;
-                        Bs[write_buf][k_idx][c_offset + 3] = (g_k < K && g_c + 3 < N) ? B[g_k * N + g_c + 3] : 0.0f;
-                    }
-                }
-            }
+            __pipeline_wait_prior(0);
         }
-
         __syncthreads();
-
-        // Swap buffers
-        int tmp = read_buf;
-        read_buf = write_buf;
-        write_buf = tmp;
     }
 
-    // Write results to C using float4 (8 elements = 2 float4 per row)
     #pragma unroll
     for (int i = 0; i < kTM; ++i) {
         int g_r = row_start + i;
         if (g_r >= M) continue;
 
         int g_c = col_start;
-        // First float4 (columns 0-3)
         if (g_c + 3 < N) {
-            float4 v;
-            v.x = sum[i][0];
-            v.y = sum[i][1];
-            v.z = sum[i][2];
-            v.w = sum[i][3];
+            float4 v = {sum[i][0], sum[i][1], sum[i][2], sum[i][3]};
             *reinterpret_cast<float4*>(C + g_r * N + g_c) = v;
         } else {
-            for (int j = 0; j < 4 && g_c + j < N; ++j) {
+            for (int j = 0; j < kTN && g_c + j < N; ++j)
                 C[g_r * N + g_c + j] = sum[i][j];
-            }
-        }
-        // Second float4 (columns 4-7)
-        if (g_c + 7 < N) {
-            float4 v;
-            v.x = sum[i][4];
-            v.y = sum[i][5];
-            v.z = sum[i][6];
-            v.w = sum[i][7];
-            *reinterpret_cast<float4*>(C + g_r * N + g_c + 4) = v;
-        } else if (g_c + 4 < N) {
-            for (int j = 4; j < kTN && g_c + j < N; ++j) {
-                C[g_r * N + g_c + j] = sum[i][j];
-            }
         }
     }
 }
@@ -250,8 +155,9 @@ static void GemmCPU(const float* A, const float* B, float* C, int M, int N, int 
     for (int r = 0; r < M; ++r)
         for (int c = 0; c < N; ++c) {
             float s = 0;
-            for (int k = 0; k < K; ++k) s += A[r * K + k] * B[k * N + c];
-            C[r * N + c] = s;
+            for (int k = 0; k < K; ++k)
+                s += A[static_cast<size_t>(r) * K + k] * B[static_cast<size_t>(k) * N + c];
+            C[static_cast<size_t>(r) * N + c] = s;
         }
 }
 
@@ -263,64 +169,75 @@ int main() {
     std::ofstream ofs("data/results/gemm_v3_results.csv");
     ofs << "id,group,M,N,K,gpu_ms,gflops,max_abs_diff,check\n";
 
+    int smem_bytes = (2 * kSmemABuf + 2 * kSmemBBuf) * sizeof(float);
+
     for (size_t i = 0; i < cases.size(); ++i) {
         int M = cases[i].rows, N = cases[i].cols, K = M;
-        int n = M * N;
-        std::vector<float> A(n), B(n), C_cpu(n), C_gpu(n);
+        bool aligned = (M % kBlockM == 0) && (N % kBlockN == 0) && (K % kTileK == 0);
+
+        size_t sz_a = static_cast<size_t>(M) * K;
+        size_t sz_b = static_cast<size_t>(K) * N;
+        size_t sz_c = static_cast<size_t>(M) * N;
+
+        std::vector<float> A(sz_a), B(sz_b), C_cpu(sz_c), C_gpu(sz_c);
         common::InitMatrix(A, M, K);
         common::InitMatrix(B, K, N);
-        if (M <= kMaxCpuVerifyDim && N <= kMaxCpuVerifyDim) {
+        if (M <= kMaxCpuVerifyDim && N <= kMaxCpuVerifyDim)
             GemmCPU(A.data(), B.data(), C_cpu.data(), M, N, K);
+
+        float gpu_ms = 0.0f;
+        if (aligned) {
+            float *dA, *dB, *dC;
+            CHECK_CUDA(cudaMalloc(&dA, sz_a * sizeof(float)));
+            CHECK_CUDA(cudaMalloc(&dB, sz_b * sizeof(float)));
+            CHECK_CUDA(cudaMalloc(&dC, sz_c * sizeof(float)));
+            CHECK_CUDA(cudaMemcpy(dA, A.data(), sz_a * sizeof(float), cudaMemcpyHostToDevice));
+            CHECK_CUDA(cudaMemcpy(dB, B.data(), sz_b * sizeof(float), cudaMemcpyHostToDevice));
+
+            dim3 block(kBlockThreadsX, kBlockThreadsY);
+            dim3 grid((N + kBlockN - 1) / kBlockN, (M + kBlockM - 1) / kBlockM);
+
+            CHECK_CUDA(cudaFuncSetAttribute(GemmV3Kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_bytes));
+
+            GemmV3Kernel<<<grid, block, smem_bytes>>>(dA, dB, dC, M, N, K);
+            CHECK_CUDA(cudaDeviceSynchronize());
+
+            cudaEvent_t start, stop;
+            CHECK_CUDA(cudaEventCreate(&start));
+            CHECK_CUDA(cudaEventCreate(&stop));
+            CHECK_CUDA(cudaEventRecord(start));
+            for (int r = 0; r < kRepeat; ++r)
+                GemmV3Kernel<<<grid, block, smem_bytes>>>(dA, dB, dC, M, N, K);
+            CHECK_CUDA(cudaEventRecord(stop));
+            CHECK_CUDA(cudaEventSynchronize(stop));
+            CHECK_CUDA(cudaEventElapsedTime(&gpu_ms, start, stop));
+            gpu_ms /= kRepeat;
+
+            CHECK_CUDA(cudaMemcpy(C_gpu.data(), dC, sz_c * sizeof(float), cudaMemcpyDeviceToHost));
+            CHECK_CUDA(cudaEventDestroy(start)); CHECK_CUDA(cudaEventDestroy(stop));
+            CHECK_CUDA(cudaFree(dA)); CHECK_CUDA(cudaFree(dB)); CHECK_CUDA(cudaFree(dC));
         }
 
-        float *d_A, *d_B, *d_C;
-        CHECK_CUDA(cudaMalloc(&d_A, M * K * sizeof(float)));
-        CHECK_CUDA(cudaMalloc(&d_B, K * N * sizeof(float)));
-        CHECK_CUDA(cudaMalloc(&d_C, M * N * sizeof(float)));
-        CHECK_CUDA(cudaMemcpy(d_A, A.data(), M * K * sizeof(float), cudaMemcpyHostToDevice));
-        CHECK_CUDA(cudaMemcpy(d_B, B.data(), K * N * sizeof(float), cudaMemcpyHostToDevice));
-
-        dim3 block(kBlockThreadsX, kBlockThreadsY);
-        dim3 grid((N + kBlockN - 1) / kBlockN, (M + kBlockM - 1) / kBlockM);
-
-        // Warmup
-        GemmV3Kernel<<<grid, block>>>(d_A, d_B, d_C, M, N, K);
-        CHECK_CUDA(cudaDeviceSynchronize());
-
-        cudaEvent_t start, stop;
-        CHECK_CUDA(cudaEventCreate(&start));
-        CHECK_CUDA(cudaEventCreate(&stop));
-        CHECK_CUDA(cudaEventRecord(start));
-        for (int r = 0; r < kRepeat; ++r) {
-            GemmV3Kernel<<<grid, block>>>(d_A, d_B, d_C, M, N, K);
-        }
-        CHECK_CUDA(cudaEventRecord(stop));
-        CHECK_CUDA(cudaEventSynchronize(stop));
-        float ms = 0;
-        CHECK_CUDA(cudaEventElapsedTime(&ms, start, stop));
-        ms /= kRepeat;
-
-        CHECK_CUDA(cudaMemcpy(C_gpu.data(), d_C, M * N * sizeof(float), cudaMemcpyDeviceToHost));
         bool ok = true;
-        if (M <= kMaxCpuVerifyDim && N <= kMaxCpuVerifyDim) {
+        double max_abs_diff = 0.0;
+        const char* check = "SKIP_UNALIGNED";
+        if (aligned && M <= kMaxCpuVerifyDim && N <= kMaxCpuVerifyDim) {
             ok = common::CheckEqual(C_cpu, C_gpu, 1e-3f);
+            max_abs_diff = common::MaxAbsDiff(C_cpu, C_gpu);
+            check = ok ? "PASS" : "FAIL";
+        } else if (aligned) {
+            check = "SKIP";
         }
-        double gflops = (2.0 * M * N * K) / (ms * 1e6);
 
-        std::cout << M << "x" << N << "x" << K << " | " << std::fixed << std::setprecision(4) << ms << " ms"
+        double gflops = (gpu_ms > 0.0f) ? (2.0 * M * N * K / (gpu_ms * 1e6)) : 0.0;
+
+        std::cout << M << "x" << N << "x" << K
+                  << " | " << std::fixed << std::setprecision(4) << gpu_ms << " ms"
                   << " | " << std::setprecision(1) << gflops << " GFLOP/s"
-                  << " | " << (ok ? "PASS" : "FAIL") << "\n";
+                  << " | " << check << "\n";
 
         ofs << i << ",gemm_v3," << M << "," << N << "," << K << ","
-            << ms << "," << gflops << ","
-            << common::MaxAbsDiff(C_cpu, C_gpu) << ","
-            << (ok ? "PASS" : "FAIL") << "\n";
-
-        CHECK_CUDA(cudaEventDestroy(start));
-        CHECK_CUDA(cudaEventDestroy(stop));
-        CHECK_CUDA(cudaFree(d_A));
-        CHECK_CUDA(cudaFree(d_B));
-        CHECK_CUDA(cudaFree(d_C));
+            << gpu_ms << "," << gflops << "," << max_abs_diff << "," << check << "\n";
     }
     return 0;
 }
