@@ -150,7 +150,7 @@ int main() {
         CHECK_CUDA(cudaMemcpy(gpu.data(), dy, n * sizeof(float), cudaMemcpyDeviceToHost));
         bool ok = common::CheckEqual(cpu, gpu, 1e-4f);
 
-        const double bytes = static_cast<double>(n) * sizeof(float) * 3.0;
+        const double bytes = static_cast<double>(n) * sizeof(float) * 2.0;
         const double bw = bytes / (static_cast<double>(gpu_ms) * 1e6);
 
         std::cout << rows << "x" << cols

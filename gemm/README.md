@@ -202,10 +202,51 @@ cuBLAS 在 Blackwell 上对 `cublasSgemm` 内部使用 **BF16 Tensor Core + BF16
 
 ---
 
-## 6. 产物路径与工程附注
+## 6. Nsight Compute 瓶颈分析
+
+使用 `ncu --set basic` 在 4096³ 规模上 profiling 各版本核心 kernel 的 GPU Speed of Light Throughput：
+
+| 版本 | Memory Throughput | DRAM Throughput | Compute Throughput | 主要瓶颈 |
+|:----|:-----------------:|:---------------:|:------------------:|:---------|
+| **v0** (朴素) | 93.85% | 41.54% | 93.85% | DRAM 带宽受限 |
+| **v3** (FP32 最优) | 60.58% | **51.30%** | 70.37% | 均衡（计算+访存） |
+| **v4** (TF32 WMMA) | 37.04% | 37.04% | **93.48%** | **寄存器/Occupancy 受限** |
+| **v4** (Occupancy) | — | — | — | 仅 26.9%（寄存器压力大） |
+| **v3** (Occupancy) | — | — | — | 约 80%+（__launch_bounds__ 保证） |
+
+**关键分析：**
+- **v0**：DRAM 吞吐仅 41.54%，L1 缓存 94.22% → 指令瓶颈（每元素 4+ 条全局加载指令），受限于 LSU 而非带宽
+- **v3**：DRAM 吞吐 51.30%，L2 52.95%，L1 61.08% → 均衡的计算-访存流水线，cp.async 有效隐藏延迟
+- **v4**：Compute 93.48%（算力吃满）但 Memory 仅 37.04% → WMMA fragment 寄存器压力（64 regs/warp）导致 occupancy 仅 26.9%（2 blocks/SM），SM 内部计算单元闲置等待寄存器就绪
+
+## 7. PTX / SASS 反汇编
+
+所有 kernel 的 PTX 和 SASS（cubin）文件位于各子目录 `asm/` 下：
+
+```bash
+gemm/asm/ptx/gemm_v0.ptx     # PTX 中间指令
+gemm/asm/ptx/gemm_v3.ptx
+gemm/asm/ptx/gemm_v4.ptx
+gemm/asm/ptx/gemm_v5.ptx
+gemm/asm/ptx/gemm_fp16.ptx
+gemm/asm/ptx/gemm_int8.ptx
+gemm/asm/sass/gemm_v0.cubin  # SASS 机器码（cuobjdump -sass 可查看）
+gemm/asm/sass/gemm_v3.cubin
+...
+```
+
+关键 PTX 指令观察：
+- **v3** (cp.async)：`cp.async.ca.shared.global.L128` — DMA 异步拷贝，不占用 LSU
+- **v4** (WMMA)：`wmma.mma.sync.aligned.row.row.m16n16k8.f32.tf32.tf32.f32` — TF32 Tensor Core 指令
+- **v5** (WGMMA)：`wgmma.fence`、`wgmma.commit_group` — Blackwell warp-group MMA
+- **gemm_fp16**：`wmma.mma.sync.aligned.row.row.m16n16k16.f32.f16.f16.f32` — k=16 的 half Tensor Core
+
+## 8. 产物路径与工程附注
 
 - **可执行文件：** `build/bin/`
 - **结果 CSV：** 各 `main` 写入 `data/results/`
+- **ncu 报告：** `build/data/ncu_reports/`
+- **PTX/SASS：** `gemm/asm/ptx/`、`gemm/asm/sass/`
 - **CUDA 架构：** RTX 5060 Ti 为 Blackwell 架构，Compute Capability **sm_120**，CUDA 13.2
 
 ---

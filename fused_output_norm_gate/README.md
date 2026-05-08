@@ -130,3 +130,24 @@ $$
 
 - **可执行文件：** `build/bin/fused_output_norm_gate_v0`
 - **结果 CSV：** `data/results/fused_output_norm_gate_v0_results.csv`
+
+---
+
+## PTX / SASS
+
+PTX 和 SASS 文件位于 `$f/asm/` 下：
+
+```bash
+$f/asm/ptx/*.ptx
+$f/asm/sass/*.cubin
+```
+
+使用 `cuobjdump -sass` 可查看 SASS 反汇编。
+
+## 产物路径
+
+- **可执行文件：** `build/bin/`
+- **结果 CSV：** `data/results/`
+- **ncu 报告：** `build/data/ncu_reports/`
+- **PTX/SASS：** `$f/asm/ptx/`、`$f/asm/sass/`
+- **CUDA 架构：** RTX 5060 Ti，Compute Capability **sm_120**，CUDA 13.2

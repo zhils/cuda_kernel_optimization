@@ -37,3 +37,24 @@ Q = N * W_q + b_q
 - `v2_bq_only`: `v2` 对照版（只缓存 `bq`，`wq` 直接访存；每 lane 同算 2 输出）
 - `v3`: 在 `v2` 基础上增加 `wq` tile 双缓冲（ping-pong）
 
+
+---
+
+## PTX / SASS
+
+PTX 和 SASS 文件位于 `$f/asm/` 下：
+
+```bash
+$f/asm/ptx/*.ptx
+$f/asm/sass/*.cubin
+```
+
+使用 `cuobjdump -sass` 可查看 SASS 反汇编。
+
+## 产物路径
+
+- **可执行文件：** `build/bin/`
+- **结果 CSV：** `data/results/`
+- **ncu 报告：** `build/data/ncu_reports/`
+- **PTX/SASS：** `$f/asm/ptx/`、`$f/asm/sass/`
+- **CUDA 架构：** RTX 5060 Ti，Compute Capability **sm_120**，CUDA 13.2
