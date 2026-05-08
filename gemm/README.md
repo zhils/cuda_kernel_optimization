@@ -52,12 +52,22 @@ A ∈ R^{MxK}, B ∈ R^{KxN}, C ∈ R^{MxN}
 
 ### 2.3 Roofline 判断
 
-- **GPU：** RTX 5060 Ti (sm_120, Blackwell)，FP32 峰值 ~25 TFLOPS，Tensor Core FP16 峰值更高；DRAM 带宽 ~448 GB/s。
+- **GPU：** RTX 5060 Ti（Blackwell sm_120, 36 SM, ~2.55 GHz），DRAM 带宽 ~448 GB/s
 
-| N | 算术强度 | 初步判断 |
-|---|----------|----------|
+| 计算路径 | 吞吐峰值 | 说明 |
+|:---------|:--------:|:-----|
+| FP32 CUDA Core FMA | **~23.5 TFLOPS** | 36 SM × 128 core × 2.55 GHz × 2 FMA |
+| TF32 Tensor Core (k=8) | ~188 TFLOPS | 每指令 2048 FMA，受 occupancy 限制严重 |
+| FP16/BF16 Tensor Core (k=16) | ~376 TFLOPS | 每指令 4096 FMA，实际可达 30-50 TFLOPS |
+
+**为什么实测值远低于理论峰值？** 理论峰值假设每 cycle 每 CUDA Core 都发射一条 FMA 指令（100% utilization），但 GEMM kernel 的指令流中混有 load/store、地址计算、循环控制等非 FMA 指令。实测中：
+- 手写 kernel 通常达到峰值的 **40-60%**（V3 的 12.52 TFLOPS→53%，已属优秀）
+- cuBLAS 可达 **60-75%**（但注意其 BF16×9 仿真走的是 Tensor Core 而非 CUDA Core）
+
+| N | 算术强度（FLOP/Byte） | 初步判断 |
+|--:|:---------------------:|:---------|
 | 128 | ~21 | 偏访存受限 |
-| 512 | ~85 | 偏计算受限 |
+| 512 | ~85 | 计算/访存均衡 |
 | 1024 | ~170 | 计算受限 |
 | 4096 | ~683 | 计算受限 |
 
@@ -166,16 +176,16 @@ A ∈ R^{MxK}, B ∈ R^{KxN}, C ∈ R^{MxN}
 
 ### 4.4 优化路径总结（4096³）
 
-| 版本 | 耗时 | TFLOPS | vs 上一版 | vs cuBLAS |
-|:----|:----:|:------:|:---------:|:---------:|
-| **v0** 朴素 | 97.12 ms | 1.42 | — | 8.7% |
-| **v1** +SMEM | 70.65 ms | 1.95 | +37% | 11.9% |
-| **v2** +register tile | 17.04 ms | 8.07 | +314% | 49.4% |
-| **v3** +cp.async+T32+8×4 | **10.98 ms** | **12.52** | **+55%** | **76.7%** |
-| v4 TF32 WMMA | 12.57 ms | 10.94 | -13% | 67.0% |
-| v5 WGMMA | 12.21 ms | 11.26 | -10% | 68.9% |
-| **gemm_fp16** half TC | **3.68 ms** | **37.39** | **+264%** | **229%** |
-| cuBLAS FP32 | 8.42 ms | 16.33 | — | 100% |
+| 版本 | 耗时 | TFLOPS | vs 上一版 | vs cuBLAS | vs FP32 理论峰值 (23.5 TFLOPS) |
+|:----|:----:|:------:|:---------:|:---------:|:------------------------------:|
+| **v0** 朴素 | 97.12 ms | 1.42 | — | 8.7% | 6.0% |
+| **v1** +SMEM | 70.65 ms | 1.95 | +37% | 11.9% | 8.3% |
+| **v2** +register tile | 17.04 ms | 8.07 | +314% | 49.4% | 34.3% |
+| **v3** +cp.async+T32+8×4 | **10.98 ms** | **12.52** | **+55%** | **76.7%** | **53.3%** |
+| v4 TF32 WMMA | 12.57 ms | 10.94 | -13% | 67.0% | 46.6% |
+| v5 WGMMA | 12.21 ms | 11.26 | -10% | 68.9% | 47.9% |
+| **gemm_fp16** half TC | **3.68 ms** | **37.39** | **+264%** | **229%** | 159%（超 FP32 上限）|
+| cuBLAS FP32 | 8.42 ms | 16.33 | — | 100% | 69.5%（走 BF16×9 仿真，非原生 FP32）|
 
 ---
 
@@ -196,9 +206,11 @@ V5 的 WGMMA（11.26 TFLOPS）与 V4 的 WMMA（10.94 TFLOPS）性能接近，�
 - 数据量减半，同等 SMEM 可存储 2× K-tile
 - 达到 cuBLAS FP16（约 49 TFLOPS）的 **76%**
 
-### 5.4 cuBLAS FP32 的 BF16x9 仿真
+### 5.4 cuBLAS FP32 的 BF16x9 仿真与实测对比
 
-cuBLAS 在 Blackwell 上对 `cublasSgemm` 内部使用 **BF16 Tensor Core + BF16x9 仿真算法**，将每个 FP32 矩阵乘分解为 9 个 BF16 运算，利用 k=16 的 BF16 Tensor Core 实现净加速。这是手写 FP32 kernel 无法匹敌的根本原因。
+cuBLAS 在 Blackwell 上对 `cublasSgemm` 内部使用 **BF16 Tensor Core + BF16x9 仿真算法**，将每个 FP32 矩阵乘分解为 9 个 BF16 运算，利用 k=16 的 BF16 Tensor Core 实现净加速。
+
+**FP32 理论峰值（23.5 TFLOPS）是 CUDA Core FMA 的上限，不适用于 BF16x9 仿真路径**——后者走的是 Tensor Core（约 376 TFLOPS BF16 峰值），9 次分解后净等效 ~42 TFLOPS。cuBLAS 实测 16.33 TFLOPS 受制于 bandwidth + 分解开销，而非 CUDA Core 上限。V3 在纯 FP32 CUDA Core FMA 路径上达到 53% 利用率（12.52 / 23.5），对手写 kernel 已属优秀水平。
 
 ---
 
