@@ -1,4 +1,5 @@
 #include <cuda_runtime.h>
+#include <cuda_pipeline.h>
 #include <mma.h>
 
 #include <algorithm>
@@ -14,122 +15,178 @@
 namespace gemm_v4 {
 namespace wmma = nvcuda::wmma;
 
-constexpr int kThreads = 128;
-constexpr int kBlockThreadsX = 16;
-constexpr int kBlockThreadsY = 8;
+constexpr int kBlockM = 128;
+constexpr int kBlockN = 128;
+constexpr int kTileK = 16;
+
+constexpr int kNumWarpsM = 2;
+constexpr int kNumWarpsN = 4;
 constexpr int kWarpSize = 32;
-constexpr int kWarpsPerBlock = kThreads / kWarpSize;
+constexpr int kThreads = kNumWarpsM * kNumWarpsN * kWarpSize;  // 256
+static_assert(kThreads == 256, "thread count");
+
+constexpr int kWarpTilesM = 4;
+constexpr int kWarpTilesN = 2;
+constexpr int kWarpM = kWarpTilesM * 16;  // 64
+constexpr int kWarpN = kWarpTilesN * 16;  // 32
+static_assert(kNumWarpsM * kWarpM == kBlockM, "block M coverage");
+static_assert(kNumWarpsN * kWarpN == kBlockN, "block N coverage");
 
 constexpr int kWmmaM = 16;
 constexpr int kWmmaN = 16;
 constexpr int kWmmaK = 8;
-constexpr int kWarpTilesM = 2;
-constexpr int kWarpTilesN = 2;
-constexpr int kBlockM = kWarpTilesM * kWmmaM;  // 32
-constexpr int kBlockN = kWarpTilesN * kWmmaN;  // 32
-constexpr int kTileK = 16;
+static_assert(kTileK % kWmmaK == 0, "kTileK must be multiple of kWmmaK");
 
-static_assert(kWarpsPerBlock == kWarpTilesM * kWarpTilesN, "warp mapping mismatch");
+constexpr int kBlockThreadsX = 16;
+constexpr int kBlockThreadsY = 16;
 
-__shared__ float As[2][kBlockM][kTileK];
-__shared__ float Bs[2][kTileK][kBlockN];
+constexpr int kSmemABuf = kBlockM * kTileK;
+constexpr int kSmemBBuf = kTileK * kBlockN;
+constexpr size_t kSmemSize = sizeof(float) * 2 * (kSmemABuf + kSmemBBuf);
 
 __global__ __launch_bounds__(kThreads, 2) void GemmV4Kernel(
     const float* __restrict__ A,
     const float* __restrict__ B,
     float* __restrict__ C,
     int M, int N, int K) {
+  extern __shared__ float shared_mem[];
+  float* As_buf0 = shared_mem;
+  float* As_buf1 = shared_mem + kSmemABuf;
+  float* Bs_buf0 = shared_mem + 2 * kSmemABuf;
+  float* Bs_buf1 = shared_mem + 2 * kSmemABuf + kSmemBBuf;
+
   const int tx = threadIdx.x;
   const int ty = threadIdx.y;
   const int tid = ty * kBlockThreadsX + tx;
   const int warp_id = tid / kWarpSize;
-  const int warp_m = warp_id / kWarpTilesN;
-  const int warp_n = warp_id % kWarpTilesN;
+  const int warp_m = warp_id / kNumWarpsN;
+  const int warp_n = warp_id % kNumWarpsN;
+
+  wmma::fragment<wmma::accumulator, kWmmaM, kWmmaN, kWmmaK, float>
+      c_frag[kWarpTilesM][kWarpTilesN];
+  #pragma unroll
+  for (int i = 0; i < kWarpTilesM; ++i) {
+    #pragma unroll
+    for (int j = 0; j < kWarpTilesN; ++j) {
+      wmma::fill_fragment(c_frag[i][j], 0.0f);
+    }
+  }
 
   const int num_k_tiles = (K + kTileK - 1) / kTileK;
-  wmma::fragment<wmma::accumulator, kWmmaM, kWmmaN, kWmmaK, float> c_frag;
-  wmma::fill_fragment(c_frag, 0.0f);
+  const int a_offset_base = warp_m * kWarpM;
+  const int b_offset_base = warp_n * kWarpN;
+  const int a_ld = kTileK;
 
-  auto load_tile = [&](int tile_idx, int buf) {
-    const int k0 = tile_idx * kTileK;
+  auto load_tile_async = [&](int tile_k_start, float* As_buf, float* Bs_buf) {
     const int total_a_float4 = (kBlockM * kTileK) / 4;
     const int a_float4_per_thread = (total_a_float4 + kThreads - 1) / kThreads;
     for (int l = 0; l < a_float4_per_thread; ++l) {
-      const int idx = tid * a_float4_per_thread + l;
+      int idx = tid * a_float4_per_thread + l;
       if (idx >= total_a_float4) continue;
-      const int r = idx / (kTileK / 4);
-      const int k_offset = (idx % (kTileK / 4)) * 4;
-      const int g_r = blockIdx.y * kBlockM + r;
-      const int g_k = k0 + k_offset;
+      int r = idx / (kTileK / 4);
+      int k_offset = (idx % (kTileK / 4)) * 4;
+      int g_r = blockIdx.y * kBlockM + r;
+      int g_k = tile_k_start + k_offset;
+      float* dst = As_buf + r * kTileK + k_offset;
       if (g_r < M && g_k + 3 < K) {
-        const float4 v = __ldg(reinterpret_cast<const float4*>(A + static_cast<size_t>(g_r) * K + g_k));
-        As[buf][r][k_offset + 0] = v.x;
-        As[buf][r][k_offset + 1] = v.y;
-        As[buf][r][k_offset + 2] = v.z;
-        As[buf][r][k_offset + 3] = v.w;
+        __pipeline_memcpy_async(
+            dst,
+            &A[static_cast<size_t>(g_r) * K + g_k], 16);
       } else {
-        As[buf][r][k_offset + 0] = (g_r < M && g_k + 0 < K) ? A[static_cast<size_t>(g_r) * K + g_k + 0] : 0.0f;
-        As[buf][r][k_offset + 1] = (g_r < M && g_k + 1 < K) ? A[static_cast<size_t>(g_r) * K + g_k + 1] : 0.0f;
-        As[buf][r][k_offset + 2] = (g_r < M && g_k + 2 < K) ? A[static_cast<size_t>(g_r) * K + g_k + 2] : 0.0f;
-        As[buf][r][k_offset + 3] = (g_r < M && g_k + 3 < K) ? A[static_cast<size_t>(g_r) * K + g_k + 3] : 0.0f;
+        dst[0] = (g_r < M && g_k + 0 < K) ? A[static_cast<size_t>(g_r) * K + g_k + 0] : 0.0f;
+        dst[1] = (g_r < M && g_k + 1 < K) ? A[static_cast<size_t>(g_r) * K + g_k + 1] : 0.0f;
+        dst[2] = (g_r < M && g_k + 2 < K) ? A[static_cast<size_t>(g_r) * K + g_k + 2] : 0.0f;
+        dst[3] = (g_r < M && g_k + 3 < K) ? A[static_cast<size_t>(g_r) * K + g_k + 3] : 0.0f;
       }
     }
 
     const int total_b_float4 = (kTileK * kBlockN) / 4;
     const int b_float4_per_thread = (total_b_float4 + kThreads - 1) / kThreads;
     for (int l = 0; l < b_float4_per_thread; ++l) {
-      const int idx = tid * b_float4_per_thread + l;
+      int idx = tid * b_float4_per_thread + l;
       if (idx >= total_b_float4) continue;
-      const int k_idx = idx / (kBlockN / 4);
-      const int c_offset = (idx % (kBlockN / 4)) * 4;
-      const int g_k = k0 + k_idx;
-      const int g_c = blockIdx.x * kBlockN + c_offset;
+      int k_idx = idx / (kBlockN / 4);
+      int c_offset = (idx % (kBlockN / 4)) * 4;
+      int g_k = tile_k_start + k_idx;
+      int g_c = blockIdx.x * kBlockN + c_offset;
+      float* dst = Bs_buf + k_idx * kBlockN + c_offset;
       if (g_k < K && g_c + 3 < N) {
-        const float4 v = __ldg(reinterpret_cast<const float4*>(B + static_cast<size_t>(g_k) * N + g_c));
-        Bs[buf][k_idx][c_offset + 0] = v.x;
-        Bs[buf][k_idx][c_offset + 1] = v.y;
-        Bs[buf][k_idx][c_offset + 2] = v.z;
-        Bs[buf][k_idx][c_offset + 3] = v.w;
+        __pipeline_memcpy_async(
+            dst,
+            &B[static_cast<size_t>(g_k) * N + g_c], 16);
       } else {
-        Bs[buf][k_idx][c_offset + 0] = (g_k < K && g_c + 0 < N) ? B[static_cast<size_t>(g_k) * N + g_c + 0] : 0.0f;
-        Bs[buf][k_idx][c_offset + 1] = (g_k < K && g_c + 1 < N) ? B[static_cast<size_t>(g_k) * N + g_c + 1] : 0.0f;
-        Bs[buf][k_idx][c_offset + 2] = (g_k < K && g_c + 2 < N) ? B[static_cast<size_t>(g_k) * N + g_c + 2] : 0.0f;
-        Bs[buf][k_idx][c_offset + 3] = (g_k < K && g_c + 3 < N) ? B[static_cast<size_t>(g_k) * N + g_c + 3] : 0.0f;
+        dst[0] = (g_k < K && g_c + 0 < N) ? B[static_cast<size_t>(g_k) * N + g_c + 0] : 0.0f;
+        dst[1] = (g_k < K && g_c + 1 < N) ? B[static_cast<size_t>(g_k) * N + g_c + 1] : 0.0f;
+        dst[2] = (g_k < K && g_c + 2 < N) ? B[static_cast<size_t>(g_k) * N + g_c + 2] : 0.0f;
+        dst[3] = (g_k < K && g_c + 3 < N) ? B[static_cast<size_t>(g_k) * N + g_c + 3] : 0.0f;
       }
     }
   };
 
-  load_tile(0, 0);
+  load_tile_async(0, As_buf0, Bs_buf0);
+  __pipeline_commit();
+  __pipeline_wait_prior(0);
   __syncthreads();
 
-  int read_buf = 0;
-  int write_buf = 1;
+  #pragma unroll
   for (int t = 0; t < num_k_tiles; ++t) {
+    float* As_read = (t & 1) ? As_buf1 : As_buf0;
+    float* Bs_read = (t & 1) ? Bs_buf1 : Bs_buf0;
+
     if (t + 1 < num_k_tiles) {
-      load_tile(t + 1, write_buf);
+      float* As_write = (t & 1) ? As_buf0 : As_buf1;
+      float* Bs_write = (t & 1) ? Bs_buf0 : Bs_buf1;
+      load_tile_async((t + 1) * kTileK, As_write, Bs_write);
+      __pipeline_commit();
     }
 
     #pragma unroll
     for (int kk = 0; kk < kTileK; kk += kWmmaK) {
-      wmma::fragment<wmma::matrix_a, kWmmaM, kWmmaN, kWmmaK, wmma::precision::tf32, wmma::row_major> a_frag;
-      wmma::fragment<wmma::matrix_b, kWmmaM, kWmmaN, kWmmaK, wmma::precision::tf32, wmma::row_major> b_frag;
-      const float* tile_a = &As[read_buf][warp_m * kWmmaM][kk];
-      const float* tile_b = &Bs[read_buf][kk][warp_n * kWmmaN];
-      wmma::load_matrix_sync(a_frag, tile_a, kTileK);
-      wmma::load_matrix_sync(b_frag, tile_b, kBlockN);
-      wmma::mma_sync(c_frag, a_frag, b_frag, c_frag);
+      wmma::fragment<wmma::matrix_a, kWmmaM, kWmmaN, kWmmaK,
+                     wmma::precision::tf32, wmma::row_major>
+          a_frag[kWarpTilesM];
+      #pragma unroll
+      for (int i = 0; i < kWarpTilesM; ++i) {
+        wmma::load_matrix_sync(a_frag[i],
+            As_read + (a_offset_base + i * kWmmaM) * a_ld + kk, a_ld);
+      }
+
+      #pragma unroll
+      for (int j = 0; j < kWarpTilesN; ++j) {
+        wmma::fragment<wmma::matrix_b, kWmmaM, kWmmaN, kWmmaK,
+                       wmma::precision::tf32, wmma::row_major>
+            b_frag;
+        wmma::load_matrix_sync(b_frag,
+            Bs_read + kk * kBlockN + b_offset_base + j * kWmmaN, kBlockN);
+
+        #pragma unroll
+        for (int i = 0; i < kWarpTilesM; ++i) {
+          wmma::mma_sync(c_frag[i][j], a_frag[i], b_frag, c_frag[i][j]);
+        }
+      }
     }
 
+    if (t + 1 < num_k_tiles) {
+      __pipeline_wait_prior(0);
+    }
     __syncthreads();
-    int tmp = read_buf;
-    read_buf = write_buf;
-    write_buf = tmp;
   }
 
-  const int out_r = blockIdx.y * kBlockM + warp_m * kWmmaM;
-  const int out_c = blockIdx.x * kBlockN + warp_n * kWmmaN;
-  if (out_r + kWmmaM <= M && out_c + kWmmaN <= N) {
-    wmma::store_matrix_sync(C + static_cast<size_t>(out_r) * N + out_c, c_frag, N, wmma::mem_row_major);
+  const int out_r = blockIdx.y * kBlockM + a_offset_base;
+  const int out_c = blockIdx.x * kBlockN + b_offset_base;
+
+  #pragma unroll
+  for (int i = 0; i < kWarpTilesM; ++i) {
+    #pragma unroll
+    for (int j = 0; j < kWarpTilesN; ++j) {
+      const int g_r = out_r + i * kWmmaM;
+      const int g_c = out_c + j * kWmmaN;
+      if (g_r + kWmmaM <= M && g_c + kWmmaN <= N) {
+        wmma::store_matrix_sync(
+            C + static_cast<size_t>(g_r) * N + g_c,
+            c_frag[i][j], N, wmma::mem_row_major);
+      }
+    }
   }
 }
 
@@ -153,11 +210,16 @@ int main() {
   std::ofstream ofs("data/results/gemm_v4_results.csv");
   ofs << "id,group,M,N,K,gpu_ms,gflops,max_abs_diff,check\n";
 
+  CHECK_CUDA(cudaFuncSetAttribute(gemm_v4::GemmV4Kernel,
+      cudaFuncAttributeMaxDynamicSharedMemorySize,
+      gemm_v4::kSmemSize));
+
   for (size_t i = 0; i < cases.size(); ++i) {
     const int M = cases[i].rows;
     const int N = cases[i].cols;
     const int K = M;
-    const bool aligned = (M % gemm_v4::kBlockM == 0) && (N % gemm_v4::kBlockN == 0) &&
+    const bool aligned = (M % gemm_v4::kBlockM == 0) &&
+                         (N % gemm_v4::kBlockN == 0) &&
                          (K % gemm_v4::kTileK == 0);
     std::vector<float> A(static_cast<size_t>(M) * K),
                        B(static_cast<size_t>(K) * N),
@@ -182,7 +244,8 @@ int main() {
       dim3 block(gemm_v4::kBlockThreadsX, gemm_v4::kBlockThreadsY);
       dim3 grid((N + gemm_v4::kBlockN - 1) / gemm_v4::kBlockN,
                 (M + gemm_v4::kBlockM - 1) / gemm_v4::kBlockM);
-      gemm_v4::GemmV4Kernel<<<grid, block>>>(dA, dB, dC, M, N, K);
+
+      gemm_v4::GemmV4Kernel<<<grid, block, gemm_v4::kSmemSize>>>(dA, dB, dC, M, N, K);
       CHECK_CUDA(cudaDeviceSynchronize());
 
       cudaEvent_t start, stop;
@@ -190,7 +253,7 @@ int main() {
       CHECK_CUDA(cudaEventCreate(&stop));
       CHECK_CUDA(cudaEventRecord(start));
       for (int rep = 0; rep < kRepeat; ++rep) {
-        gemm_v4::GemmV4Kernel<<<grid, block>>>(dA, dB, dC, M, N, K);
+        gemm_v4::GemmV4Kernel<<<grid, block, gemm_v4::kSmemSize>>>(dA, dB, dC, M, N, K);
       }
       CHECK_CUDA(cudaEventRecord(stop));
       CHECK_CUDA(cudaEventSynchronize(stop));
