@@ -1,11 +1,10 @@
-set(FUSED_CONV1D_SILU_VARIANTS
-    fused_conv1d_silu_v0
-    fused_conv1d_silu_v1
-    fused_conv1d_silu_v2
-    fused_conv1d_silu_v3
+set(FLASH_ATTENTION_VARIANTS
+    flash_attention_v0
+    flash_attention_v1
+    flash_attention_v2
 )
 
-foreach(variant ${FUSED_CONV1D_SILU_VARIANTS})
+foreach(variant ${FLASH_ATTENTION_VARIANTS})
     add_executable(${variant} ${variant}.cu)
     target_link_libraries(${variant} PRIVATE cuda_common)
     set_target_properties(${variant} PROPERTIES

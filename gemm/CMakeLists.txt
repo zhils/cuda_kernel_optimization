@@ -4,6 +4,9 @@ set(GEMM_VARIANTS
     gemm_v2
     gemm_v3
     gemm_v4
+    gemm_v5
+    gemm_fp16
+    gemm_int8
     gemm_cublas_ref
 )
 
