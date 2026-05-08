@@ -239,27 +239,7 @@ RMSNorm:
 
 ---
 
-## 5. 面试时如何讲 Roofline
-
-**面试官**："你怎么分析 kernel 性能？会不会用 roofline？"
-
-**建议回答：**
-
-> "会。我分三步：
->
-> 第一步，定位瓶颈类型。先算算术强度 AI——GEMM 方阵是 N/6 FLOP/Byte，
-> 我的 RTX 5060 Ti 转折点约 56 FLOP/Byte，所以 N<336 是 memory-bound，
-> N>336 是 compute-bound。
->
-> 第二步，判断 Tensor Core 是否需要。Tensor Core 的峰值更高，但只在
-> compute-bound 区域有效。比如我的 RMSNorm AI=0.33，加 Tensor Core
-> 毫无意义——它永远撞不到计算天花板，因为带宽才是瓶颈。而 4096³ GEMM
-> AI=683，Tensor Core 的 25+ TFLOPS 峰值是必争之地。
->
-> 第三步，分析实测点离天花板多远。我的 GEMM v3 在 4096³ 上 13.5 TFLOPS，
-> 离 25 TFLOPS 天花板差 46%。我用 roofline 逆推这 46% 的构成：25%
-> occupancy → ~30% 损失，WMMA API copy 开销 → ~10%，bank conflict →
-> ~6%。这个分解帮我确定了下一步优化优先级——提升 occupancy 是第一要务。"
+---
 >
 
 ---

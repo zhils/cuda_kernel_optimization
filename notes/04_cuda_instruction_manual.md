@@ -233,14 +233,6 @@ asm volatile(
 核心瓶颈：WMMA API 的 fragment 抽象 → 编译后有 extra copy 指令
          + 仅 25% occupancy → SM 利用率不足
 
-面试时说这个：
-"我的 GEMM v4 用了 WMMA Tensor Core API，在 4096³ 上达到 13 TFLOPS，
-相对 cuBLAS FP32 的 77%。性能差距主要来自两方面：
-1. WMMA fragment 的 load/store 有额外的寄存器 copy 开销
-2. 寄存器压力大导致 occupancy 只有 25%
-
-下一步优化方向是把 WMMA 替换为 PTX mma.sync，参考 CUTLASS 的 warp-level
-mma 编排方式，把 occupancy 提到 50% 以上。"
 ```
 
 ---
@@ -389,7 +381,7 @@ asm volatile(
 ## 8. 学习优先级路线图
 
 ```
-P0（本周必学，面试高频）：
+P0（基础）：
   ✅ __shfl_down_sync — 你已经在用了
   ⬜ __dp4a — 完成上面的 INT8 GEMM demo
   ⬜ mma.sync.aligned — 读一遍 CUTLASS tiled_mma 的 warp-level 实现
@@ -422,10 +414,4 @@ P2（进阶储备，高级职位要求）：
 5. 测试正确性和性能变化
 ```
 
-**面试时最好的回答：**
-
-> "`__dp4a` 是 INT8 的 SIMD 内积指令，一次做 4 个 INT8 的乘加。我实现了一个
-> 完整的 INT8 量化 GEMM，用 `__dp4a` 做 K 维度的乘加。相比 FP32 GEMM，INT8
-> 的关键优势是数据量缩小 4×，同样的共享内存能放更大的 tile，提高数据复用。
-> 性能收益主要来自访存减少，反量化 overhead 不到 5%。我对指令的学习方式是：
-> 先写独立 demo 验证正确性，再集成到现有优化 kernel 中。"
+> `__dp4a` 是 INT8 的 SIMD 内积指令，一次做 4 个 INT8 的乘加。

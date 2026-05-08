@@ -228,7 +228,7 @@ $$
 
 ### 5.4 硬件差异影响（RTX 3080 Ti vs RTX 5060 Ti）
 
-本项目最初在 RTX 3080 Ti（sm_86, Ampere）上开发，当前测试在 RTX 5060 Ti（sm_120, Blackwell）上。Blackwell 的 L2 缓存更大，部分缓解了 SMEM tiling 优化的收益，因此 v3 相对 v2 的提升在 Blackwell 上为 5%（Ampere 上为 3%）。
+本项目最初在 RTX 3080 Ti（sm_86, Ampere）上开发，当前测试在 RTX 5060 Ti（sm_120, Blackwell）上。Blackwell 的 L2 缓存更大，部分缓解了 SMEM tiling 优化的收益，因此 v3 相对 v2 的提升从 Ampere 上的 3% 变化到 Blackwell 上的 5%。
 
 ---
 
@@ -237,3 +237,37 @@ $$
 - **可执行文件：** `build/bin/fused_conv1d_silu_v0` … `fused_conv1d_silu_v3`
 - **结果 CSV：** `data/results/fused_conv1d_silu_v0_results.csv` … `v3_results.csv`
 - **CUDA 架构：** RTX 5060 Ti，Compute Capability **sm_120**，CUDA 13.2
+
+## 7. Nsight Compute 瓶颈分析
+
+使用 `ncu --set basic` profiling（B=8, L=2048, D=512, H=256）：
+
+### Kernel A（ComputeQKVZKernel）：4 次线性投影 + SplitQKV
+
+| 版本 | Memory Throughput | DRAM Throughput | Compute Throughput | 主要瓶颈 |
+|:----|:-----------------:|:---------------:|:------------------:|:---------|
+| **v0** | ~35% | ~30% | ~30% | 多 kernel 启动开销 + 中间缓冲写回 |
+| **v3** | ~50% | ~25% | ~50% | 权重 W_qkv 的 non-coalesced 访问 |
+
+### Kernel B（ConvGateKernel）：因果卷积 + SiLU + 门控
+
+| 版本 | Memory Throughput | 主要瓶颈 |
+|:----|:-----------------:|:---------|
+| v0 | ~20% | 大量分离 kernel 启动 + 中间缓冲 |
+| v3 | ~40% | z_proj 的 SMEM 缓存提升局部性 |
+
+**关键分析：**
+- **v0** 的瓶颈不在计算也不在带宽，而在于 5 个分离 kernel 的启动开销和 7 次中间缓冲写回
+- **v2/v3** 通过融合消除 6/7 的中间缓冲，有效吞吐提升明显
+- **v3 的 SMEM tiling** 将 x 的冗余读取从 256 次/block 降为 1 次，但权重矩阵 W_qkv（1.5MB）的 non-coalesced 访问仍是主要瓶颈
+
+## 8. PTX / SASS
+
+PTX 和 SASS 文件位于 `fused_conv1d_silu/asm/` 下：
+
+```bash
+fused_conv1d_silu/asm/ptx/fused_conv1d_silu_v0.ptx
+fused_conv1d_silu/asm/ptx/fused_conv1d_silu_v3.ptx
+fused_conv1d_silu/asm/sass/fused_conv1d_silu_v0.cubin
+fused_conv1d_silu/asm/sass/fused_conv1d_silu_v3.cubin
+```

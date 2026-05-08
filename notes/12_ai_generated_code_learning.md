@@ -394,5 +394,5 @@ for (int k = 0; k < kTileK; k += 16) {
 第3周：交叉对比
   Day 1-2: 对比 V3（cuda core + 双缓冲）vs V4（tensor core）在 512³ 上
   Day 3-4: 写一篇 500 字的技术笔记："双缓冲和 Tensor Core 分别解决了什么问题，为什么不能互相替代"
-  Day 5:   面试模拟：在白板上画 V3 的时间线图和 V4 的 fragment 映射
+  Day 5:   白板推导 V3 的时间线图和 V4 的 fragment 映射
 ```

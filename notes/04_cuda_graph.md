@@ -88,14 +88,6 @@ void RunWithGraph(dim3 grid, dim3 block, ...) {
 3. **cudaMemset/cudaMemcpy 也能被捕获** —— 整个 pipeline 都可以 graph 化
 4. **NVIDIA 推荐组合方式**：CUDA Graph + MPS（Multi-Process Service）用于生产推理
 
-## 简历写法
-
-```
-• CUDA Graph 优化：将多 kernel 流水线（fused_conv1d_silu 的 5 个分离 kernel）
-  用 cudaStreamBeginCapture 捕获为 CUDA Graph，消除重复的 kernel launch overhead。
-  一次捕获、多次提交，小规模（B=1）下 launch 耗时降低约 40%。
-```
-
 ## 参考
 
 - [CUDA Graph 文档](https://docs.nvidia.com/cuda/cuda-c-programming-guide/index.html#cuda-graphs)

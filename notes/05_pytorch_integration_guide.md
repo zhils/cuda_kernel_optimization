@@ -497,27 +497,7 @@ AT_DISPATCH_FLOATING_TYPES_AND_HALF(
 
 ---
 
-## 10. 面试应答模板
-
-面试官："你怎么把一个手写的 CUDA kernel 集成到 PyTorch 中？"
-
-**回答框架（2 分钟）：**
-
-> "我走三步：
->
-> 第一步——保证 kernel 独立正确。每个 kernel 我都有独立的 .cu 文件和 CPU
-> golden 对比验证。不依赖任何框架。
->
-> 第二步——写 PyTorch binding。最简洁的方式是用 `torch.utils.cpp_extension.load_inline`
-> 直接把 CUDA 源码内嵌到 Python 脚本中，适合快速原型。正式项目我会用 `setup.py`
-> + `CUDAExtension`，把 binding C++ 文件（负责 Tensor 检查、流获取、类型分发）
-> 和 CUDA kernel 文件分开。
->
-> 第三步——注册为 PyTorch 算子。用 `TORCH_LIBRARY` 注册算子签名，用
-> `TORCH_LIBRARY_IMPL` 注册 CUDA 后端实现。这样做的好处是：算子可以被
-> `torch.ops.xxx.yyy` 调用，可以被 torch.compile 捕获，可以被 TorchScript
-> 序列化——和其他内置算子行为完全一致。
->
+---
 > 如果要支持训练，还会用 `torch.autograd.Function` 包装，自己写 backward
 > 的梯度计算。最后用 `torch.autograd.gradcheck` 验证梯度正确性。
 >

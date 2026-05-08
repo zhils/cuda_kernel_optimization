@@ -42,19 +42,10 @@ Q = N * W_q + b_q
 
 ## PTX / SASS
 
-PTX 和 SASS 文件位于 `$f/asm/` 下：
-
-```bash
-$f/asm/ptx/*.ptx
-$f/asm/sass/*.cubin
-```
-
-使用 `cuobjdump -sass` 可查看 SASS 反汇编。
+PTX 和 SASS 在 `q_path_fusion/asm/` 下。
 
 ## 产物路径
 
-- **可执行文件：** `build/bin/`
-- **结果 CSV：** `data/results/`
-- **ncu 报告：** `build/data/ncu_reports/`
-- **PTX/SASS：** `$f/asm/ptx/`、`$f/asm/sass/`
-- **CUDA 架构：** RTX 5060 Ti，Compute Capability **sm_120**，CUDA 13.2
+- 可执行文件：`build/bin/`
+- 结果 CSV：`data/results/`
+- PTX/SASS：`q_path_fusion/asm/ptx/`、`q_path_fusion/asm/sass/`

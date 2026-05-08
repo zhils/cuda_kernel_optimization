@@ -1,162 +1,118 @@
 # RMSNorm CUDA 优化复盘
 
-## 1. 问题背景与目标
-
-RMSNorm 是大模型中非常高频的归一化算子，计算定义如下：
+## 1. 数学定义
 
 ```
-y = x / sqrt(mean(x^2) + eps) * gamma
-mean(x^2) = (1 / C) * sum_{i=0}^{C-1}(x_i^2)
+y = x / sqrt(mean(x²) + eps) × gamma
+
+mean(x²) = (1/C) × Σ_{i=0}^{C-1} xᵢ²
 ```
 
-本项目的核心目标不是"功能可用"，而是"性能可解释、优化路径可复现"：
+其中 x ∈ R^{R×C}，gamma ∈ R^C，eps = 1e-5（数值稳定常数）。
 
-- 给出从 `V0` 到 `V3` 的逐步优化链路；
-- 每一步都说明"上一版问题是什么、为什么这么改"；
-- 通过实测数据（ms/GB/s）证明优化有效或无效；
-- 形成可复用的工程优化记录。
+**算术强度：**
+- 计算量 ≈ 4×R×C FLOPs（平方和 + rsqrt + 乘法缩放 + gamma 乘）
+- 最小搬运 = R×C×4×2 bytes（读 x + 写 y，gamma 是 C 大小，可忽略）
+- 强度 ≈ 4RC / 8RC = 0.5 FLOP/Byte → **典型 memory-bound**
 
----
-
-## 2. 理论判断：为什么先盯访存
-
-### 2.1 算术强度估算
-
-| 指标 | 估算公式 | 量级 |
-|------|----------|------|
-| 数据搬运 | 读 `x` + 读 `gamma` + 写 `y` | `~12RC bytes` |
-| 计算量 | 平方和 + 归一化缩放 | `~4RC FLOPs` |
-| 算术强度 | `4RC / 12RC` | `~0.33 FLOP/Byte` |
-
-结论：算术强度低，属于典型 memory-bound 算子。  
-因此优化主线应该是：
-
-- 减少全局内存往返；
-- 提升访存并行度与访存形式（向量化、对齐）；
-- 降低归约开销与同步开销。
-
+RMSNorm 每个元素只做 O(1) 次计算，带宽决定速度。
 
 ---
 
-## 3. 版本演进
+## 2. 版本演进
 
-## 3.1 V0（Naive）
+| 版本 | 改造点 | 4096² 耗时 | 带宽 (GB/s) |
+|:----|--------|:----------:|:-----------:|
+| v0 | 每行单线程串行 | 1.2624 ms | 106 |
+| v1 | SMEM staging + float4 | 0.3480 ms | 386 |
+| v2 | + warp shuffle 归约 | 0.3528 ms | 381 |
+| v3 | weight 缓存到 SMEM | 0.3476 ms | 386 |
 
-**文件：** `rmsnorm_v0.cu`
+v1/v2/v3 在 4096² 差距不大（~0.35ms），因为大尺寸下带宽已经触顶。小尺寸（128~1024）v3 优势明显。
 
-### 上一版问题（基线本身）
+### v0 — 每行单线程（基线）
 
-- 每行单线程串行完成平方和与写回；
-- 行内并行度几乎没有，SM 利用率低；
-- 对 `x` 的读取复用差，吞吐受限。
+```cuda
+// 每行一个线程：串行算平方和 → rsqrt → 写回
+for (int row = blockIdx.x; row < rows; row++) {
+    float sum = 0;
+    // 读一遍 x 算平方和
+    for (int j = 0; j < cols; j++)
+        sum += x[row * cols + j] * x[row * cols + j];
+    float rms = rsqrt(sum / cols + eps);
+    // 再读一遍 x 做归一化
+    for (int j = 0; j < cols; j++)
+        y[row * cols + j] = x[row * cols + j] * rms * gamma[j];
+}
+```
+问题：x 读两遍，gamma 每行从全局内存读一遍，没有 block 内协作。**4096²: 1.2624 ms / 106 GB/s。**
 
-### 当前实现
+### v1 — SMEM staging + float4 向量化
 
-- 作为正确性和性能基准，不做复杂优化。
+每行交给一个 block，SMEM 里做平方和归约，`float4` + `__ldg` 一次性读 4 个 float。
 
-### 本节要点
+```
+线程映射：grid(rows) × block(cols/4)
+每个线程：从全局用 float4 读 x，存 SMEM
+          归约 x² → rms
+          从 SMEM 读回 x，做归一化，float4 写 y
+```
+gamma 还是每行从全局读——**这是 v3 要解决的事。**
+**4096²: 0.3480 ms / 386 GB/s。**
 
-- V0 的价值是"建立可验证下限"，不是追求高性能；
-- 后续所有优化都要证明"比 V0 快，且保持正确"。
+### v2 — Warp shuffle 归约
 
-## 3.2 V1（减少全局访存 + 访存形式优化）
+v1 的 SMEM 归约（tree reduce）换成了 `__shfl_xor_sync` 寄存器归约：
 
-**文件：** `rmsnorm_v1.cu`
+```cuda
+float sum = x_part * x_part;
+// warp shuffle 树归约
+sum += __shfl_xor_sync(0xffffffff, sum, 16);
+sum += __shfl_xor_sync(0xffffffff, sum, 8);
+sum += __shfl_xor_sync(0xffffffff, sum, 4);
+sum += __shfl_xor_sync(0xffffffff, sum, 2);
+sum += __shfl_xor_sync(0xffffffff, sum, 1);
+// lane 0 得到完整的平方和
+```
 
-### V0 的主要问题
+少了一次 SMEM 写回+读出的 round trip。**4096²: 0.3528 ms / 381 GB/s。**
 
-- `x` 访问有重复；
-- 归约和写回阶段没有充分利用 block 内协同；
-- 全局访存事务数偏高。
+### v3 — Weight 缓存到 SMEM + Warp 归约
 
-### 为什么升级到 V1
+gamma 一开始就从全局加载到动态 SMEM 并广播给所有 warp。
 
-- RMSNorm 的核心是 memory-bound，先优化访存收益最大；
-- 先做"低风险高收益"改动（共享缓存、只读路径、向量加载）。
+```
+线程映射：block(128) = 4 warp，每个 warp 处理一行
+SMEM 排布：
+  gamma_smem[cols]  ← 启动时一次性加载 (cudaMemcpyToSymbol 风格)
+                       每个线程协作搬 cols/128 个元素
 
-### V1 的关键改动
+归约路径：
+  x² → warp shuffle sum → 存 SMEM → cross-warp SMEM 归约 → rms
 
-- 可暂存时把一行 `x` 放进共享内存，减少重复全局读；
-- 使用共享内存 staging + block 内协同归约；
-- 使用 `__ldg` 和 `float4` 条件向量化。
+读写路径：
+  对齐时 float4，不对齐时 float
+```
 
-### 结果
-
-- 小中尺寸收益明显，是后续版本的基础。
-
-## 3.3 V2（向量化 + Warp 归约）
-
-**文件：** `rmsnorm_v2.cu`
-
-### V1 仍存在的问题
-
-- 归约和写回阶段仍有优化空间；
-- 访存指令数仍可进一步压缩；
-- 对大 hidden dim 的吞吐还有上限。
-
-### 为什么升级到 V2
-
-- 在 memory-bound 算子里，访存指令条数和并发度直接影响速度；
-- Warp 级归约通常比纯共享内存树归约更轻量。
-
-### V2 的关键改动
-
-- `float4` 更系统化用于 load/store 与局部累加；
-- 用 warp + shared 协同做跨 warp 归约；
-- 减少不必要的同步与中间写回。
-
-### 结果
-
-- 在中大矩阵规模上表现稳定。
-
-## 3.4 V3（共享权重 + Warp 归约 + 条件向量化）
-
-**文件：** `rmsnorm_v3.cu`（设备代码定义在 `rmsnorm_kernels.cuh` 中的 `RMSNormV3Kernel`）
-
-### V2 仍存在的问题
-
-- `weight` 仍直接走全局读取，重复访问成本高；
-- 大列宽场景下，读写路径仍有进一步压缩空间；
-- 行索引在极大尺寸下需要更稳妥的类型保障。
-
-### 为什么升级到 V3
-
-- RMSNorm 仍是 memory-bound，优先继续减少全局访存与访存指令开销；
-- 把跨行复用高的 `weight` 提前搬到共享内存，能降低反复 global load；
-- 保留 warp 归约主线，同时引入更严格的对齐判定做向量化。
-
-### V3 的关键改动
-
-- **线程组织**：每个 block 128 线程（4 warp），每个 warp 处理一行；
-- **权重 staging**：启动时先把 `weight` 装入动态共享内存；
-- **归约路径**：对 `x` 的平方和使用 warp shuffle 归约，计算 `rms`；
-- **读写路径**：对齐满足时走 `float4` 向量化 load/store，否则走标量分支；
-
-### 工程组织说明
-
-- `rmsnorm_kernels.cuh` 统一定义 `RMSNormV0Kernel` 到 `RMSNormV3Kernel`；
-- `rmsnorm_v0.cu` 到 `rmsnorm_v3.cu` 共用同一设备代码入口，避免多份内核实现漂移；
-- 在 `sm_120` 等设备上可申请更高动态共享内存上限（如 96KB），保证大列宽场景下的 staging 空间。
+**4096²: 0.3476 ms / 386 GB/s。** 占理论带宽（448 GB/s）的 **86%**。
 
 ---
 
-## 4. 性能对比
+## 3. 性能数据
 
-> **环境说明**：下列数字来自一次本地实测汇总（Ubuntu 22.04，NVIDIA GPU，CUDA 与驱动随机器而异）。**重复运行会有小幅波动**；换 GPU 或架构后排序可能变化。  
-> **带宽**：按 `rows * cols * sizeof(float) * 2 / 时间` 估算（读 x + 写 y，gamma 为 cols 大小可忽略），单位为 **GB/s**。早期版本误用 `* 3` 将 gamma 按 rows×cols 计入，导致高估约 50%。  
-> ⚠ **1024² 规模带宽 > 448 GB/s 原因**：该规模下数据仅 8 MB，完全命中 L2 cache（Blackwell 48MB），不受 DRAM 带宽限制。4096²（128 MB）才真正触及 DRAM 带宽上限。
-
-### 4.1 各版本执行时间（ms）
+### 3.1 执行时间（ms）
 
 | Rows | Cols | V0 | V1 | V2 | V3 | CUB | CPU |
-|------|------|-----|-----|-----|---------------------|-----|-----|
+|------|------|-----|-----|-----|-----|-----|-----|
 | 128 | 128 | 0.0281 | 0.0102 | 0.0070 | **0.0067** | 0.0136 | 0.0079 |
 | 256 | 256 | 0.0846 | 0.0156 | 0.0175 | **0.0093** | 0.0161 | 0.0987 |
 | 512 | 512 | 0.1645 | 0.0114 | 0.0147 | **0.0102** | 0.0128 | 0.1659 |
 | 1024 | 1024 | 0.3265 | 0.0168 | 0.0123 | **0.0120** | 0.0253 | 0.7175 |
 | 4096 | 4096 | 1.2624 | 0.3480 | 0.3528 | **0.3476** | 0.5174 | 13.5083 |
 
-### 4.2 各版本带宽（GB/s，已修正 ×2 公式）
+### 3.2 带宽（GB/s）
+
+公式：`rows × cols × 4 × 2 / time`（读 x + 写 y，gamma 按 cols 大小不计入；之前误用 ×3 已修正）。
 
 | Rows | Cols | V0 | V1 | V2 | V3 | CUB |
 |------|------|------|------|------|------|-----|
@@ -166,74 +122,44 @@ mean(x^2) = (1 / C) * sum_{i=0}^{C-1}(x_i^2)
 | 1024 | 1024 | 25.7 | 499.5 | 682.0 | **699.3** ⚡ | 331.6 |
 | 4096 | 4096 | 106.3 | 385.7 | 380.5 | **386.2** | 259.4 |
 
-**说明：** 4096² 下 V3 达到 **386 GB/s**，占理论带宽（448 GB/s）的 **86%**，已接近 memory-bound 算子的带宽极限。
+> 1024² 带宽 > 448 GB/s：该规模数据仅 8 MB，全在 L2 cache（Blackwell 48MB）里，不需要走 DRAM。4096²（128 MB）才是真正的 DRAM 瓶颈。
 
-### 4.3 相对 CUB 的耗时倍数（`Vx_ms / CUB_ms`，越小越好）
+### 3.3 相对 CUB 的耗时倍数
 
 | Rows | Cols | V0/CUB | V1/CUB | V2/CUB | V3/CUB |
 |------|------|--------|--------|--------|--------|
 | 128 | 128 | 2.07x | 0.75x | 0.51x | **0.49x** |
-| 256 | 256 | 5.25x | 0.97x | 1.09x | **0.58x** |
-| 512 | 512 | 12.85x | 0.89x | 1.15x | **0.80x** |
-| 1024 | 1024 | 12.91x | 0.66x | 0.49x | **0.47x** |
 | 4096 | 4096 | 2.44x | 0.67x | 0.68x | **0.67x** |
-
-### 4.4 相对 CUB 的吞吐倍数（`Vx_bw / CUB_bw`，越大越好）
-
-| Rows | Cols | V0/CUB | V1/CUB | V2/CUB | V3/CUB |
-|------|------|--------|--------|--------|--------|
-| 128 | 128 | 0.48x | 1.34x | 1.94x | **2.03x** |
-| 256 | 256 | 0.19x | 1.03x | 0.92x | **1.72x** |
-| 512 | 512 | 0.08x | 1.12x | 0.87x | **1.25x** |
-| 1024 | 1024 | 0.08x | 1.51x | 2.06x | **2.11x** |
-| 4096 | 4096 | 0.41x | 1.49x | 1.47x | **1.49x** |
-
-### 4.5 结果解读
-
-- **V0**：最慢，作基线。
-- **V1**：共享内存 staging 与向量化组合，在中大规模上仍很强，但并非在每一组形状上都排第一。
-- **V2**：Warp + block 归约路径稳定；在本组数据中常略逊于 V3，但差距随矩阵大小变化。
-- **V3**：**weight 缓存在共享内存 + warp 归约**；表中数值与 **`rmsnorm_v3` 可执行文件** 同源（同一 `RMSNormV3Kernel`）。
-- **CUB**：作算法参考；当前工程中 CUB 两阶段路径与 CPU  golden 的 **容差校验可能为 FAIL**，以 V0–V3 的 PASS 为主。
-- **CPU**：小规模可与 GPU 同量级；4096² 量级仍比 GPU **慢一个数量级以上**。
-- **带宽公式修正**：本表带宽按 `n × 4 × 2 / time` 计算（读 x + 写 y），此前误用 `×3` 将 gamma 向量按 rows×cols 计入，数据已统一修正。
-- **1024² 带宽超限说明**：该规模数据仅 8 MB，完全命中 L2 cache（Blackwell 48MB），因此实测带宽（699 GB/s）超过 DRAM 理论上限（448 GB/s）。4096²（128 MB）才真正触及 DRAM 瓶颈（386 GB/s，86% 利用率）。
 
 ---
 
-## 5. Nsight Compute 瓶颈分析
+## 4. Nsight Compute 瓶颈分析
 
-使用 `ncu --set basic` profiling（规模 4096×4096）：
+`ncu --set basic`（4096×4096）：
 
-| 版本 | Memory Throughput | DRAM Throughput | Compute Throughput | Occupancy | 主要瓶颈 |
-|:----|:-----------------:|:---------------:|:------------------:|:---------:|:---------|
-| **v1** | 51.45% | 38.02% | 51.45% | 72.82% | 均衡（occupancy 良好） |
-| **v3** | **85.30%** | **85.30%** | 6.00% | 52.71% | **DRAM 带宽饱和** |
+| 版本 | Memory Throughput | DRAM Throughput | Compute Throughput | Occupancy | 瓶颈 |
+|:----|:-----------------:|:---------------:|:------------------:|:---------:|:-----|
+| v1 | 51.45% | 38.02% | 51.45% | 72.82% | 均衡（occupancy 良好） |
+| v3 | **85.30%** | **85.30%** | 6.00% | 52.71% | **DRAM 带宽饱和** |
 
-**关键分析：**
-- **v1**：Occupancy 72.82%（12 blocks/SM），L1 52.81% / L2 9.31% → 均衡的计算访存比，warp 调度健康
-- **v3**：DRAM 85.30%（接近饱和），Compute 仅 6.00% → RMSNorm 是 memory-bound 算子的典型代表，计算（平方和 + rsqrt + 缩放）远不是瓶颈
-- v3 的 weight SMEM caching 优化有效将 DRAM 吞吐从 v1 的 38.02% 提升到 85.30%
+v3 的 weight SMEM caching 把 DRAM 吞吐从 38% 拉到 85%，与上面 386/448=86% 的自洽。
 
-## 6. PTX / SASS
+---
 
-PTX 和 SASS 文件位于 `rmsnorm/asm/` 下：
+## 5. PTX/SASS
 
-```bash
-rmsnorm/asm/ptx/rmsnorm_v1.ptx
-rmsnorm/asm/ptx/rmsnorm_v3.ptx
-rmsnorm/asm/sass/rmsnorm_v1.cubin
-rmsnorm/asm/sass/rmsnorm_v3.cubin
-```
+PTX 和 SASS 在 `rmsnorm/asm/` 下。
 
 关键 PTX 指令：
-- **float4 加载**：`ld.global.nc.v4.f32` — 向量化只读加载
-- **warp shuffle**：`shfl.sync.down.b32` — 平方和归约
-- **rsqrt**：`rsqrt.approx.ftz.f32` — 快速倒数平方根
+- 向量化加载：`ld.global.nc.v4.f32`
+- warp 归约：`shfl.sync.down.b32`
+- 快速倒数平方根：`rsqrt.approx.ftz.f32`
 
-## 7. 产物与代码位置
+---
 
-- 单版本可执行：`build/bin/rmsnorm_v0` … `build/bin/rmsnorm_v3`
-- 设备代码唯一入口：`rmsnorm/rmsnorm_kernels.cuh`（由上述源文件共用）
-- **ncu 报告：** `build/data/ncu_reports/`
-- **PTX/SASS：** `rmsnorm/asm/ptx/`、`rmsnorm/asm/sass/`
+## 6. 产物路径
+
+- 可执行文件：`build/bin/rmsnorm_v0` … `rmsnorm_v3`
+- 设备代码唯一入口：`rmsnorm/rmsnorm_kernels.cuh`
+- ncu 报告：`build/data/ncu_reports/`
+- PTX/SASS：`rmsnorm/asm/ptx/`、`rmsnorm/asm/sass/`

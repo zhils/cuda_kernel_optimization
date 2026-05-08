@@ -162,18 +162,6 @@ make flash_attention_v2
 nvcc -arch=sm_120 -O3 flash_attention_v2.cu -o flash_attention_v2
 ```
 
-## 简历写法
-
-```
-Flash Attention V2: Blackwell WGMMA 架构优化
-• 利用 Blackwell WGMMA（Warp Group MMA）指令重写注意力内核：
-  64 线程 warp group 协处理 64×64 tile（vs Ampere WMMA 的 16×16）
-• WGMMA 直接从 SMEM 读取数据 → 消除 load_matrix_sync 开销
-• 异步 WGMMA 流水线：SMEM 加载与矩阵乘法完全重叠
-• 理论 Tensor Core 利用率提升至 ~85%，预期较 V1 加速 ~1.8x
-• （当前需 Blackwell GPU 编译验证，代码已基于 PTX WGMMA 指令完成）
-```
-
 ## 参考
 
 - NVIDIA Blackwell Architecture Whitepaper (GTC 2024)

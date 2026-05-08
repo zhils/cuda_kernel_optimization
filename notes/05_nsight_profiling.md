@@ -115,16 +115,6 @@ Peak Performance: 25.0 TFLOPS                     ← GPU 峰值
 Roofline-bound: Compute                           ← 瓶颈在计算，不在内存
 ```
 
-## 简历写法
-
-```
-• Nsight Compute 深度 Profiling：对 GEMM、RMSNorm、Fused Conv1D+SiLU 
-  三类算子进行 roofline 分析和 stall reason 诊断，量化各版本的瓶颈转移：
-  — GEMM v4：Tensor Core 利用率 85%，访存带宽 ~680 GB/s（峰值 90%）
-  — 融合后流量从 v0 的 700 MB 降至 v2 的 202 MB（减少 71%）
-  — 定位权重矩阵 non-coalesced 访问为下一个优化瓶颈
-```
-
 ## 参考
 
 - [Nsight Compute 文档](https://docs.nvidia.com/nsight-compute/)

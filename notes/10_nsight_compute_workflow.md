@@ -255,27 +255,7 @@ ncu --kernel-name $KERNEL \
 
 ---
 
-## 6. 面试应答模板
-
-**面试官**："你用 Nsight Compute 吗？怎么分析 kernel 性能？"
-
-**回答（2 分钟）：**
-
-> "用，这是我的主要性能分析工具。我有一套标准流程：
->
-> 第一步——快速扫描，30 秒。看三个数字：SM throughput、Memory throughput、
-> Occupancy。给出来的 GEMM V4 在 4096³ 上，SM throughput 约 54%，Memory
-> throughput 约 30%，Occupancy 约 25%——第一眼就确定：是 compute-bound
-> 但 occupancy 是瓶颈。
->
-> 第二步——stall 分析。这是 Nsight Compute 最核心的价值。我看了我 kernel
-> 的 stall reasons：Long Scoreboard 占 35%（等全局内存）、Barrier 占
-> 15%（syncthreads）、Math Pipe Throttle 占 8%（计算单元被占满）、Not
-> Selected 占 28%（其他 warp 在忙）。这个分布告诉我：内存等待是主导，
-> 但 Tensor Core 的计算密度还行——问题不在计算而在"喂数据的速度"。
->
-> 第三步——查 feed 效率。看 bank conflict（< 1.1 → 没问题），看 L1/L2
-> hit rate，看 cp.async 是否真的生成了指令。如果 cp.async 的指令数
+---
 > 为 0，说明编译器没生成异步加载——这可能就是性能差的原因。
 >
 > 整个过程通常 5-10 分钟完成一个 kernel 的完整分析。分析完我会把结果

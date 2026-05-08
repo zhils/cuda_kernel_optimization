@@ -117,11 +117,6 @@ kernel_auto_tuning/
 
 Python 比 CUDA 更适合做调优框架：可以调用 nvcc 编译、解析输出、写 CSV、画图。
 
-## 简历写法
+---
 
-```
-• Kernel Auto-Tuning：构建 GEMM 自动参数搜索框架（Python + CUDA），
-  在 216 组参数空间中搜索 tile size / block size / thread 的最优组合，
-  离线调优结果写入 JSON 缓存，运行时自动加载最优配置。
-  相比固定参数配置，在 512³ 规模提升 ~15%。
-```
+## 参考
