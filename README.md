@@ -1,6 +1,27 @@
 # CUDA Kernel 优化
 
-在 **RTX 5060 Ti（Blackwell sm_120）** 上从零实现并优化深度学习核心算子，逐版本对比 NVIDIA 官方库（cuBLAS / cuDNN）。
+> **3 分钟速览：** 在 RTX 5060 Ti (Blackwell sm_120) 上从零实现 10 个深度学习算子的 CUDA 优化。
+> 每算子从朴素(v0)基线出发，逐版本只改一个瓶颈，最终 GEMM 达 12.52 TFLOPS(峰值 53%)，
+> RMSNorm 达 386 GB/s(显存带宽 86%)，端到端融合算子达 2.6× 加速。
+> 完整 Nsight Compute 瓶颈分析 + Warp Stall 原因分解。
+
+---
+
+## 性能摘要
+
+| 算子 | 规模 | 基线(v0) | 最优版 | 加速比 | 瓶颈类型 | 关键优化 |
+|:-----|:----|:--------:|:------:|:------:|:--------:|:---------|
+| GEMM FP32 | 4096³ | 1.42 TFLOPS | **12.52 TFLOPS** | **8.8×** | 计算受限 | cp.async + 8×4 分块 |
+| GEMM FP16 | 4096³ | — | **37.39 TFLOPS** | — | 计算受限 | Tensor Core k=16 |
+| RMSNorm | 4096² | 106 GB/s | **386 GB/s** | **3.6×** | 带宽受限 | float4 + warp shuffle |
+| Softmax | 4096² | 16.64% Occupancy | **84.86% MemUtil** | — | 带宽受限 | Online 单遍算法 |
+| Fused Conv1D+SiLU | B=8,L=2048,D=512,H=256 | 137.36 ms | **52.92 ms** | **2.6×** | 访存偏重 | 双 kernel 融合 + float4 |
+| Flash Attention | B=1,H=1,N=1024 | 49.10 ms¹ | 36.39 ms¹ | 1.3× | 计算/访存混合 | Tiled Online-Softmax |
+| Fused Gated Delta Rule | B=8,L=2048,D=512,H=256 | 1.36 ms | 0.19 ms | — | 时间维串行 | 全融合 + ILP + FMA |
+| Fused Output Norm Gate | B=8,L=2048,D=512,H=256 | 1.10 ms² | 0.19 ms² | **5.7×** | SMEM 密集 | 全融合 + 权重复用 |
+
+¹ flash_attention v0 为朴素 3-kernel 基线，v1 为 tiled 版本。  
+² fused_output_norm_gate v0 实际运行在 B=8 时数据，v2 为加速后。
 
 ---
 
@@ -18,6 +39,22 @@
 | Fused Output Norm Gate | [fused_output_norm_gate/](fused_output_norm_gate/README.md) | 3（v0~v2） | v1 单 kernel 全融合消除 3 个中间缓冲，v2 2 行/block 权重复用 |
 | Q Path Fusion | [q_path_fusion/](q_path_fusion/README.md) | 3（v0~v2） | RMSNorm + Linear(Q) 融合，v2 达 95.80% Occupancy |
 | PyTorch Extension | [pytorch_extension/](pytorch_extension/README.md) | — | Softmax + RMSNorm 的 PyTorch 自定义算子绑定 |
+
+---
+
+## 算术强度与瓶颈判断
+
+| 算子 | 算术强度(FLOP/Byte) | Ridge Point | 瓶颈类别 | NWU 实测 |
+|:-----|:------------------:|:-----------:|:--------:|:--------:|
+| GEMM N=4096 | N/6 ≈ 683 | 52.5 | **计算受限** | 53% 峰值利用率 |
+| GEMM N=128 | N/6 ≈ 21 | 52.5 | **访存受限** | — |
+| Softmax | 3N² / (8N²) ≈ 0.38 | 52.5 | **访存受限** | 84.86% MemUtil |
+| RMSNorm | 4C / (8C) = 0.5 | 52.5 | **访存受限** | 86.90% DRAM Util |
+| Flash Attention | N/4 | 52.5 | 混合（取决于 N） | — |
+| Conv1D+SiLU | ~1.5 | 52.5 | **访存受限** | — |
+| Output Norm Gate | ~2 | 52.5 | **访存受限** | — |
+
+Ridge Point = 23.5 TFLOPS / 448 GB/s ≈ 52.5 FLOP/Byte。当算术强度 < 52.5 为访存受限。
 
 ---
 
@@ -74,20 +111,14 @@
 | `q_path_fusion_v0` | 166.91 us | 72.45% | 4.13% | 72.45% | 88.76% | **计算占主导** |
 | `q_path_fusion_v2` | 697.89 us | 17.81% | 81.28% | 81.28% | 95.80% | **RMSNorm 阶段带宽瓶颈** |
 
-> **注：**
-> ¹ GEMM Compute/DRAM/Memory 数据取自 128³ 小规模 ncu 指标。实际大规摸性能见各版本 TFLOPS 数据。
-> ² flash_attention v3/v4 为 N=64 小规模测试数据（grid 仅 2 blocks）。
-> ³ fused_gated_delta_rule v1 为 B=4,L=1024,D=512,H=256 配置；v2 为 B=8,L=2048,D=512,H=256 配置。
-> ⁴ fused_output_norm_gate v1/v2 为 B=128 小规模配置数据。
-> ⁵ Occupancy 取该版本最大规模 launch 配置的数据。
-> 各算子新增版本的详细 ncu profiling 可通过 `ncu --set basic ./build/bin/<target>` 在本地获取。
+> **注：** ¹ GEMM 数据取自 128³ 小规模。² flash_attention v3/v4 为 N=64 小规模。³ Gated Delta Rule v1/v2 为 B=4~8 中等规模。⁴ Output Norm Gate v1/v2 为 B=128 小规模。⁵ Occupancy 取最大规模 launch。
 
 ---
 
 ## Warp Stall 原因分析
 
 命令：`ncu --metrics smsp__average_warps_issue_stalled_*_per_issue_active.ratio`。  
-统计口径：取该版本 Duration 最大的一次 launch 的 Top 5 stall 原因（百分比按归一化后的相对占比）。
+统计口径：取该版本 Duration 最大的一次 launch 的 Top 5 stall 原因（归一化百分比）。
 
 | 目标 | #1 Stall | #2 Stall | #3 Stall | #4 Stall | #5 Stall |
 |:-----|:---------|:---------|:---------|:---------|:---------|
@@ -127,11 +158,11 @@
 | `q_path_fusion_v2` | Mio Throttle 27.2% | Short Scoreboard 26.8% | Long Scoreboard 15.4% | Not Selected 12.9% | No Instruction 8.5% |
 
 **关键发现：**
-- **Long Scoreboard**（等待全局内存/纹理加载完成）是占主导的 stall 原因，尤其在 memory-bound 的 kernel（softmax_v0/v2/v3、rmsnorm_v0/v2/v3）中占 70-97%。
-- **Mio Throttle**（内存 I/O 管道瓶颈）在融合 kernel（fused_output_norm_gate_v1/v2）中显著，因其 SMEM 读取密集。
-- **Math Pipe Throttle**（计算管道瓶颈）在 TF32 WMMA 的 gemm_v4 中占 72.9%，说明 Tensor Core 算力已达硬件上限。
-- **Wait**（等待其他 warp 完成）在 softmax_v1 中占 49.3%，因其 warp shuffle 归约阶段需跨 warp 同步。
-- **Short Scoreboard**（等待 L1/L2 缓存）在 flash_attention_v0/v3 中较高，因小规模测试时数据在片上缓存中。
+- **Long Scoreboard**（等待全局内存加载）是主导 stall，memory-bound kernel 中占 70-97%
+- **Mio Throttle**（MIO 管道拥塞）在融合 kernel（fused_output_norm_gate）中占 50-74%
+- **Math Pipe Throttle**（计算管道瓶颈）在 gemm_v4 TF32 WMMA 中占 72.9%
+- **Wait**（跨 warp 同步）在 softmax_v1 中占 49.3%
+- **Short Scoreboard**（缓存等待）在小规模 flash_attention 中较高
 
 ---
 
@@ -168,51 +199,21 @@ cd ..
 │   └── src/benchmark.cpp
 │
 ├── gemm/                         通用矩阵乘（v0~v5 + fp16 + int8 + cuBLAS/cuBLASLt）
-│   ├── README.md                 性能数据、Nsight 分析
-│   ├── gemm_v0~v5.cu            CUDA Core / WMMA / WGMMA 各版本
-│   ├── gemm_fp16.cu              FP16 Tensor Core
-│   ├── gemm_int8.cu              INT8 WMMA 量化
-│   ├── gemm_fp8_cublaslt.cu      FP8 cuBLASLt
-│   └── quant_gemm_compare.cu     低精度舍入对比
-│
 ├── softmax/                      Softmax（v0~v3 + cuDNN 参考）
-│   ├── README.md
-│   ├── softmax_v0~v3.cu
-│   ├── softmax_kernels.cuh
-│   └── benchmark_all.cu          统一 benchmark
-│
 ├── rmsnorm/                      RMSNorm（v0~v3）
-│   ├── README.md                 Nsight 瓶颈分析
-│   ├── rmsnorm_v0~v3.cu
-│   └── rmsnorm_kernels.cuh
-│
 ├── flash_attention/              Flash Attention（v0~v4）
-│   ├── README.md                 各版本架构演进对比
-│   ├── flash_attention_v0~v4.cu
-│   └── flash_attn_v2_blackwell.md
-│
 ├── fused_conv1d_silu/            融合 Conv1D + SiLU（v0~v3）
-│   └── ...
-│
-├── fused_gated_delta_rule/       融合 Gated Delta Rule（v0~v2）
-│   └── ...
-│
+├── fused_gated_delta_rule/       融合 Gated Delta Rule（v0~v2 + v3 INT8 量化）
 ├── fused_l2_norm_qk/             融合 L2 Norm Q/K（v0~v2）
-│   └── ...
-│
 ├── fused_output_norm_gate/       融合 Output Norm Gate（v0~v2）
-│   └── ...
-│
 ├── q_path_fusion/                Q 路径融合 RMSNorm + Linear（v0~v2）
-│   └── ...
-│
 ├── pytorch_extension/            PyTorch 自定义算子绑定
-│   ├── setup.py
-│   ├── binding.cpp
-│   └── test_ops.py
 │
+├── tests/                        统一测试框架（test_runner + test_utils）
+├── run_ncu_all.sh                Nsight Compute 批量 profiling
+├── run_ncu_stall.sh              Warp Stall 批量分析
 ├── gemm/quantization_fp16_fp8_int8.md  低精度量化数据汇总
-└── LICENSE                               Apache 2.0
+└── LICENSE                        Apache 2.0
 ```
 
 ---

@@ -4,6 +4,8 @@
 #include <iostream>
 #include <utility>
 
+#include "common/cuda_utils.h"
+
 namespace test {
 
 namespace {
