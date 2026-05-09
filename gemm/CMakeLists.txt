@@ -37,7 +37,7 @@ target_link_libraries(gemm_cublas_ref PRIVATE cublas)
 
 target_link_libraries(gemm_fp8_cublaslt PRIVATE cublas cublasLt)
 
-set(ASM_OUTPUT_DIR ${CMAKE_SOURCE_DIR}/gemm/asm)
+set(ASM_OUTPUT_DIR ${CMAKE_BINARY_DIR}/gemm/asm)
 set(NVCC_FLAGS -Xcompiler=-Wno-deprecated-declarations)
 
 foreach(variant IN LISTS GEMM_VARIANTS)

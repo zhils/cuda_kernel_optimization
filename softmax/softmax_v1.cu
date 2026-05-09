@@ -24,7 +24,6 @@
 
 __global__ void SoftmaxV1Kernel(const float* __restrict__ x, float* __restrict__ y,
                                 int rows, int cols) {
-    // ---------------- warp 到行的映射 ----------------
     const int warp_id = threadIdx.x / WARP_SIZE;
     const int lane = threadIdx.x % WARP_SIZE;
     const int row = blockIdx.x * WARPS_PER_BLOCK + warp_id;
@@ -40,7 +39,6 @@ __global__ void SoftmaxV1Kernel(const float* __restrict__ x, float* __restrict__
 
     const int cols4 = cols / 4;
 
-    // ---------------- 行数据搬到共享内存 ----------------
     for (int c = lane; c < cols4; c += WARP_SIZE) {
         const float4 v = __ldg(reinterpret_cast<const float4*>(row_x + c * 4));
         s_exp[c * 4 + 0] = v.x;
@@ -53,7 +51,6 @@ __global__ void SoftmaxV1Kernel(const float* __restrict__ x, float* __restrict__
     }
     __syncthreads();
 
-    // ---------------- lane0 串行算 row_max / row_sum ----------------
     if (lane == 0) {
         float row_max = s_exp[0];
         for (int c = 1; c < cols; ++c) {
@@ -70,7 +67,6 @@ __global__ void SoftmaxV1Kernel(const float* __restrict__ x, float* __restrict__
     }
     __syncthreads();
 
-    // ---------------- 按 inv 写回 ----------------
     const float inv = 1.f / s_sum[warp_id];
     for (int c = lane; c < cols4; c += WARP_SIZE) {
         const float4 e = *reinterpret_cast<const float4*>(s_exp + c * 4);
@@ -85,6 +81,8 @@ __global__ void SoftmaxV1Kernel(const float* __restrict__ x, float* __restrict__
         row_y[c] = s_exp[c] * inv;
     }
 }
+
+#ifndef PYTORCH_EXTENSION
 
 static void SoftmaxCPU(const float* x, float* y, int rows, int cols) {
     for (int r = 0; r < rows; ++r) {
@@ -162,3 +160,5 @@ int main() {
     }
     return 0;
 }
+
+#endif  // PYTORCH_EXTENSION

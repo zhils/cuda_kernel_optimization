@@ -18,8 +18,8 @@ softmax(x_i) = exp(x_i - max(x)) / Σ_j exp(x_j - max(x))
 | 版本 | 做法 | Memory Throughput | Compute Throughput | Occupancy |
 |:----|------|:-----------------:|:------------------:|:---------:|
 | v0 | 朴素三遍扫描（max → exp/sum → normalize），每行 1 线程 | ~90% | ~15% | 高 |
-| v1 | SMEM staging + float4 向量化 + warp 内归约 | （未测量） | （未测量） | （未测量） |
-| v2 | 8-warp 在线归约，增大并行度 | （未测量） | （未测量） | （未测量） |
+| v1 | SMEM staging + float4 向量化 + warp 内归约 | 待测量 | 待测量 | 待测量 |
+| v2 | 8-warp 在线归约，增大并行度 | 待测量 | 待测量 | 待测量 |
 | v3 | **Online 单遍算法 + SMEM + Warp Shuffle** | **84.87%** | 13.46% | 36.17% |
 
 性能数据来自 `ncu --set basic`（1024×1024 规模）。

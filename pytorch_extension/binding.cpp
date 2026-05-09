@@ -109,12 +109,12 @@ torch::Tensor rmsnorm_forward_cuda(torch::Tensor x, torch::Tensor weight, float 
     } else if (version == 1) {
         // V1: 1 warp per row, serial reduce
         int blocks = (rows + WARPS_PER_BLOCK - 1) / WARPS_PER_BLOCK;
-        size_t smem = WARPS_PER_BLOCK * (cols + 1) * sizeof(float);
+        size_t smem = WARPS_PER_BLOCK * cols * sizeof(float);
         RMSNormV1Kernel<<<blocks, BLOCK_SIZE, smem>>>(x_ptr, y_ptr, w_ptr, rows, cols, eps);
     } else if (version == 2) {
         // V2: warp shuffle reduce
         int blocks = (rows + WARPS_PER_BLOCK - 1) / WARPS_PER_BLOCK;
-        size_t smem = WARPS_PER_BLOCK * (cols + 1) * sizeof(float);
+        size_t smem = WARPS_PER_BLOCK * cols * sizeof(float);
         RMSNormV2Kernel<<<blocks, BLOCK_SIZE, smem>>>(x_ptr, y_ptr, w_ptr, rows, cols, eps);
     } else if (version == 3) {
         // V3: weight in smem, no staging

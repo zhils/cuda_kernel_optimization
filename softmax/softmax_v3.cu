@@ -25,11 +25,10 @@
 #define BLOCK_SIZE (WARP_SIZE * WARPS_PER_BLOCK)
 
 __global__ void SoftmaxV3Kernel(
-    const float* __restrict__ x, 
+    const float* __restrict__ x,
     float* __restrict__ y,
     int rows, int cols
 ) {
-    // ---------------- 索引与行指针 ----------------
     const int warp_id = threadIdx.x / WARP_SIZE;
     const int lane = threadIdx.x % WARP_SIZE;
     const int row = blockIdx.x * WARPS_PER_BLOCK + warp_id;
@@ -45,7 +44,6 @@ __global__ void SoftmaxV3Kernel(
 
     const int cols4 = cols / 4;
 
-    // ---------------- 先把这一行搬到共享内存 ----------------
     #pragma unroll 4
     for (int c = lane; c < cols4; c += WARP_SIZE) {
         const float4 v = __ldg(reinterpret_cast<const float4*>(row_x + c * 4));
@@ -59,7 +57,6 @@ __global__ void SoftmaxV3Kernel(
     }
     __syncthreads();
 
-    // ---------------- Online 计算 row_max / row_sum ----------------
     float local_max = -INFINITY;
     float local_sum = 0.f;
 
@@ -87,7 +84,6 @@ __global__ void SoftmaxV3Kernel(
     }
     __syncthreads();
 
-    // ---------------- 用 row_max / row_sum 写回 ----------------
     const float row_max = s_max[warp_id];
     const float row_sum = s_sum[warp_id];
     const float inv = 1.f / row_sum;
@@ -106,6 +102,8 @@ __global__ void SoftmaxV3Kernel(
         row_y[c] = __expf(s_data[c] - row_max) * inv;
     }
 }
+
+#ifndef PYTORCH_EXTENSION
 
 static void SoftmaxCPU(const float* x, float* y, int rows, int cols) {
     for (int r = 0; r < rows; ++r) {
@@ -131,13 +129,12 @@ int main() {
     cudaDeviceProp prop;
     CHECK_CUDA(cudaGetDeviceProperties(&prop, 0));
     size_t max_smem = prop.sharedMemPerBlock;
-    
-    // 尝试把动态共享内存上限拉高（sm_120 上通常可到 96KB）
+
     cudaFuncAttributes attr;
     CHECK_CUDA(cudaFuncGetAttributes(&attr, SoftmaxV3Kernel));
     size_t max_dyn_smem = max_smem;
     if (prop.major >= 12) {
-        max_dyn_smem = 96 * 1024;  // 96KB for sm120
+        max_dyn_smem = 96 * 1024;
         cudaError_t err = cudaFuncSetAttribute(SoftmaxV3Kernel,
                                                 cudaFuncAttributeMaxDynamicSharedMemorySize,
                                                 max_dyn_smem);
@@ -154,18 +151,15 @@ int main() {
             continue;
         }
 
-        // ---------------- 准备数据 + CPU 参考 ----------------
         std::vector<float> x(n), cpu(n), gpu(n);
         common::InitMatrix(x, rows, cols);
         SoftmaxCPU(x.data(), cpu.data(), rows, cols);
 
-        // ---------------- 设备内存 ----------------
         float *dx, *dy;
         CHECK_CUDA(cudaMalloc(&dx, n * sizeof(float)));
         CHECK_CUDA(cudaMalloc(&dy, n * sizeof(float)));
         CHECK_CUDA(cudaMemcpy(dx, x.data(), n * sizeof(float), cudaMemcpyHostToDevice));
 
-        // ---------------- warmup + 计时 ----------------
         dim3 block(BLOCK_SIZE);
         dim3 grid((rows + WARPS_PER_BLOCK - 1) / WARPS_PER_BLOCK);
         SoftmaxV3Kernel<<<grid, block, smem_size>>>(dx, dy, rows, cols);
@@ -205,3 +199,5 @@ int main() {
     }
     return 0;
 }
+
+#endif  // PYTORCH_EXTENSION

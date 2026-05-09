@@ -26,6 +26,8 @@ __global__ void SoftmaxNaiveKernel(const float* x, float* y, int rows, int cols)
   for (int c = 0; c < cols; ++c) y[r * cols + c] /= sum;
 }
 
+#ifndef PYTORCH_EXTENSION
+
 static void SoftmaxCPU(const float* x, float* y, int rows, int cols) {
   for (int r = 0; r < rows; ++r) {
     float maxv = x[r * cols];
@@ -48,7 +50,6 @@ int main() {
   for (size_t i = 0; i < cases.size(); ++i) {
     int rows = cases[i].rows, cols = cases[i].cols, n = rows * cols;
 
-    // ---------------- host 数据 + CPU 参考 ----------------
     std::vector<float> x(n), cpu(n), gpu(n);
     common::InitMatrix(x, rows, cols);
     auto t0 = std::chrono::high_resolution_clock::now();
@@ -56,7 +57,6 @@ int main() {
     auto t1 = std::chrono::high_resolution_clock::now();
     double cpu_ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
 
-    // ---------------- 设备内存与执行 ----------------
     float *dx, *dy;
     CHECK_CUDA(cudaMalloc(&dx, n * sizeof(float)));
     CHECK_CUDA(cudaMalloc(&dy, n * sizeof(float)));
@@ -72,13 +72,11 @@ int main() {
     float gpu_ms = 0.f;
     CHECK_CUDA(cudaEventElapsedTime(&gpu_ms, s, e));
 
-    // ---------------- 回拷与校验 ----------------
     CHECK_CUDA(cudaMemcpy(gpu.data(), dy, n * sizeof(float), cudaMemcpyDeviceToHost));
     bool ok = common::CheckEqual(cpu, gpu, 1e-4f);
     ofs << i << "," << cases[i].group << "," << rows << "," << cols << "," << cpu_ms << "," << gpu_ms << ","
         << (gpu_ms > 0 ? cpu_ms / gpu_ms : 0) << "," << common::MaxAbsDiff(cpu, gpu) << "," << (ok ? "PASS" : "FAIL") << "\n";
 
-    // ---------------- 释放资源 ----------------
     CHECK_CUDA(cudaEventDestroy(s));
     CHECK_CUDA(cudaEventDestroy(e));
     CHECK_CUDA(cudaFree(dx));
@@ -86,3 +84,5 @@ int main() {
   }
   return 0;
 }
+
+#endif  // PYTORCH_EXTENSION
