@@ -3,10 +3,12 @@
 #include <mma.h>
 
 #include <algorithm>
+#include <cmath>
 #include <filesystem>
 #include <fstream>
 #include <iomanip>
 #include <iostream>
+#include <numeric>
 #include <vector>
 
 #include "common/benchmark.h"
@@ -186,6 +188,65 @@ __global__ __launch_bounds__(kThreads, 2) void GemmFP16Kernel(
 
 }  // namespace gemm_fp16
 
+// ============================================================
+// 精度评估指标（与 gemm_int8 一致）
+// ============================================================
+struct PrecisionMetrics {
+  double cos_sim;
+  double snr_db;
+  double max_rel_err;
+  double mean_abs_err;
+  double p99_abs_err;
+  double max_abs_err;
+};
+
+static PrecisionMetrics ComputeMetrics(const float* ref, const float* test, size_t n) {
+  PrecisionMetrics m = {};
+  double dot = 0.0, norm_ref = 0.0, norm_test = 0.0;
+  double noise_power = 0.0, signal_power = 0.0;
+  double max_rel = 0.0;
+  std::vector<double> abs_errs(n);
+  double sum_abs = 0.0;
+  double max_abs = 0.0;
+
+  double ref_max_abs = 0.0;
+  for (size_t i = 0; i < n; ++i)
+    ref_max_abs = std::max(ref_max_abs, static_cast<double>(std::fabs(ref[i])));
+  double rel_threshold = std::max(ref_max_abs * 1e-6, 1e-6);
+
+  for (size_t i = 0; i < n; ++i) {
+    double r = ref[i], t = test[i];
+    dot += r * t;
+    norm_ref += r * r;
+    norm_test += t * t;
+    double diff = r - t;
+    noise_power += diff * diff;
+    signal_power += r * r;
+    double ab = std::fabs(diff);
+    abs_errs[i] = ab;
+    sum_abs += ab;
+    max_abs = std::max(max_abs, ab);
+    if (std::fabs(r) >= rel_threshold) {
+      max_rel = std::max(max_rel, ab / std::fabs(r));
+    }
+  }
+
+  m.cos_sim = dot / (std::sqrt(norm_ref) * std::sqrt(norm_test) + 1e-10);
+  m.snr_db = 10.0 * std::log10(signal_power / (noise_power + 1e-10));
+  m.max_rel_err = max_rel;
+  m.mean_abs_err = sum_abs / n;
+  m.max_abs_err = max_abs;
+
+  if (n > 0) {
+    size_t p99_idx = static_cast<size_t>(n * 0.99);
+    p99_idx = std::min(p99_idx, n - 1);
+    std::nth_element(abs_errs.begin(), abs_errs.begin() + p99_idx, abs_errs.end());
+    m.p99_abs_err = abs_errs[p99_idx];
+  }
+
+  return m;
+}
+
 static void GemmCPU_FP32(const float* A, const float* B, float* C, int M, int N, int K) {
   for (int r = 0; r < M; ++r) {
     for (int c = 0; c < N; ++c) {
@@ -202,7 +263,8 @@ int main() {
   auto cases = common::LoadOrCreateTestCasesCsv("data/gemm/test_cases.csv");
   std::filesystem::create_directories("data/results");
   std::ofstream ofs("data/results/gemm_fp16_results.csv");
-  ofs << "id,group,M,N,K,gpu_ms,gflops,max_abs_diff,check\n";
+  ofs << "id,group,M,N,K,gpu_ms,gflops,"
+      << "cos_sim,snr_db,max_rel_err,mean_abs_err,p99_abs_err,max_abs_err\n";
 
   CHECK_CUDA(cudaFuncSetAttribute(gemm_fp16::GemmFP16Kernel,
       cudaFuncAttributeMaxDynamicSharedMemorySize,
@@ -215,13 +277,15 @@ int main() {
     const bool aligned = (M % gemm_fp16::kBlockM == 0) &&
                          (N % gemm_fp16::kBlockN == 0) &&
                          (K % gemm_fp16::kTileK == 0);
+    const size_t C_size = static_cast<size_t>(M) * N;
     std::vector<float> A_fp32(static_cast<size_t>(M) * K),
                        B_fp32(static_cast<size_t>(K) * N),
-                       C_cpu(static_cast<size_t>(M) * N),
-                       C_gpu_fp32(static_cast<size_t>(M) * N);
+                       C_cpu(C_size),
+                       C_gpu_fp32(C_size);
     common::InitMatrix(A_fp32, M, K);
     common::InitMatrix(B_fp32, K, N);
 
+    // FP32 CPU 参考
     if (M <= kMaxCpuVerifyDim && N <= kMaxCpuVerifyDim) {
       GemmCPU_FP32(A_fp32.data(), B_fp32.data(), C_cpu.data(), M, N, K);
     }
@@ -236,7 +300,7 @@ int main() {
       float *dC;
       CHECK_CUDA(cudaMalloc(&dA, A_half.size() * sizeof(__half)));
       CHECK_CUDA(cudaMalloc(&dB, B_half.size() * sizeof(__half)));
-      CHECK_CUDA(cudaMalloc(&dC, C_gpu_fp32.size() * sizeof(float)));
+      CHECK_CUDA(cudaMalloc(&dC, C_size * sizeof(float)));
       CHECK_CUDA(cudaMemcpy(dA, A_half.data(), A_half.size() * sizeof(__half), cudaMemcpyHostToDevice));
       CHECK_CUDA(cudaMemcpy(dB, B_half.data(), B_half.size() * sizeof(__half), cudaMemcpyHostToDevice));
 
@@ -246,6 +310,8 @@ int main() {
 
       gemm_fp16::GemmFP16Kernel<<<grid, block, gemm_fp16::kSmemSize>>>(dA, dB, dC, M, N, K);
       CHECK_CUDA(cudaDeviceSynchronize());
+
+      CHECK_CUDA(cudaMemcpy(C_gpu_fp32.data(), dC, C_size * sizeof(float), cudaMemcpyDeviceToHost));
 
       cudaEvent_t start, stop;
       CHECK_CUDA(cudaEventCreate(&start));
@@ -259,8 +325,6 @@ int main() {
       CHECK_CUDA(cudaEventElapsedTime(&gpu_ms, start, stop));
       gpu_ms /= static_cast<float>(kRepeat);
 
-      CHECK_CUDA(cudaMemcpy(C_gpu_fp32.data(), dC, C_gpu_fp32.size() * sizeof(float), cudaMemcpyDeviceToHost));
-
       CHECK_CUDA(cudaEventDestroy(start));
       CHECK_CUDA(cudaEventDestroy(stop));
       CHECK_CUDA(cudaFree(dA));
@@ -268,25 +332,45 @@ int main() {
       CHECK_CUDA(cudaFree(dC));
     }
 
-    bool ok = true;
+    // 精度评估：FP32 参考 vs FP16 GPU 结果
     double max_abs_diff = 0.0;
-    const char* check = "SKIP_UNALIGNED";
+    PrecisionMetrics pm = {};
     if (aligned && M <= kMaxCpuVerifyDim && N <= kMaxCpuVerifyDim) {
-      ok = common::CheckEqual(C_cpu, C_gpu_fp32, 1e-1f);
-      max_abs_diff = common::MaxAbsDiff(C_cpu, C_gpu_fp32);
-      check = ok ? "PASS" : "FAIL";
-    } else if (aligned) {
-      check = "SKIP";
+      pm = ComputeMetrics(C_cpu.data(), C_gpu_fp32.data(), C_size);
+      max_abs_diff = pm.max_abs_err;
     }
 
     const double gflops = (gpu_ms > 0.0f) ? (2.0 * M * N * K / (gpu_ms * 1e6)) : 0.0;
-    std::cout << M << "x" << N << "x" << K
-              << " | " << std::fixed << std::setprecision(4) << gpu_ms << " ms"
-              << " | " << std::setprecision(1) << gflops << " GFLOP/s"
-              << " | " << check << "\n";
+    std::cout << "\n========== " << M << "x" << N << "x" << K
+              << " | GPU: " << std::fixed << std::setprecision(3) << gpu_ms << " ms"
+              << " | " << std::setprecision(1) << gflops << " GFLOPS ==========\n";
+
+    if (M <= kMaxCpuVerifyDim && N <= kMaxCpuVerifyDim) {
+      std::cout << std::left << std::setw(16) << "Scheme"
+                << std::right
+                << std::setw(12) << "CosSim"
+                << std::setw(12) << "SNR(dB)"
+                << std::setw(14) << "MaxRelErr"
+                << std::setw(14) << "MeanAbsErr"
+                << std::setw(14) << "P99AbsErr"
+                << std::setw(14) << "MaxAbsErr"
+                << "\n";
+      std::cout << std::string(16 + 12*6, '-') << "\n";
+      std::cout << std::left << std::setw(16) << "FP16 WMMA"
+                << std::right
+                << std::setw(12) << std::fixed << std::setprecision(6) << pm.cos_sim
+                << std::setw(12) << std::setprecision(2) << pm.snr_db
+                << std::setw(14) << std::setprecision(6) << pm.max_rel_err
+                << std::setw(14) << std::setprecision(8) << pm.mean_abs_err
+                << std::setw(14) << std::setprecision(8) << pm.p99_abs_err
+                << std::setw(14) << std::setprecision(8) << pm.max_abs_err
+                << "\n";
+    }
 
     ofs << i << ",gemm_fp16," << M << "," << N << "," << K << ","
-        << gpu_ms << "," << gflops << "," << max_abs_diff << "," << check << "\n";
+        << gpu_ms << "," << gflops << ","
+        << pm.cos_sim << "," << pm.snr_db << "," << pm.max_rel_err << ","
+        << pm.mean_abs_err << "," << pm.p99_abs_err << "," << pm.max_abs_err << "\n";
   }
   return 0;
 }

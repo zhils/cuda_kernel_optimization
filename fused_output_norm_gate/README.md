@@ -142,3 +142,15 @@ PTX 和 SASS 在 `fused_output_norm_gate/asm/` 下。
 - 可执行文件：`build/bin/`
 - 结果 CSV：`data/results/`
 - PTX/SASS：`fused_output_norm_gate/asm/ptx/`、`fused_output_norm_gate/asm/sass/`
+
+## Nsight Compute 性能分析
+
+
+使用 `ncu --set basic` 对每个可执行文件的第一个 kernel launch 进行 profiling。
+运行环境：NVIDIA RTX 5060 Ti (Blackwell sm_120) | CUDA 13.2 | Nsight Compute 2026.1.1
+
+| 版本 | Kernel | Duration(us) | Compute% | MemBW% | L1% | L2% | Occupancy% | Reg/Thread | Block | Grid |
+|---|---|---|---|---|---|---|---|---|---|---|
+| fused_output_norm_gate_v0 | FusedOutputNormGateV0 | 6.5 | 5.8% | 44.6% | 64.1% | 4.5% | 9.9% | 30 | 256 | 128 |
+**说明：** ncu `--set basic` 默认对程序的**第一个 kernel launch** 进行 profiling。对于 GEMM 等算子，这对应最小测试尺寸（128×128），GPU 远未饱和。因此表格中的 Compute% / MemBW% 表示的是**小尺寸下的资源利用率**，用于横向对比各版本的寄存器压力、occupancy 等结构性差异。大尺寸下的实际性能请参考各算子 README 中的完整 benchmark 表格。
+

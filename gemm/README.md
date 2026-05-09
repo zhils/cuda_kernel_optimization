@@ -44,8 +44,8 @@ A ∈ R^{M×K}, B ∈ R^{K×N}, C ∈ R^{M×N}
 | `gemm_v2` | `gemm_v2.cu` | 寄存器分块 8×8/线程 |
 | `gemm_v3` | `gemm_v3.cu` | cp.async + 8×4 子块 + TileK=32 |
 | `gemm_v4` | `gemm_v4.cu` | TF32 WMMA Tensor Core |
-| `gemm_v5` | `gemm_v5.cu` | WMMA + cp.async + 多配置自动调优 |
 | `gemm_fp16` | `gemm_fp16.cu` | FP16 WMMA (k=16) |
+| `gemm_int8` | `gemm_int8.cu` | INT8 WMMA Tensor Core (k=16) |
 | `gemm_cublas_ref` | `gemm_cublas_ref.cu` | cuBLAS FP32 参考 |
 
 ### v0 — 朴素基线
@@ -150,23 +150,70 @@ cp.async 流水线（简化伪码）：
 ### v4 — TF32 WMMA Tensor Core
 
 ```cuda
-nvcuda::wmma::fragment<nvcuda::wmma::matrix_a, 16, 16, 8, nvcuda::wmma::tf32, ...> a_frag;
-nvcuda::wmma::fragment<nvcuda::wmma::accumulator, 16, 16, 8, float, ...> c_frag;
-// 每个 warp 算 16×16 的 C tile
-wmma::load_matrix_sync(a_frag, smem_a, 16);
-wmma::load_matrix_sync(b_frag, smem_b, 16);
-wmma::mma_sync(c_frag, a_frag, b_frag, c_frag);  // 16×16 × 16×16 × k=8
+wmma::fragment<wmma::matrix_a, 16, 16, 8, wmma::precision::tf32, ...> a_frag;
+wmma::fragment<wmma::accumulator, 16, 16, 8, float, ...> c_frag;
+// 每个 warp 算 64×32 的 C tile（4×2 个 16×16 fragment）
+wmma::load_matrix_sync(a_frag, smem_a, ld);   // SMEM → fragment
+wmma::load_matrix_sync(b_frag, smem_b, ld);
+wmma::mma_sync(c_frag, a_frag, b_frag, c_frag);  // Tensor Core 计算
 ```
 
-Blackwell 的 TF32 WMMA 只支持 m16n16k8。一条 mma_sync 做 2×16×8 = 256 对乘加 = 512 FLOPs。v0~v3 的 CUDA Core FMA 一个时钟周期每 core 一对乘加 = 2 FLOPs，128 core × 2 = 256 FLOPs/cycle/SM。
+**性能：4096³ — 12.57 ms / 10.94 TFLOPS，比 v3 还慢 14%。** TF32 名义峰值是 CUDA Core 的 8×（188 TFLOPS），实测利用率只有 **5.8%**。
 
-**问题在于 occupancy：** WMMA fragment 占寄存器太多（每个 warp 存 8×16×16 = 2048 个 float 的 fragment，每个 warp 64 寄存器），occupancy 降到 26.9%。CUDA Core V3 的 occupancy > 80%。
+为什么"上 Tensor Core 反而更慢"？逐项拆给最大头：
 
-**4096³：12.57 ms / 10.94 TFLOPS** — 比 V3 慢 14%。
+**A. Occupancy 80%+ → 26.9%（最主要）**
 
-### v5 — WGMMA Blackwell TC
+每 warp 8 个 16×16 accumulator fragment：
 
-用 `wgmma` warp-group MMA 指令（Blackwell 新增）。**4096³：12.21 ms / 11.26 TFLOPS。** 比 WMMA 略好，仍受 k=8 的硬件限制。
+```cuda
+wmma::fragment<wmma::accumulator, 16, 16, 8, float>
+    c_frag[kWarpTilesM][kWarpTilesN];   // 4 × 2 = 8 个
+```
+
+- 仅累加器 = **64 regs/thread**；加上 a/b fragment + 索引地址 ≈ **128 regs/thread**。
+- v3 同样 128 regs/thread，但 8×4 寄存器分块只占 32 regs，其余预算用来隐藏 SMEM 延迟，ncu 给 **80%+ occupancy**。
+- v4 因为 fragment 把寄存器吃满，**SM 上只能驻留 1 个 block**，warp scheduler 没有别的 warp 可切——每次 SMEM 加载和 `mma_sync` 都是真等待。
+
+**B. TileK=16 vs v3 的 32 → 外循环次数翻倍**
+
+```cuda
+constexpr int kTileK = 16;   // v4
+```
+
+- 4096³：v3 外循环 128 轮，v4 **256 轮**，`__pipeline_commit` + `__pipeline_wait_prior` + `__syncthreads()` 全部翻倍。
+- 想抬到 32 → 双缓冲 SMEM 32KB→64KB，又要 `cudaFuncSetAttribute` 抬上限，且占用率进一步降低。原 v4 试过这条路，反而慢 13%。
+
+**C. TF32 m16n16k8 的"算密度"只有 FP16 m16n16k16 的 1/3**
+
+| 指令 | SMEM 加载 | 算力 | FLOPs/Byte |
+|---|---|---|---|
+| `mma.m16n16k8` (TF32) | 1.5 KB | 4096 FLOPs | 2.67 |
+| `mma.m16n16k16` (FP16) | 1.0 KB | 8192 FLOPs | **8.0** |
+
+同样 SMEM 带宽，FP16 拿到 3× 算力——这是 `gemm_fp16` 跑到 37.4 TFLOPS、而 v4 卡在 11 TFLOPS 的根本原因之一。**WMMA 选 TF32 这条路本身就有天花板。**
+
+**D. `load_matrix_sync` 是 warp 同步阻塞调用，无法和 mma 重叠**
+
+- v3 的内循环纯 FFMA，可以与 `cp.async` 形成跨 K-tile 的双缓冲流水。
+- v4 的 `load_matrix_sync` 把 "SMEM → fragment 内部格式" 的转换塞进同一条指令同步完成，与 `mma_sync` 之间无法跨指令流水。
+
+**E. fragment 复用不充分**
+
+```cuda
+for (int kk = 0; kk < kTileK; kk += 8) {
+    a_frag[4]; for(i)load a;             // a 复用 j 循环 2 次
+    for (int j = 0; j < 2; ++j) {
+        b_frag; load b;                   // b 每次 j 重新加载，不复用
+        for(i) mma(c_frag[i][j], a, b);
+    }
+}
+```
+
+- a_frag 数组在外，复用 2 次；b 没缓存，每 j 重载——每 kk 步 4+2=6 加载 / 8 mma。
+- 把 a/b 都缓存为数组（2×2 fragment 全 cache）能压到 4 加载 / 4 mma。
+
+**一句话总结：** v4 拿了 8× 的名义算力，但被 (A) 累加器吃掉占用率（80%→27%）、(B) TileK 减半导致同步翻倍、(C) TF32 单指令算密度只有 FP16 的 1/3 三件事联合击穿，净结果比 v3 慢 14%。
 
 ### gemm_fp16 — FP16 K=16 Tensor Core
 
@@ -177,9 +224,67 @@ wmma::mma_sync(c_frag, a_frag, b_frag, c_frag);  // k=16
 
 k=16，每条指令做 2×16×16 = 512 对乘加 = 1024 FLOPs，是 TF32 的 2 倍。数据量减半又让 SMEM 能放 2× 的 K-tile。**4096³：3.68 ms / 37.39 TFLOPS。**
 
+精度（FP32 CPU 参考 vs FP16 GPU 结果，1024³）：
+
+| CosSim | SNR(dB) | MeanAbsErr | MaxAbsErr |
+|--------|---------|------------|-----------|
+| 1.000000 | 103.63 | 0.00149 | 0.00455 |
+
+FP16 的 10-bit mantissa 对 [-1,1] 分布几乎无损，SNR 比 INT8（45dB）高 58dB。
+
 ### cuBLAS FP32 参考
 
 `cublasSgemm` 内部在 Blackwell 上走的是 **BF16×9 仿真**：把 FP32 矩阵拆成 9 个 BF16 子矩阵乘，用 BF16 Tensor Core（k=16）加速，9 次结果重组合回 FP32。**4096³：8.42 ms / 16.33 TFLOPS。**
+
+### gemm_int8 — INT8 WMMA Tensor Core + Per-Channel 量化
+
+kernel 本身和 gemm_fp16 一样走 WMMA (k=16)，只是输入换成了 `int8_t`（signed char），累加器用 `int32_t` 避免溢出。
+
+#### 量化方案对比
+
+对 INT8 推理而言，量化精度和计算性能同等重要。实现了 3 种方案并对比精度：
+
+| 方案 | A (激活) 量化 | B (权重) 量化 | 反量化 |
+|------|-------------|-------------|-------|
+| Per-Tensor | 一个 `scale_a` 覆盖整个 A | 一个 `scale_b` 覆盖整个 B | `C_deq = C_int32 × scale_a × scale_b` |
+| Per-Channel | 一个 `scale_a` 覆盖整个 A | 每列（输出通道）独立 `scale_b[c]` | `C_deq[r][c] = C_int32[r][c] × scale_a × scale_b[c]` |
+
+per-channel 对权重每列独立缩放，保留了通道间的分布差异。实际模型中各通道权重幅值可能差几十倍（如 embedding 层），per-channel 能显著降低量化误差。
+
+#### 精度指标
+
+采用 6 个指标评估 FP32 参考和 INT8 方案之间的差异：
+
+- **余弦相似度** `cos_sim = Σ(r×t) / √(Σr² × Σt²)` — 越接近 1 越好
+- **信噪比** `SNR = 10×log₁₀(Σr² / Σ(r-t)²)` (dB) — 越高越好
+- **最大相对误差** `max|r-t|/|r|` — 过滤掉接近零的参考值
+- **平均绝对误差** `mean|r-t|`
+- **P99 绝对误差** — 排除了 1% 的极端值
+- **最大绝对误差** `max|r-t|`
+
+#### 精度结果（均匀随机分布 [-1,1]，矩阵 1024³）
+
+| 方案 | CosSim | SNR(dB) | MeanAbsErr | MaxAbsErr |
+|------|--------|---------|------------|-----------|
+| FP16 WMMA (k=16) | 1.000000 | 103.63 | 0.00149 | 0.00455 |
+| Per-Tensor INT8 | 0.999985 | 45.10 | 0.04738 | 0.29195 |
+| Per-Channel INT8 | 0.999985 | 45.10 | 0.04733 | 0.27508 |
+
+FP16 比 INT8 高约 **58dB SNR**，平均绝对误差小 **32 倍**（0.0015 vs 0.047）。FP16 的量化步长（2⁻¹⁰ ≈ 0.001）远小于 INT8（1/127 ≈ 0.0079），对 [-1,1] 范围的均匀分布，精度几乎无损。per-channel 在这个均匀分布场景下和 per-tensor 接近，实际模型中权重通道分布差异大时 per-channel 优势更明显。
+
+#### 性能
+
+INT8 在 Tensor Core 上走 k=16，吞吐远高于 FP32 CUDA Core 版本：
+
+| 规模 | 耗时 (ms) | GFLOPS |
+|------|-----------|--------|
+| 128³ | 0.010 | 429 |
+| 256³ | 0.012 | 2915 |
+| 512³ | 0.026 | 10318 |
+| 1024³ | 0.054 | 40033 |
+| 4096³ | 2.107 | 65226 |
+
+4096³ 达到 **65.2 TFLOPS**，接近 FP16 版本的 37.39 TFLOPS 的 1.74×（INT8 数据量减半，带宽压力更小）。
 
 ---
 
@@ -187,23 +292,23 @@ k=16，每条指令做 2×16×16 = 512 对乘加 = 1024 FLOPs，是 TF32 的 2 �
 
 ### 3.1 执行时间（ms）
 
-| 规模 | v0 | v1 | v2 | v3 | v4 | v5 | cuBLAS FP32 | gemm_fp16 |
-|------|------|------|------|------|------|------|-------------|-----------|
-| 128³ | 0.0111 | 0.0066 | 0.0168 | 0.0136 | 0.0211 | 0.0164 | 0.0209 | 0.0139 |
-| 256³ | 0.0314 | 0.0246 | 0.0313 | 0.0170 | 0.0384 | 0.0175 | 0.0164 | 0.0147 |
-| 512³ | 0.1861 | 0.1383 | 0.0580 | 0.0292 | 0.0674 | 0.0397 | 0.0324 | 0.0266 |
-| 1024³ | 1.3743 | 1.0209 | 0.2185 | 0.1803 | 0.2198 | 0.2175 | 0.1547 | 0.0714 |
-| 4096³ | 97.1207 | 70.6531 | 17.0384 | 10.9755 | 12.5675 | 12.2069 | 8.4151 | 3.6755 |
+| 规模 | v0 | v1 | v2 | v3 | v4 | cuBLAS FP32 | gemm_fp16 |
+|------|------|------|------|------|------|-------------|-----------|
+| 128³ | 0.0111 | 0.0066 | 0.0168 | 0.0136 | 0.0211 | 0.0209 | 0.0139 |
+| 256³ | 0.0314 | 0.0246 | 0.0313 | 0.0170 | 0.0384 | 0.0164 | 0.0147 |
+| 512³ | 0.1861 | 0.1383 | 0.0580 | 0.0292 | 0.0674 | 0.0324 | 0.0266 |
+| 1024³ | 1.3743 | 1.0209 | 0.2185 | 0.1803 | 0.2198 | 0.1547 | 0.0714 |
+| 4096³ | 97.1207 | 70.6531 | 17.0384 | 10.9755 | 12.5675 | 8.4151 | 3.6755 |
 
 ### 3.2 吞吐（GFLOPS）
 
-| 规模 | v0 | v1 | v2 | v3 | v4 | v5 | cuBLAS FP32 | gemm_fp16 |
-|------|------|------|------|------|------|------|-------------|-----------|
-| 128³ | 379 | 639 | 249 | 307 | 199 | 255 | 200 | 301 |
-| 256³ | 1068 | 1366 | 1071 | 1977 | 874 | 1913 | 2048 | 2281 |
-| 512³ | 1443 | 1942 | 4625 | 9205 | 3981 | 6760 | 8275 | 10080 |
-| 1024³ | 1563 | 2104 | 9827 | 11909 | 9770 | 9875 | 13880 | 30069 |
-| 4096³ | 1415 | 1945 | 8066 | 12522 | 10936 | 11259 | 16333 | 37393 |
+| 规模 | v0 | v1 | v2 | v3 | v4 | cuBLAS FP32 | gemm_fp16 |
+|------|------|------|------|------|------|-------------|-----------|
+| 128³ | 379 | 639 | 249 | 307 | 199 | 200 | 301 |
+| 256³ | 1068 | 1366 | 1071 | 1977 | 874 | 2048 | 2281 |
+| 512³ | 1443 | 1942 | 4625 | 9205 | 3981 | 8275 | 10080 |
+| 1024³ | 1563 | 2104 | 9827 | 11909 | 9770 | 13880 | 30069 |
+| 4096³ | 1415 | 1945 | 8066 | 12522 | 10936 | 16333 | 37393 |
 
 4096³ 下：
 - V3 达到 **53%** 的 FP32 CUDA Core 理论峰值（12.52 / 23.5）
@@ -212,13 +317,13 @@ k=16，每条指令做 2×16×16 = 512 对乘加 = 1024 FLOPs，是 TF32 的 2 �
 
 ### 3.3 相对 cuBLAS FP32 的吞吐比值
 
-| 规模 | v0 | v1 | v2 | v3 | v4 | v5 | gemm_fp16 |
-|------|----|----|----|----|----|----|-----------|
-| 128³ | 1.89x | 3.19x | 1.24x | 1.53x | 0.99x | 1.27x | 1.50x |
-| 256³ | 0.52x | 0.67x | 0.52x | 0.97x | 0.43x | 0.93x | 1.11x |
-| 512³ | 0.17x | 0.23x | 0.56x | 1.11x | 0.48x | 0.82x | 1.22x |
-| 1024³ | 0.11x | 0.15x | 0.71x | 0.86x | 0.70x | 0.71x | 2.17x |
-| 4096³ | 0.09x | 0.12x | 0.49x | 0.77x | 0.67x | 0.69x | 2.29x |
+| 规模 | v0 | v1 | v2 | v3 | v4 | gemm_fp16 |
+|------|----|----|----|----|----|-----------|
+| 128³ | 1.89x | 3.19x | 1.24x | 1.53x | 0.99x | 1.50x |
+| 256³ | 0.52x | 0.67x | 0.52x | 0.97x | 0.43x | 1.11x |
+| 512³ | 0.17x | 0.23x | 0.56x | 1.11x | 0.48x | 1.22x |
+| 1024³ | 0.11x | 0.15x | 0.71x | 0.86x | 0.70x | 2.17x |
+| 4096³ | 0.09x | 0.12x | 0.49x | 0.77x | 0.67x | 2.29x |
 
 ---
 
@@ -247,15 +352,33 @@ k=16，每条指令做 2×16×16 = 512 对乘加 = 1024 FLOPs，是 TF32 的 2 �
 |------|-------------|
 | v3 | `cp.async.ca.shared.global.L128` — DMA 异步拷贝，不占用 LSU |
 | v4 | `wmma.mma.sync.aligned.row.row.m16n16k8.f32.tf32.tf32.f32` |
-| v5 | `wgmma.fence`, `wgmma.commit_group` |
 | gemm_fp16 | `wmma.mma.sync.aligned.row.row.m16n16k16.f32.f16.f16.f32` — k=16 |
 
 ---
 
 ## 6. 产物路径
 
-- 可执行文件：`build/bin/gemm_v0` … `gemm_v5`、`gemm_fp16`、`gemm_cublas_ref`
+- 可执行文件：`build/bin/gemm_v0` … `gemm_v4`、`gemm_fp16`、`gemm_cublas_ref`
 - 结果 CSV：`data/results/`
 - ncu 报告：`build/data/ncu_reports/`
 - PTX/SASS：`gemm/asm/ptx/`、`gemm/asm/sass/`
 - compute capability：**sm_120**（Blackwell），CUDA 13.2
+
+## Nsight Compute 性能分析
+
+
+使用 `ncu --set basic` 对每个可执行文件的第一个 kernel launch 进行 profiling。
+运行环境：NVIDIA RTX 5060 Ti (Blackwell sm_120) | CUDA 13.2 | Nsight Compute 2026.1.1
+
+| 版本 | Kernel | Duration(us) | Compute% | MemBW% | L1% | L2% | Occupancy% | Reg/Thread | Block | Grid |
+|---|---|---|---|---|---|---|---|---|---|---|
+| gemm_v0 | GemmNaiveKernel | 8.4 | 34.1% | 34.1% | 43.6% | 8.2% | 29.4% | 32 | 256 | 64 |
+| gemm_v1 | GemmSmemKernel | 6.0 | 36.0% | 36.0% | 43.9% | 7.9% | 28.8% | 40 | 256 | 64 |
+| gemm_v2 | GemmRegTiledKernel | 21.2 | 1.0% | 1.9% | 53.3% | 1.2% | 16.6% | 142 | 256 | 1 |
+| gemm_v3 | GemmCpAsyncKernel | 9.5 | 2.4% | 4.9% | 43.9% | 2.8% | 16.6% | 128 | 256 | 2 |
+| gemm_fp16 | GemmFP16Kernel | 8.7 | 1.0% | 2.1% | 57.5% | 1.4% | 16.6% | 112 | 256 | 1 |
+| gemm_fp8 | cublasLtMatmul (cuBLASLt FP8) | 3.0 | 1.6% | 4.0% | 12.1% | 3.1% | 8.3% | 255 | 128 | 16 |
+| gemm_int8 | GemmINT8Kernel | 6.6 | 0.7% | 5.5% | 61.0% | 1.4% | 16.5% | 120 | 256 | 1 |
+| gemm_cublas_ref | cublasSgemm (cuBLAS FP32) | 5.0 | 7.6% | 8.4% | 54.3% | 5.2% | 8.3% | 80 | 128 | 8 |
+**说明：** ncu `--set basic` 默认对程序的**第一个 kernel launch** 进行 profiling。对于 GEMM 等算子，这对应最小测试尺寸（128×128），GPU 远未饱和。因此表格中的 Compute% / MemBW% 表示的是**小尺寸下的资源利用率**，用于横向对比各版本的寄存器压力、occupancy 等结构性差异。大尺寸下的实际性能请参考各算子 README 中的完整 benchmark 表格。
+

@@ -4,8 +4,8 @@ set(GEMM_VARIANTS
     gemm_v2
     gemm_v3
     gemm_v4
-    gemm_v5
     gemm_fp16
+    gemm_fp8
     gemm_int8
     gemm_cublas_ref
 )
@@ -26,6 +26,7 @@ foreach(variant ${GEMM_VARIANTS})
 endforeach()
 
 target_link_libraries(gemm_cublas_ref PRIVATE cublas)
+target_link_libraries(gemm_fp8 PRIVATE cublasLt)
 
 set(ASM_OUTPUT_DIR ${CMAKE_SOURCE_DIR}/gemm/asm)
 set(NVCC_FLAGS -Xcompiler=-Wno-deprecated-declarations)

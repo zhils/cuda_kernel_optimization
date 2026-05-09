@@ -271,3 +271,18 @@ fused_conv1d_silu/asm/ptx/fused_conv1d_silu_v3.ptx
 fused_conv1d_silu/asm/sass/fused_conv1d_silu_v0.cubin
 fused_conv1d_silu/asm/sass/fused_conv1d_silu_v3.cubin
 ```
+
+## Nsight Compute 性能分析
+
+
+使用 `ncu --set basic` 对每个可执行文件的第一个 kernel launch 进行 profiling。
+运行环境：NVIDIA RTX 5060 Ti (Blackwell sm_120) | CUDA 13.2 | Nsight Compute 2026.1.1
+
+| 版本 | Kernel | Duration(us) | Compute% | MemBW% | L1% | L2% | Occupancy% | Reg/Thread | Block | Grid |
+|---|---|---|---|---|---|---|---|---|---|---|
+| fused_conv1d_silu_v0 | FusedConv1dSiluV0 (5 kernels) | 12.3 | 8.9% | 70.7% | 92.1% | 6.5% | 22.3% | 30 | 256 | 128 |
+| fused_conv1d_silu_v1 | FusedConv1dSiluV1 (fully fused) | 0.0 | 0.1% | 1.0% | 36.5% | 0.6% | 2.1% | 48 | 256 | 1 |
+| fused_conv1d_silu_v2 | FusedConv1dSiluV2 (2-kernel + vec4) | 10.7 | 2.3% | 27.1% | 73.7% | 4.7% | 16.4% | 48 | 256 | 16 |
+| fused_conv1d_silu_v3 | FusedConv1dSiluV3 (2D grid + SMEM) | 9.9 | 3.6% | 29.2% | 35.3% | 10.6% | 11.6% | 48 | 256 | 128 |
+**说明：** ncu `--set basic` 默认对程序的**第一个 kernel launch** 进行 profiling。对于 GEMM 等算子，这对应最小测试尺寸（128×128），GPU 远未饱和。因此表格中的 Compute% / MemBW% 表示的是**小尺寸下的资源利用率**，用于横向对比各版本的寄存器压力、occupancy 等结构性差异。大尺寸下的实际性能请参考各算子 README 中的完整 benchmark 表格。
+

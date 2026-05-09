@@ -91,7 +91,7 @@ int main() {
 
     dim3 grid(rows);
     dim3 block(QPF_BLOCK_SIZE);
-    const size_t smem_size = static_cast<size_t>(cols) * sizeof(float);
+    const size_t smem_size = static_cast<size_t>(block.x) * sizeof(float);
 
     QPathFusionV0Kernel<<<grid, block, smem_size>>>(dx, dgamma, dwq, dbq, dq, rows, cols, kEps);
     CHECK_CUDA(cudaDeviceSynchronize());

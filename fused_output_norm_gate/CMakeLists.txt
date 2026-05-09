@@ -1,5 +1,7 @@
 set(FUSED_OUTPUT_NORM_GATE_VARIANTS
     fused_output_norm_gate_v0
+    fused_output_norm_gate_v1
+    fused_output_norm_gate_v2
 )
 
 foreach(variant ${FUSED_OUTPUT_NORM_GATE_VARIANTS})

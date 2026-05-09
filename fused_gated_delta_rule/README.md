@@ -65,10 +65,7 @@ for each (b, t):
 for each batch b:
     s = 0                                                   # 初始化状态为 0
     for t = 0 to L-1:
-        # 状态更新：s_new = alpha * s_old + delta * u
         s = alpha[b, t] * s + delta[b, t] * u[b, t]         # (H,)
-        
-        # 输出：o = s（或额外的输出投影）
         o[b, t] = s                                         # (H,)
 ```
 
@@ -106,56 +103,94 @@ $$
 o_{b,t,h} = s_{b,t,h}
 $$
 
-### 2.4 Softplus 激活函数
-
-$$
-\text{softplus}(x) = \ln(1 + e^x)
-$$
-
-等价于数值稳定形式：
-
-$$
-\text{softplus}(x) = \max(0, x) + \ln(1 + e^{-|x|})
-$$
-
-### 2.5 融合优势
-
-将三个步骤融合为单个 kernel 的优势：
-
-1. **减少全局内存搬运**：$\alpha, \delta, u$ 可以直接在寄存器/共享内存中计算并使用，无需写回全局内存
-2. **隐藏延迟**：门控计算和状态更新可以流水线化
-3. **更好的占用率**：单个 kernel 可以更好地利用 GPU 资源
-
 ---
 
 ## 3. 版本演进
 
-### 3.1 v0：朴素基线（逐个操作分离）
+### 3.1 v0：朴素基线（4 个分离 kernel）
 
 **文件：** `fused_gated_delta_rule_v0.cu`
 
-- 每个操作单独实现为 CUDA kernel，中间结果写回全局内存
-- Decay Gate、Delta Gate、State Projection 分别计算
-- Recurrent Update 单独一个 kernel
-- 用于验证正确性和作为后续融合优化的基准
+- 3 个 `LinearActivationKernel` 分别计算 decay/delta/state 投影，写 alpha/delta/u 到全局内存
+- 1 个 `RecurrentDeltaRuleKernel` 读取中间 buffer 做循环更新
+- 优点：结构简单清晰，验证正确性的基准
+- 缺点：4 次 kernel launch 开销大；x_bt 被 H 个线程各自从全局读 H 次，严重冗余；中间 buffer 3 次写 + 3 次读浪费带宽
+
+### 3.2 v1：融合投影（2 个 kernel）
+
+**文件：** `fused_gated_delta_rule_v1.cu`
+
+将 3 个投影 kernel 合并为 1 个 `FusedProjectionKernel`，每个线程在同一个循环中同时算 3 个点积：
+- x 数据只读一次，3 个权重矩阵连续访问—改善缓存局部性
+- kernel launch 从 4 次减到 2 次
+- **实测效果：** 小尺寸稍有改善，大尺寸反而略慢于 v0，主要原因是从 3 个体积小的 kernel 变成了 1 个体积更大的 kernel，register pressure 升高但没有解决 x_bt 的 H 重读问题
+
+### 3.3 v2：SMEM 缓存 x_bt + float4 向量化（关键优化）
+
+**文件：** `fused_gated_delta_rule_v2.cu`
+
+v2 找到了 v0/v1 的核心问题：**每个 (b,t) 位置的 x_bt 被 H 个线程同时从全局内存独立读取，总共产生 H× 的冗余全局访问。**
+
+解决：用 shared memory 做 x_bt 的块内缓存。
+
+```
+grid(B, L), block(128), shared_mem = x[D × sizeof(float)]
+
+每个 block 处理一个 (b,t):
+  1. 协作式将 x_bt 从全局内存加载到 SMEM — 每个元素只读 1 次
+  2. __syncthreads() 同步
+  3. 每个线程从 SMEM 读 x，从全局读 W，
+     用 float4 向量化计算 3 个点积 + 激活函数
+  4. 写 alpha/delta/u 到全局内存
+```
+
+**额外优化：**
+- **Float4 向量化访存：** W 从全局内存和 x 从 SMEM 都使用 float4（16 字节）加载，每 4 个 FMA 合并 1 次访存指令
+- **SMEM 节省全局带宽：** H=256 时，SMEM 策略将 x 的全局读取量减少到 1/256
 
 ---
 
-## 4. 产物路径
+## 4. 性能对比
 
-- **可执行文件：** `build/bin/fused_gated_delta_rule_v0`
-- **结果 CSV：** `data/results/fused_gated_delta_rule_v0_results.csv`
+GPU 时间（ms），全部 PASS（与 CPU FP32 参考的 MaxAbsDiff < 1e-3）：
+
+| 测试规模 (B,L,D,H) | **v0 (4 kernel)** | **v1 (2 kernel)** | **v2 (SMEM)** | **v2 vs v0** |
+|:-----------------:|:----------------:|:----------------:|:-------------:|:-----------:|
+| 1,128,64,32       | 0.0345           | 0.0267           | **0.0182**    | **1.9×** |
+| 1,256,128,64      | 0.1174           | 0.1079           | **0.0343**    | **3.4×** |
+| 2,512,256,128     | 1.0711           | 1.5072           | **0.6283**    | **1.7×** |
+| 4,1024,512,256    | 16.705           | 21.798           | **10.010**    | **1.7×** |
+| 8,2048,512,256    | 66.973           | 86.694           | **40.166**    | **1.7×** |
+
+v2 在所有尺寸下均优于 v0，加速比稳定在 1.7~3.4×。v1 在中等以上尺寸反而比 v0 慢，说明单纯合并 kernel 而不解决访存冗余不足以带来收益。
 
 ---
 
-## PTX / SASS
+## 5. Nsight Compute 性能分析
 
-PTX 和 SASS 在 `fused_gated_delta_rule/asm/` 下。
+使用 `ncu --set basic` 对每个可执行文件的第一个 kernel launch 进行 profiling。
+运行环境：NVIDIA RTX 5060 Ti (Blackwell sm_120) | CUDA 13.2 | Nsight Compute 2026.1.1
 
-使用 `cuobjdump -sass` 可查看 SASS 反汇编。
+| 版本 | Kernel | Duration(us) | Compute% | MemBW% | L1% | L2% | Occupancy% | Reg/Thread | Block | Grid |
+|---|---|---|---|---|---|---|---|---|---|---|
+| fused_gated_delta_rule_v0 | 4 kernels (3×proj+1×recurrent) | 6.5 | 5.9% | 45.1% | 65.3% | 4.5% | 9.9% | 30 | 256 | 128 |
+| fused_gated_delta_rule_v1 | FusedProjectionKernel | 13.0 | 5.7% | 65.4% | 79.5% | 6.3% | 8.4% | 39 | 256 | 128 |
+| fused_gated_delta_rule_v2 | FusedProjectionSmemKernel | **2.5** | **43.3%** | **55.0%** | **33.8%** | **7.6%** | **10.4%** | 44 | 128 | 128 |
 
-## 产物路径
+v2 的关键改进在 ncu 数据中清晰可见：
+- **Duration 从 6.5us 降到 2.5us** — SMEM 缓存直接缩短了投影 kernel 的执行时间
+- **MemBW% 从 45.1% 升到 55.0%** — SMEM 缓存减少了 x 的冗余全局读，剩余的内存带宽更多用于 W 和中间 buffer 的读写
+- **L1% 从 65.3% 降到 33.8%** — x 数据通过 SMEM 访问（L1 是 global load/store 的通道），L1 压力减小
+- **Compute% 从 5.9% 升到 43.3%** — 访存效率提高后，计算有更多机会执行
 
-- 可执行文件：`build/bin/`
-- 结果 CSV：`data/results/`
-- PTX/SASS：`fused_gated_delta_rule/asm/ptx/`、`fused_gated_delta_rule/asm/sass/`
+v1 的 Duration（13.0us）比 v0（6.5us）更长，这是因为 v1 的 FusedProjectionKernel 每个线程做 3 倍的点积工作量，但 grid 大小没变（同样是 128 blocks），kernel 执行时间自然变长。而 v2 通过 SMEM 缓存解决了访存冗余，投影 kernel 仅需 2.5us，实现真正的加速。
+
+---
+
+## 6. 产物路径
+
+- **可执行文件：** `build/bin/fused_gated_delta_rule_v0`, `v1`, `v2`
+- **结果 CSV：** `data/results/fused_gated_delta_rule_v{0,1,2}_results.csv`
+- **量化评估可执行：** `build/bin/fused_gated_delta_rule_quant_eval`
+- **量化评估 CSV：** `data/results/fused_gated_delta_rule_quant_eval.csv`
+- **PTX/SASS：** `fused_gated_delta_rule/asm/ptx/`、`fused_gated_delta_rule/asm/sass/`

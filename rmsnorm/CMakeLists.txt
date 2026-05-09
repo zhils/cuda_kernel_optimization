@@ -3,6 +3,7 @@ set(RMSNORM_VARIANTS
     rmsnorm_v1
     rmsnorm_v2
     rmsnorm_v3
+    rmsnorm_cub_ref
 )
 
 foreach(variant ${RMSNORM_VARIANTS})
