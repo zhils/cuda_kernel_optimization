@@ -86,11 +86,26 @@ $$
 
 | 内核 | Duration(us) | Compute(SM) | DRAM | Memory | Achieved Occupancy | Reg/Thr |
 |:----|:-----------:|:-----------:|:----:|:------:|:------------------:|:-------:|
-| `LinearOutputKernel` | 385.38 | 11.73% | 0.49% | 95.81% | 90.97% | 38 |
+| `LinearOutputKernel` (v0) | 385.38 | 11.73% | 0.49% | 95.81% | 90.97% | 38 |
+| `fused_output_norm_gate_v1_kernel` (v1) | 11.54¹ | 7.29% | 1.58% | 51.09% | 69.89%² | 38 |
+| `fused_output_norm_gate_v2_kernel` (v2) | 8.37¹ | 6.25% | 2.35% | 19.81% | —² | — |
+
+¹ v1/v2 数据取自 B=128 配置（小规模），大规模下数值会更高。
+² v1 Occupancy 取自 Grid=256 配置（69.89%），v2 小规模时 Occupancy 较低。
 
 Occupancy 高、缓存流量高，主受访存路径与数据重用模式影响。v1/v2 将消除中间张量全局读写，提升有效访存带宽利用率。
 
 ---
+
+## Warp Stall 原因分析
+
+| 版本 | #1 Stall | #2 Stall | #3 Stall | #4 Stall | #5 Stall |
+|:----|:---------|:---------|:---------|:---------|:---------|
+| v0 | Long Scoreboard 38.5% | Short Scoreboard 24.8% | Wait 20.1% | Not Selected 8.6% | Mio Throttle 5.2% |
+| v1 | **Mio Throttle 73.7%** | Long Scoreboard 18.9% | Short Scoreboard 5.0% | Not Selected 1.3% | Wait 1.0% |
+| v2 | **Mio Throttle 50.0%** | Long Scoreboard 33.3% | Short Scoreboard 14.7% | Wait 1.1% | Not Selected 0.8% |
+
+关键变化：v0 以 Long/Short Scoreboard 为主（等待全局/缓存加载），而 v1/v2 的 #1 stall 变为 **Mio Throttle**（73.7%/50.0%）。这是因为全融合后不再有中间缓冲的全局读写，SMEM 访问成为新的瓶颈：大量线程同时访问共享内存引发 MIO 管道拥塞。v2 的 Mio Throttle 降至 50%（vs v1 的 73.7%），因其 2 行/block 的权重复用减少了 SMEM 访问密度。
 
 ## 构建
 

@@ -60,13 +60,27 @@ Q 和 K 的 L2 归一化分别实现为独立 CUDA kernel。
 
 `ncu --set basic`，`fused_l2_norm_qk_v0`：
 
-| 内核 | Duration(us) | Compute(SM) | DRAM | Achieved Occupancy | Reg/Thr |
-|:----|:-----------:|:-----------:|:----:|:------------------:|:-------:|
-| `L2NormKernel` | 402.53 | 29.08% | 25.20% | 89.22% | 22 |
+| 内核 | Duration(us) | Compute(SM) | DRAM | Memory | Achieved Occupancy | Reg/Thr |
+|:----|:-----------:|:-----------:|:----:|:------:|:------------------:|:-------:|
+| `L2NormKernel` (v0) | 402.53 | 29.08% | 25.20% | — | 89.22% | 22 |
+| `FusedL2NormKernel` (v1) | 225.24 | 20.76% | 4.31% | 11.81% | 67.13%¹ | 36 |
+| `FusedL2NormV2Kernel` (v2) | 238.10 | 12.96% | 5.34% | 10.59% | 55.21%¹ | 48 |
+
+¹ v1/v2 Occupancy 为小规模测试数据，大规模时更高（v1 最高 91%，v2 最高 77%）。
 
 Occupancy 很高，算存较均衡，受归约与访存共同限制。v1/v2 通过减少同步与 ILP 优化提升计算占比。
 
 ---
+
+## Warp Stall 原因分析
+
+| 版本 | #1 Stall | #2 Stall | #3 Stall | #4 Stall | #5 Stall |
+|:----|:---------|:---------|:---------|:---------|:---------|
+| v0 | Long Scoreboard 38.1% | Short Scoreboard 26.4% | Wait 20.7% | Not Selected 7.0% | Mio Throttle 5.2% |
+| v1 | Long Scoreboard 46.1% | Wait 24.2% | Short Scoreboard 17.0% | Not Selected 9.0% | Math Pipe Throttle 1.5% |
+| v2 | Long Scoreboard 35.4% | Short Scoreboard 27.9% | Wait 25.0% | No Instruction 5.6% | Not Selected 5.5% |
+
+三个版本的 stall 分布较为均衡，Long Scoreboard、Short Scoreboard、Wait 三者合计占比约 85-90%，说明 L2 Norm 的瓶颈是混合的：加载 x 行的全局内存延迟（Long Scoreboard）、缓存访问（Short Scoreboard）以及 warp shuffle 归约的同步等待（Wait）共同构成主要延迟来源。
 
 ## 构建
 

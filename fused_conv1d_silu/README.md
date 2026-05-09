@@ -252,6 +252,19 @@ $$
 
 说明：v2/v3 的 `Memory Throughput` 高而 `DRAM Throughput` 低，表示大量流量命中 L1/L2/SMEM，符合融合减少中间回写后的访问模式。
 
+---
+
+## Warp Stall 原因分析
+
+| 版本 | #1 Stall | #2 Stall | #3 Stall | #4 Stall | #5 Stall |
+|:----|:---------|:---------|:---------|:---------|:---------|
+| v0 | **Long Scoreboard 92.0%** | Wait 4.5% | Short Scoreboard 2.1% | Not Selected 0.7% | Math Pipe Throttle 0.4% |
+| v1 | **Long Scoreboard 99.0%** | Wait 0.9% | No Instruction 0.0% | Short Scoreboard 0.0% | — |
+| v2 | Long Scoreboard 58.6% | Wait 18.2% | Not Selected 9.9% | Short Scoreboard 8.3% | Math Pipe Throttle 3.2% |
+| v3 | **Long Scoreboard 69.3%** | Wait 15.7% | Short Scoreboard 6.0% | Not Selected 5.3% | Mio Throttle 2.2% |
+
+v0/v1 的 Long Scoreboard 占比极高（92-99%），说明大量时间花在等待全局内存加载。v2 降至 58.6%，因双 kernel 融合 + float4 减少了全局访问次数。v3 略有回升（69.3%），因其增加了 SMEM tiling 但权重矩阵加载仍为全局内存瓶颈。
+
 ## 8. PTX / SASS
 
 PTX 和 SASS 可在本地通过 `cuobjdump -ptx <binary>` 或 `cuobjdump -sass <binary>` 生成（`**/asm/` 已从版本控制中排除）：

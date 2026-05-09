@@ -59,34 +59,13 @@ __global__ void FusedL2NormKernel(
     const int nthreads = blockDim.x;
 
     // ------------------------------------------------------------------
-    // Phase 1: float4 向量化加载 x_row 到寄存器，同时累加平方和
+    // Phase 1: 加载 x_row 到寄存器，同时累加平方和
     // 使用寄存器而非 SMEM，消除 shared memory 延迟
+    // 由于 L2 Norm 是 memory-bound，无需 ILP 展开
     // ------------------------------------------------------------------
     float local_sum = 0.0f;
 
-    int h = tid;
-    // float4 主循环
-    for (; h + 4 <= H; h += nthreads * 4) {
-        float4 v;
-        if (h + nthreads * 0 < H) {
-            v.x = x_row[h + nthreads * 0];
-            local_sum += v.x * v.x;
-        }
-        if (h + nthreads * 1 < H) {
-            v.y = x_row[h + nthreads * 1];
-            local_sum += v.y * v.y;
-        }
-        if (h + nthreads * 2 < H) {
-            v.z = x_row[h + nthreads * 2];
-            local_sum += v.z * v.z;
-        }
-        if (h + nthreads * 3 < H) {
-            v.w = x_row[h + nthreads * 3];
-            local_sum += v.w * v.w;
-        }
-    }
-    // 尾部处理
-    for (h = tid; h < H; h += nthreads) {
+    for (int h = tid; h < H; h += nthreads) {
         float val = x_row[h];
         local_sum += val * val;
     }

@@ -163,8 +163,8 @@ __global__ void fused_gdr_v2_kernel(
             compute_two_heads_fma(
                 s_x,
                 W_decay + h0 * D, W_delta + h0 * D, W_state + h0 * D,
-                W_delta + ((h1 < H) ? h1 : h0) * D,
                 W_decay + ((h1 < H) ? h1 : h0) * D,
+                W_delta + ((h1 < H) ? h1 : h0) * D,
                 W_state + ((h1 < H) ? h1 : h0) * D,
                 b_decay[h0], b_delta[h0], b_state[h0],
                 b_decay[h1 < H ? h1 : h0],

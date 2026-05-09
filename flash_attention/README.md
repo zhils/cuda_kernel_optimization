@@ -113,11 +113,28 @@ Attention(Q, K, V) = softmax(Q @ K^T / sqrt(D)) @ V
 | `flash_attention_v0` | 599.97 | 0.69% | 2.46% | 11.53% | 33.04% | 40 | 多 kernel 分离路径，整体利用率低 |
 | `flash_attention_v1` | 705.70 | 0.81% | 0.19% | 0.81% | 16.67% | 72 | 当前 launch 网格太小（`Waves/SM≈0.01`），严重欠并行 |
 | `flash_attention_v2` | 551.23 | 65.09% | 0.08% | 65.09% | 27.01% | 37 | 当前为 fallback v2 内核，具备可分析的中等算力利用 |
+| `flash_attention_v3` | 76.28¹ | 1.07% | 0.82% | 1.06% | —³ | 96 | 2D Grid 消除外层 Q 循环，grid 并行度由 N/Br 决定 |
+| `flash_attention_v4` | 76.09¹ | 1.30% | 0.67% | 1.36% | —³ | 72 | Bank-free SMEM + ILP + FMA，Waves/SM 仍偏小 |
 
 补充：
 - 由于当前工具链无法汇编 WGMMA PTX，`flash_attention_v2` 暂时使用可移植 fallback kernel 保持可构建/可分析。
 - 原始报告：`data/ncu_reports/text/flash_attention_v0.txt`、`flash_attention_v1.txt`、`flash_attention_v2.txt`。
-- v3/v4 尚未完成 ncu profiling，预计 v3 Occupancy 提升至 ~60%，v4 compute throughput 进一步提升。
+- ¹ v3/v4 的 ncu 数据取自 B=1,H=1,N=64,D=32 小规模（grid=2 blocks，Waves/SM≈0.02）。随着 N 增大，grid blocks 增至 N/Br×B×H，Occupancy 和吞吐将大幅提升。
+- v3/v4 的大规模 profiling 可在本地运行 `NCU_QUICK=1 ncu --set basic ./build/bin/flash_attention_v3` 获得。
+
+---
+
+## Warp Stall 原因分析
+
+| 版本 | #1 Stall | #2 Stall | #3 Stall | #4 Stall | #5 Stall |
+|:----|:---------|:---------|:---------|:---------|:---------|
+| v0 | Short Scoreboard 38.9% | Long Scoreboard 31.7% | Wait 26.9% | No Instruction 1.2% | Not Selected 1.0% |
+| v1 | Long Scoreboard 52.7% | Not Selected 27.1% | Wait 18.3% | Short Scoreboard 1.2% | No Instruction 0.6% |
+| v2 | Long Scoreboard 52.7% | Not Selected 27.1% | Wait 18.3% | Short Scoreboard 1.2% | No Instruction 0.6% |
+| v3 | Short Scoreboard 40.7% | Wait 33.8% | No Instruction 15.0% | Not Selected 6.2% | Long Scoreboard 2.3% |
+| v4 | Long Scoreboard 47.2% | Short Scoreboard 31.6% | Wait 16.7% | Not Selected 3.7% | Math Pipe Throttle 0.3% |
+
+v0/v3 的 Short Scoreboard 较高，说明小规模测试时数据主要驻留在 L1/L2 缓存中，等待缓存加载而非全局内存。v1/v2/v4 以 Long Scoreboard 为主，符合大型 tile 多次加载 K/V 时受全局内存延迟限制的预期。
 
 ## 构建
 

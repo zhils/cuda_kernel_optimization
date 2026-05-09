@@ -149,6 +149,19 @@ SMEM 排布：
 
 ---
 
+## Warp Stall 原因分析
+
+| 版本 | #1 Stall | #2 Stall | #3 Stall | #4 Stall | #5 Stall |
+|:----|:---------|:---------|:---------|:---------|:---------|
+| v0 | **Long Scoreboard 97.4%** | Wait 2.5% | No Instruction 0.0% | Not Selected 0.0% | Short Scoreboard 0.0% |
+| v1 | Wait 34.7% | Long Scoreboard 31.0% | Short Scoreboard 21.3% | Mio Throttle 11.8% | No Instruction 1.2% |
+| v2 | **Long Scoreboard 81.8%** | Wait 8.7% | Short Scoreboard 8.4% | Mio Throttle 0.7% | No Instruction 0.4% |
+| v3 | **Long Scoreboard 78.7%** | Mio Throttle 11.0% | Short Scoreboard 8.8% | Wait 1.2% | Not Selected 0.2% |
+
+结论：v0 和 v2/v3 均以 Long Scoreboard 为主导（>78%），说明这些版本在等待全局内存加载完成。v1 的 Wait 占 34.7%，反映其 SMEM 协作阶段线程同步占比更高。
+
+---
+
 ## 5. PTX/SASS
 
 PTX 和 SASS 可在本地通过 `cuobjdump -ptx <binary>` 或 `cuobjdump -sass <binary>` 生成（`**/asm/` 已从版本控制中排除）。

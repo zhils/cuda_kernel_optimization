@@ -110,13 +110,27 @@ cmake --build build --target fused_gated_delta_rule_compensation_test
 
 `ncu --set basic`，`fused_gated_delta_rule_v0`：
 
-| 内核 | Duration(us) | Compute(SM) | DRAM | Achieved Occupancy | Reg/Thr |
-|:----|:-----------:|:-----------:|:----:|:------------------:|:-------:|
-| `RecurrentDeltaRuleKernel` | 814.21 | 2.28% | 31.69% | 16.53% | 40 |
+| 内核 | Duration(us) | Compute(SM) | DRAM | Memory | Achieved Occupancy | Reg/Thr |
+|:----|:-----------:|:-----------:|:----:|:------:|:------------------:|:-------:|
+| `RecurrentDeltaRuleKernel` (v0) | 814.21 | 2.28% | 31.69% | — | 16.53% | 40 |
+| `fused_gdr_v1_kernel` (v1) | 368.17¹ | 1.70% | 0.53% | 22.08% | 16.67% | 40 |
+| `fused_gdr_v2_kernel` (v2) | 145.94¹ | — | — | — | 8.33% | 78 |
+
+¹ v1 数值为 4×1024×512×256 配置，v2 为 8×2048×512×256 配置。
 
 时间维串行递推导致并行度受限，为延迟/带宽混合瓶颈。v1/v2 通过消除中间缓冲与 ILP 优化提升有效吞吐。
 
 ---
+
+## Warp Stall 原因分析
+
+| 版本 | #1 Stall | #2 Stall | #3 Stall | #4 Stall | #5 Stall |
+|:----|:---------|:---------|:---------|:---------|:---------|
+| v0 | **Long Scoreboard 86.3%** | Wait 10.8% | Short Scoreboard 2.0% | Not Selected 0.4% | Math Pipe Throttle 0.3% |
+| v1 | **Long Scoreboard 96.7%** | Wait 3.0% | No Instruction 0.1% | Short Scoreboard 0.1% | Math Pipe Throttle 0.1% |
+| v2 | **Long Scoreboard 96.6%** | Wait 2.9% | Short Scoreboard 0.4% | No Instruction 0.1% | — |
+
+三个版本均以 Long Scoreboard 占绝对主导（86-97%），反映 Gated Delta Rule 的时间维串行递推特性：每个时间步都要从全局内存重新读取权重矩阵，每次读取都触发大量长延迟全局加载。v1/v2 的融合优化减小了中间缓冲的读写，但对权重矩阵的全局加载没有改善。
 
 ## 构建
 

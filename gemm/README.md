@@ -247,6 +247,21 @@ k=16，每条指令做 2×16×16 = 512 对乘加 = 1024 FLOPs，是 TF32 的 2 �
 
 ---
 
+## Warp Stall 原因分析
+
+| 版本 | #1 Stall | #2 Stall | #3 Stall | #4 Stall | #5 Stall |
+|:----|:---------|:---------|:---------|:---------|:---------|
+| v0 | Long Scoreboard 79.8% | Not Selected 12.0% | Wait 7.9% | No Instruction 0.2% | Math Pipe Throttle 0.1% |
+| v1 | Mio Throttle 43.5% | Long Scoreboard 40.2% | Not Selected 7.6% | Wait 5.6% | Short Scoreboard 2.7% |
+| v2 | Long Scoreboard 52.5% | Short Scoreboard 20.5% | Not Selected 16.3% | Wait 6.5% | Mio Throttle 2.2% |
+| v3 | Long Scoreboard 46.4% | Not Selected 25.8% | Short Scoreboard 13.1% | Mio Throttle 6.9% | Wait 5.8% |
+| v4 | **Math Pipe Throttle 72.9%** | Wait 15.7% | Long Scoreboard 6.5% | Not Selected 2.7% | Short Scoreboard 0.9% |
+| fp16 | Long Scoreboard 46.8% | Short Scoreboard 20.2% | Math Pipe Throttle 16.1% | Wait 9.1% | Mio Throttle 6.7% |
+
+v4 的 Math Pipe Throttle 占 72.9%，说明 Tensor Core WMMA 指令已完全占满计算管道，瓶颈在计算而非访存，与 Nsight 分析中 Compute Throughput 低但 occupancy 受限的结论一致。v0-v3 以 Long Scoreboard 为主，符合 memory-bound 预期。
+
+---
+
 ## 5. PTX/SASS 关键指令
 
 所有 kernel 的 PTX 和 SASS 可在本地通过 `nvcc --ptx` 或 `--cubin` 生成（`**/asm/` 已从版本控制中排除）。

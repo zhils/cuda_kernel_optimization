@@ -53,3 +53,15 @@ cd ..
 | `q_path_fusion_v2` | `RMSNormKernel` | 697.89 | 17.81% | 81.28% | 81.28% | 95.80% | 18 | 以 RMSNorm 阶段的带宽瓶颈为主 |
 
 原始报告：`data/ncu_reports/text/q_path_fusion_v0.txt`、`q_path_fusion_v1.txt`、`q_path_fusion_v2.txt`。
+
+---
+
+## Warp Stall 原因分析
+
+| 版本 | #1 Stall | #2 Stall | #3 Stall | #4 Stall | #5 Stall |
+|:----|:---------|:---------|:---------|:---------|:---------|
+| v0 | **Long Scoreboard 79.7%** | Mio Throttle 7.9% | Wait 5.5% | Short Scoreboard 3.9% | Not Selected 2.7% |
+| v1 | **Long Scoreboard 80.2%** | Mio Throttle 7.5% | Wait 5.5% | Short Scoreboard 3.9% | Not Selected 2.5% |
+| v2 | Mio Throttle 27.2% | Short Scoreboard 26.8% | Long Scoreboard 15.4% | Not Selected 12.9% | No Instruction 8.5% |
+
+v0/v1 以 Long Scoreboard 占主导（~80%），v2 的 stall 分布更均匀——Mio Throttle 27.2% + Short Scoreboard 26.8% + Long Scoreboard 15.4%。这与 v2 的瓶颈阶段变化一致：融合后的 RMSNorm 阶段成为带宽瓶颈，其 stall 模式从单纯等待全局内存过渡到 MIO 管道拥塞和缓存访问延迟的混合模式。

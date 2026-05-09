@@ -76,14 +76,14 @@ __global__ void FusedL2NormV2Kernel(
         for (; h + kILP * nthreads <= H; h += kILP * nthreads) {
             #pragma unroll
             for (int i = 0; i < kILP; ++i) {
-                val0[i] = row_ptr0[h + i * nthreads + 0];
+                val0[i] = row_ptr0[h + i];
                 sum0[i] = __fmaf_rn(val0[i], val0[i], sum0[i]);
             }
         }
         // 尾部：处理剩余元素
         #pragma unroll
-        for (int i = 0; i < kILP && h + i * nthreads < H; ++i) {
-            val0[i] = row_ptr0[h + i * nthreads + 0];
+        for (int i = 0; i < kILP && h + i < H; ++i) {
+            val0[i] = row_ptr0[h + i];
             sum0[i] = __fmaf_rn(val0[i], val0[i], sum0[i]);
         }
     }
@@ -95,13 +95,13 @@ __global__ void FusedL2NormV2Kernel(
         for (; h + kILP * nthreads <= H; h += kILP * nthreads) {
             #pragma unroll
             for (int i = 0; i < kILP; ++i) {
-                val1[i] = row_ptr1[h + i * nthreads + 0];
+                val1[i] = row_ptr1[h + i];
                 sum1[i] = __fmaf_rn(val1[i], val1[i], sum1[i]);
             }
         }
         #pragma unroll
-        for (int i = 0; i < kILP && h + i * nthreads < H; ++i) {
-            val1[i] = row_ptr1[h + i * nthreads + 0];
+        for (int i = 0; i < kILP && h + i < H; ++i) {
+            val1[i] = row_ptr1[h + i];
             sum1[i] = __fmaf_rn(val1[i], val1[i], sum1[i]);
         }
     }
@@ -171,14 +171,14 @@ __global__ void FusedL2NormV2Kernel(
         for (; h + kILP * nthreads <= H; h += kILP * nthreads) {
             #pragma unroll
             for (int i = 0; i < kILP; ++i) {
-                float v = row_ptr0[h + i * nthreads + 0];
-                out_ptr0[h + i * nthreads + 0] = v * inv_norm0;
+                float v = row_ptr0[h + i];
+                out_ptr0[h + i] = v * inv_norm0;
             }
         }
         #pragma unroll
-        for (int i = 0; i < kILP && h + i * nthreads < H; ++i) {
-            float v = row_ptr0[h + i * nthreads + 0];
-            out_ptr0[h + i * nthreads + 0] = v * inv_norm0;
+        for (int i = 0; i < kILP && h + i < H; ++i) {
+            float v = row_ptr0[h + i];
+            out_ptr0[h + i] = v * inv_norm0;
         }
     }
 
@@ -189,14 +189,14 @@ __global__ void FusedL2NormV2Kernel(
         for (; h + kILP * nthreads <= H; h += kILP * nthreads) {
             #pragma unroll
             for (int i = 0; i < kILP; ++i) {
-                float v = row_ptr1[h + i * nthreads + 0];
-                out_ptr1[h + i * nthreads + 0] = v * inv_norm1;
+                float v = row_ptr1[h + i];
+                out_ptr1[h + i] = v * inv_norm1;
             }
         }
         #pragma unroll
-        for (int i = 0; i < kILP && h + i * nthreads < H; ++i) {
-            float v = row_ptr1[h + i * nthreads + 0];
-            out_ptr1[h + i * nthreads + 0] = v * inv_norm1;
+        for (int i = 0; i < kILP && h + i < H; ++i) {
+            float v = row_ptr1[h + i];
+            out_ptr1[h + i] = v * inv_norm1;
         }
     }
 }

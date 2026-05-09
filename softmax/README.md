@@ -119,6 +119,19 @@ out.w = __expf(d.w - row_max) * inv;
 
 ---
 
+## Warp Stall 原因分析
+
+| 版本 | #1 Stall | #2 Stall | #3 Stall | #4 Stall | #5 Stall |
+|:----|:---------|:---------|:---------|:---------|:---------|
+| v0 | **Long Scoreboard 97.4%** | Wait 1.4% | Short Scoreboard 1.1% | No Instruction 0.1% | — |
+| v1 | **Wait 49.3%** | Short Scoreboard 32.1% | Long Scoreboard 10.7% | Mio Throttle 6.5% | No Instruction 1.4% |
+| v2 | **Long Scoreboard 73.6%** | Wait 13.0% | Short Scoreboard 11.7% | No Instruction 0.9% | Mio Throttle 0.9% |
+| v3 | **Long Scoreboard 79.1%** | Wait 13.2% | Short Scoreboard 6.4% | No Instruction 0.9% | Math Pipe Throttle 0.2% |
+
+v1 的 #1 stall 为 Wait（49.3%），因其 SMEM staging + warp shuffle 方案导致线程间高度同步依赖，大量时间等待其他 warp 完成。v0/v2/v3 均以 Long Scoreboard 为主，核心瓶颈在全局内存访问延迟。
+
+---
+
 ## 关键 PTX 指令
 
 | 操作 | PTX 指令 |
