@@ -14,20 +14,20 @@
 #include "common/cuda_utils.h"
 
 // ============================================================================
-// Fused Output Norm Gate v0: Naive baseline (separate kernels per step)
+// Fused Output Norm Gate v0（朴素基线）
 // ============================================================================
-// Operations:
-//   1. Gate_Projection + SiLU: x(B,L,D_in) -> gate(B,L,H)
-//   2. RMSNorm: gate(B,L,H) -> x_hat(B,L,H)
-//   3. Multiply_Gate: x_hat * gate -> y(B,L,H)
-//   4. Linear(out_proj): y(B,L,H) -> output(B,L,D_out)
+// 拆成四步：
+// 1) Gate Projection + SiLU: x(B,L,D_in) -> gate(B,L,H)
+// 2) RMSNorm:                gate(B,L,H) -> x_hat(B,L,H)
+// 3) Multiply Gate:          x_hat * gate -> y(B,L,H)
+// 4) Linear(out_proj):       y(B,L,H) -> output(B,L,D_out)
 // ============================================================================
 
 constexpr float kEps = 1e-6f;
 
 // ----------------------------------------------------------------------------
-// Kernel 1: Gate Projection + SiLU
-// Each block processes one (b, t) token, threads compute output features
+// Kernel 1：Gate Projection + SiLU
+// 一个 block 处理一个 (b,t)，线程并行处理不同 h
 // ----------------------------------------------------------------------------
 __global__ void GateProjectionSiLUKernel(const float* __restrict__ x,
                                          const float* __restrict__ W_gate,
@@ -52,8 +52,8 @@ __global__ void GateProjectionSiLUKernel(const float* __restrict__ x,
 }
 
 // ----------------------------------------------------------------------------
-// Kernel 2: RMSNorm
-// Each block processes one (b, t) row, threads cooperate to compute RMS
+// Kernel 2：RMSNorm
+// 一个 block 处理一行 (b,t)，线程协作归约平方和
 // ----------------------------------------------------------------------------
 __global__ void RMSNormKernel(const float* __restrict__ gate,
                               const float* __restrict__ g,
@@ -93,7 +93,7 @@ __global__ void RMSNormKernel(const float* __restrict__ gate,
 }
 
 // ----------------------------------------------------------------------------
-// Kernel 3: Multiply Gate (element-wise)
+// Kernel 3：逐元素门控相乘
 // ----------------------------------------------------------------------------
 __global__ void MultiplyGateKernel(const float* __restrict__ x_hat,
                                    const float* __restrict__ gate,
@@ -105,8 +105,8 @@ __global__ void MultiplyGateKernel(const float* __restrict__ x_hat,
 }
 
 // ----------------------------------------------------------------------------
-// Kernel 4: Linear Output Projection
-// Each block processes one (b, t) token, threads compute output features
+// Kernel 4：输出投影
+// 一个 block 处理一个 (b,t)，线程并行处理不同 d_out
 // ----------------------------------------------------------------------------
 __global__ void LinearOutputKernel(const float* __restrict__ y,
                                    const float* __restrict__ W_out,
@@ -140,7 +140,7 @@ static void OutputNormGate_CPU(const float* x,
   std::vector<float> x_hat(B * L * H);
   std::vector<float> y(B * L * H);
 
-  // Step 1: Gate Projection + SiLU
+  // 1) Gate Projection + SiLU
   for (int b = 0; b < B; ++b) {
     for (int t = 0; t < L; ++t) {
       const float* x_bt = x + (b * L + t) * D_in;
@@ -156,7 +156,7 @@ static void OutputNormGate_CPU(const float* x,
     }
   }
 
-  // Step 2: RMSNorm
+  // 2) RMSNorm
   for (int b = 0; b < B; ++b) {
     for (int t = 0; t < L; ++t) {
       int offset = (b * L + t) * H;
@@ -171,12 +171,12 @@ static void OutputNormGate_CPU(const float* x,
     }
   }
 
-  // Step 3: Multiply Gate
+  // 3) Multiply Gate
   for (int i = 0; i < B * L * H; ++i) {
     y[i] = x_hat[i] * gate[i];
   }
 
-  // Step 4: Linear Output Projection
+  // 4) Linear Output Projection
   for (int b = 0; b < B; ++b) {
     for (int t = 0; t < L; ++t) {
       const float* y_bt = y.data() + (b * L + t) * H;

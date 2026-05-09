@@ -10,11 +10,68 @@
 
 #include "common/benchmark.h"
 #include "common/cuda_utils.h"
-#include "q_path_fusion_kernels.cuh"
 
+// 用固定模式初始化向量，保证每次 benchmark 可复现。
 static void InitVector(std::vector<float>& vec) {
   for (size_t i = 0; i < vec.size(); ++i) {
     vec[i] = static_cast<float>((i * 17 + 13) % 1000) * 0.001f;
+  }
+}
+
+constexpr int QPF_BLOCK_SIZE = 256;
+
+__global__ void QPathFusionV1Kernel(
+    const float* __restrict__ x,
+    const float* __restrict__ gamma,
+    const float* __restrict__ wq,
+    const float* __restrict__ bq,
+    float* __restrict__ q,
+    int rows,
+    int cols,
+    float eps) {
+  const int row = blockIdx.x;
+  if (row >= rows) return;
+  const int tx = threadIdx.x;
+
+  // v1 仍是单 kernel：RMSNorm + Linear
+  extern __shared__ float s_norm[];
+  __shared__ float s_reduce[QPF_BLOCK_SIZE];
+  __shared__ float s_inv_rms;
+
+  const float* x_row = x + static_cast<size_t>(row) * cols;
+  float* q_row = q + static_cast<size_t>(row) * cols;
+
+  // 1) 每个线程先累计自己负责的平方和
+  float part = 0.0f;
+  for (int c = tx; c < cols; c += blockDim.x) {
+    float v = x_row[c];
+    part += v * v;
+  }
+  s_reduce[tx] = part;
+  __syncthreads();
+  for (int stride = blockDim.x >> 1; stride > 0; stride >>= 1) {
+    if (tx < stride) s_reduce[tx] += s_reduce[tx + stride];
+    __syncthreads();
+  }
+  if (tx == 0) {
+    s_inv_rms = rsqrtf(s_reduce[0] / static_cast<float>(cols) + eps);
+  }
+  __syncthreads();
+
+  // 2) 写入归一化后的临时向量
+  const float inv = s_inv_rms;
+  for (int c = tx; c < cols; c += blockDim.x) {
+    s_norm[c] = x_row[c] * inv * gamma[c];
+  }
+  __syncthreads();
+
+  // 3) 输出列按线程条带分配，减少写回冲突
+  for (int out_col = tx; out_col < cols; out_col += blockDim.x) {
+    float acc = bq[out_col];
+    for (int k = 0; k < cols; ++k) {
+      acc += s_norm[k] * wq[static_cast<size_t>(k) * cols + out_col];
+    }
+    q_row[out_col] = acc;
   }
 }
 
@@ -76,6 +133,7 @@ int main() {
       QPathFusionCPU(x.data(), gamma.data(), wq.data(), bq.data(), q_cpu.data(), rows, cols, kEps);
     }
 
+    // 设备内存
     float *dx = nullptr, *dgamma = nullptr, *dwq = nullptr, *dbq = nullptr, *dq = nullptr;
     CHECK_CUDA(cudaMalloc(&dx, n * sizeof(float)));
     CHECK_CUDA(cudaMalloc(&dgamma, cols * sizeof(float)));
@@ -90,6 +148,7 @@ int main() {
     dim3 grid(rows);
     dim3 block(QPF_BLOCK_SIZE);
     const size_t smem_size = static_cast<size_t>(cols) * sizeof(float);
+
     QPathFusionV1Kernel<<<grid, block, smem_size>>>(
         dx, dgamma, dwq, dbq, dq, rows, cols, kEps);
     CHECK_CUDA(cudaDeviceSynchronize());
@@ -105,6 +164,7 @@ int main() {
     CHECK_CUDA(cudaEventRecord(stop));
     CHECK_CUDA(cudaEventSynchronize(stop));
     CHECK_CUDA(cudaGetLastError());
+
     float total_ms = 0.0f;
     CHECK_CUDA(cudaEventElapsedTime(&total_ms, start, stop));
     const float gpu_ms = total_ms / static_cast<float>(kRepeat);

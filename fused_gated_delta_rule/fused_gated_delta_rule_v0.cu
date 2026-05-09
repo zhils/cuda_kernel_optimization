@@ -14,23 +14,24 @@
 #include "common/cuda_utils.h"
 
 // ============================================================================
-// Fused Gated Delta Rule v0: Naive baseline (separate kernels per step)
+// Fused Gated Delta Rule v0（朴素基线）
 // ============================================================================
-// Operations:
-//   1. Compute_Decay_Gate:  x(B,L,D) -> alpha(B,L,H)
-//   2. Compute_Delta_Gate:  x(B,L,D) -> delta(B,L,H)
-//   3. State_Projection:    x(B,L,D) -> u(B,L,H)
-//   4. Recurrent_Update:    alpha, delta, u -> output(B,L,H)
+// 拆成四步：
+// 1) decay gate:  x(B,L,D) -> alpha(B,L,H)
+// 2) delta gate:  x(B,L,D) -> delta(B,L,H)
+// 3) state proj:  x(B,L,D) -> u(B,L,H)
+// 4) recurrent:   alpha, delta, u -> output(B,L,H)
 //
-// Recurrent formula: s_t = alpha_t * s_{t-1} + delta_t * u_t
-//                    output_t = s_t
+// 递推公式：
+//   s_t = alpha_t * s_{t-1} + delta_t * u_t
+//   output_t = s_t
 // ============================================================================
 
 constexpr float kEps = 1e-6f;
 
 // ----------------------------------------------------------------------------
-// Kernel 1: Linear projection + activation (for decay/delta/state)
-// Each block processes one (b, t) token, threads compute output features
+// Kernel 1：线性投影 + 激活（复用同一套逻辑）
+// 一个 block 处理一个 (b, t)，线程并行处理不同 h
 // ----------------------------------------------------------------------------
 __global__ void LinearActivationKernel(const float* __restrict__ x,
                                        const float* __restrict__ W,
@@ -63,9 +64,8 @@ __global__ void LinearActivationKernel(const float* __restrict__ x,
 }
 
 // ----------------------------------------------------------------------------
-// Kernel 2: Recurrent Delta Rule Update
-// Each block processes one batch, threads process different features
-// Sequential over time steps (causal)
+// Kernel 2：递推更新
+// 每个线程负责一个 h，时间维 t 按顺序推进（因果）
 // ----------------------------------------------------------------------------
 __global__ void RecurrentDeltaRuleKernel(const float* __restrict__ alpha,
                                          const float* __restrict__ delta,
@@ -76,7 +76,7 @@ __global__ void RecurrentDeltaRuleKernel(const float* __restrict__ alpha,
   int h = threadIdx.x + blockIdx.y * blockDim.x;
   if (b_idx >= B || h >= H) return;
 
-  float s = 0.0f;  // initial state
+  float s = 0.0f;  // 初始状态
 
   for (int t = 0; t < L; ++t) {
     int idx = (b_idx * L + t) * H + h;
@@ -101,24 +101,24 @@ static void GatedDeltaRule_CPU(const float* x,
                                int B, int L, int D, int H) {
   std::vector<float> alpha(B * L * H), delta(B * L * H), u(B * L * H);
 
-  // Step 1-3: Linear projections + activations
+  // 1~3：线性投影 + 激活
   for (int b = 0; b < B; ++b) {
     for (int t = 0; t < L; ++t) {
       const float* x_bt = x + (b * L + t) * D;
       for (int h = 0; h < H; ++h) {
-        // Decay gate (sigmoid)
+        // decay gate（sigmoid）
         float a = b_decay[h];
         for (int d = 0; d < D; ++d) a += x_bt[d] * W_decay[h * D + d];
         a = 1.0f / (1.0f + std::exp(-a));
         alpha[(b * L + t) * H + h] = a;
 
-        // Delta gate (softplus)
+        // delta gate（softplus）
         float dlt = b_delta[h];
         for (int d = 0; d < D; ++d) dlt += x_bt[d] * W_delta[h * D + d];
         dlt = std::max(dlt, 0.0f) + std::log(1.0f + std::exp(-std::abs(dlt)));
         delta[(b * L + t) * H + h] = dlt;
 
-        // State projection (no activation)
+        // state projection（无激活）
         float v = b_state[h];
         for (int d = 0; d < D; ++d) v += x_bt[d] * W_state[h * D + d];
         u[(b * L + t) * H + h] = v;
@@ -126,7 +126,7 @@ static void GatedDeltaRule_CPU(const float* x,
     }
   }
 
-  // Step 4: Recurrent update
+  // 4：递推更新
   for (int b = 0; b < B; ++b) {
     for (int h = 0; h < H; ++h) {
       float s = 0.0f;
@@ -140,7 +140,7 @@ static void GatedDeltaRule_CPU(const float* x,
 }
 
 // ============================================================================
-// GPU Naive Implementation (separate kernels)
+// GPU 朴素实现：四步分别发 kernel
 // ============================================================================
 static void RunGpuV0(const float* d_x,
                      const float* d_W_decay, const float* d_b_decay,
@@ -152,17 +152,17 @@ static void RunGpuV0(const float* d_x,
   dim3 block(256);
   dim3 grid(B, L, (H + 255) / 256);
 
-  // 1. Decay gate (sigmoid)
+  // 1) decay gate（sigmoid）
   LinearActivationKernel<<<grid, block>>>(d_x, d_W_decay, d_b_decay, d_alpha,
                                           B, L, D, H, 1);
-  // 2. Delta gate (softplus)
+  // 2) delta gate（softplus）
   LinearActivationKernel<<<grid, block>>>(d_x, d_W_delta, d_b_delta, d_delta,
                                           B, L, D, H, 2);
-  // 3. State projection (no activation)
+  // 3) state projection（无激活）
   LinearActivationKernel<<<grid, block>>>(d_x, d_W_state, d_b_state, d_u,
                                           B, L, D, H, 0);
 
-  // 4. Recurrent update
+  // 4) recurrent update
   dim3 block_rec(256);
   dim3 grid_rec(B, (H + 255) / 256);
   RecurrentDeltaRuleKernel<<<grid_rec, block_rec>>>(d_alpha, d_delta, d_u,

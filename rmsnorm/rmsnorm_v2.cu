@@ -1,4 +1,5 @@
-// RMSNorm V2: 在 V1 基础上, 使用 Warp 归约计算 sq_sum
+// RMSNorm V2
+// 在 v1 的基础上，改为 warp shuffle 归约平方和，减少 lane0 串行路径。
 
 #include <cuda_runtime.h>
 
@@ -47,11 +48,15 @@ int main() {
   for (int i = 0; i < kTestCases; ++i) {
     auto cfg = rmsnorm::RandomTestConfig(2026 + i);
     int rows = cfg.rows, cols = cfg.cols, n = rows * cols;
+
+    // ---------------- host 数据 + CPU 参考 ----------------
     std::vector<float> x = rmsnorm::RandomMatrix(rows, cols, 2026 + i);
     std::vector<float> w = rmsnorm::RandomWeight(cols, 2026 + i + 100);
     std::vector<float> cpu(n), gpu(n);
     RMSNormCPU(x.data(), cpu.data(), w.data(), rows, cols, EPS);
 
+
+    // ---------------- 设备内存 ----------------
     float *dx, *dy, *dw;
     CHECK_CUDA(cudaMalloc(&dx, n * sizeof(float)));
     CHECK_CUDA(cudaMalloc(&dy, n * sizeof(float)));
@@ -59,6 +64,8 @@ int main() {
     CHECK_CUDA(cudaMemcpy(dx, x.data(), n * sizeof(float), cudaMemcpyHostToDevice));
     CHECK_CUDA(cudaMemcpy(dw, w.data(), cols * sizeof(float), cudaMemcpyHostToDevice));
 
+
+    // ---------------- warmup + benchmark ----------------
     const size_t smem_size = RMSNORM_WARPS_PER_BLOCK * cols * sizeof(float);
     CHECK_CUDA(cudaFuncSetAttribute(RMSNormV2Kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
 
@@ -80,6 +87,8 @@ int main() {
     CHECK_CUDA(cudaEventElapsedTime(&gpu_ms_total, s, e));
     const float gpu_ms = gpu_ms_total / static_cast<float>(kRepeat);
 
+
+    // ---------------- 回拷与校验 ----------------
     CHECK_CUDA(cudaMemcpy(gpu.data(), dy, n * sizeof(float), cudaMemcpyDeviceToHost));
     bool ok = common::CheckEqual(cpu, gpu, 1e-4f);
 
@@ -94,6 +103,8 @@ int main() {
     ofs << i << "," << rows << "," << cols << "," << gpu_ms << "," << bw << ","
         << common::MaxAbsDiff(cpu, gpu) << "," << (ok ? "PASS" : "FAIL") << "\n";
 
+
+    // ---------------- 释放资源 ----------------
     CHECK_CUDA(cudaEventDestroy(s));
     CHECK_CUDA(cudaEventDestroy(e));
     CHECK_CUDA(cudaFree(dx));

@@ -10,11 +10,69 @@
 
 #include "common/benchmark.h"
 #include "common/cuda_utils.h"
-#include "q_path_fusion_kernels.cuh"
 
+// 用固定模式初始化向量，保证每次 benchmark 可复现。
 static void InitVector(std::vector<float>& vec) {
   for (size_t i = 0; i < vec.size(); ++i) {
     vec[i] = static_cast<float>((i * 17 + 13) % 1000) * 0.001f;
+  }
+}
+
+constexpr int QPF_BLOCK_SIZE = 256;
+
+__global__ void QPathFusionV0Kernel(
+    const float* __restrict__ x,
+    const float* __restrict__ gamma,
+    const float* __restrict__ wq,
+    const float* __restrict__ bq,
+    float* __restrict__ q,
+    int rows,
+    int cols,
+    float eps) {
+  const int row = blockIdx.x;
+  if (row >= rows) return;
+  const int tx = threadIdx.x;
+
+  // 共享内存：先缓存 norm，再做线性层。
+  extern __shared__ float s_norm[];
+  __shared__ float s_reduce[QPF_BLOCK_SIZE];
+  __shared__ float s_inv_rms;
+
+  const float* x_row = x + static_cast<size_t>(row) * cols;
+  float* q_row = q + static_cast<size_t>(row) * cols;
+
+  // 1) 先做 RMSNorm 的平方和归约
+  float part = 0.0f;
+  for (int c = tx; c < cols; c += blockDim.x) {
+    float v = x_row[c];
+    part += v * v;
+  }
+  s_reduce[tx] = part;
+  __syncthreads();
+
+  for (int stride = blockDim.x >> 1; stride > 0; stride >>= 1) {
+    if (tx < stride) s_reduce[tx] += s_reduce[tx + stride];
+    __syncthreads();
+  }
+  if (tx == 0) {
+    s_inv_rms = rsqrtf(s_reduce[0] / static_cast<float>(cols) + eps);
+  }
+  __syncthreads();
+
+  // 2) 归一化并乘 gamma
+  const float inv = s_inv_rms;
+  for (int c = tx; c < cols; c += blockDim.x) {
+    s_norm[c] = x_row[c] * inv * gamma[c];
+  }
+  __syncthreads();
+
+  // 3) 线性层：q = norm * wq + bq
+  for (int out_col = tx; out_col < cols; out_col += blockDim.x) {
+    float acc = bq[out_col];
+    for (int k = 0; k < cols; ++k) {
+      acc += s_norm[k] * wq[static_cast<size_t>(k) * cols + out_col];
+    }
+    q_row[out_col] = acc;
   }
 }
 
@@ -68,6 +126,7 @@ int main() {
     const size_t mat = static_cast<size_t>(cols) * static_cast<size_t>(cols);
 
     std::vector<float> x(n), gamma(cols), wq(mat), bq(cols), q_cpu(n), q_gpu(n);
+
     common::InitMatrix(x, rows, cols);
     InitVector(gamma);
     common::InitMatrix(wq, cols, cols);
@@ -78,6 +137,7 @@ int main() {
       QPathFusionCPU(x.data(), gamma.data(), wq.data(), bq.data(), q_cpu.data(), rows, cols, kEps);
     }
 
+    // 设备内存
     float *dx = nullptr, *dgamma = nullptr, *dwq = nullptr, *dbq = nullptr, *dq = nullptr;
     CHECK_CUDA(cudaMalloc(&dx, n * sizeof(float)));
     CHECK_CUDA(cudaMalloc(&dgamma, cols * sizeof(float)));
@@ -93,6 +153,7 @@ int main() {
     dim3 block(QPF_BLOCK_SIZE);
     const size_t smem_size = static_cast<size_t>(block.x) * sizeof(float);
 
+    // 先跑一次，确认 kernel 正常
     QPathFusionV0Kernel<<<grid, block, smem_size>>>(dx, dgamma, dwq, dbq, dq, rows, cols, kEps);
     CHECK_CUDA(cudaDeviceSynchronize());
 
@@ -107,6 +168,7 @@ int main() {
     CHECK_CUDA(cudaEventSynchronize(stop));
     CHECK_CUDA(cudaGetLastError());
 
+    // 回拷 + 校验
     float total_ms = 0.0f;
     CHECK_CUDA(cudaEventElapsedTime(&total_ms, start, stop));
     const float gpu_ms = total_ms / static_cast<float>(kRepeat);

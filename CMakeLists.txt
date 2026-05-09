@@ -5,7 +5,7 @@ set(CMAKE_CUDA_STANDARD 17)
 set(CMAKE_CXX_STANDARD 17)
 
 if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
-    set(CMAKE_CUDA_ARCHITECTURES native)
+    set(CMAKE_CUDA_ARCHITECTURES 120)
 endif()
 
 if(NOT CMAKE_BUILD_TYPE)
@@ -22,3 +22,9 @@ add_subdirectory(flash_attention)
 add_subdirectory(fused_l2_norm_qk)
 add_subdirectory(fused_gated_delta_rule)
 add_subdirectory(fused_output_norm_gate)
+
+# 统一测试框架（可选，默认不构建）
+option(BUILD_TESTS "Build unified test framework" OFF)
+if(BUILD_TESTS)
+    add_subdirectory(tests)
+endif()

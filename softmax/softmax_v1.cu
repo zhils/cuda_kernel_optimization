@@ -1,10 +1,10 @@
-// Softmax V1: 在 V0 基础上增加向量化加载和共享内存缓存
+// Softmax V1
 //
-// 核心设计:
-// - 1维 block: 128 线程 = 4 个 warp，每个 warp 处理一行数据
-// - 共享内存缓存: exp 结果存入共享内存，避免全局内存中间读写
-// - 串行归约: 每个 warp 的 lane 0 串行计算 max 和 sum
-// - float4 向量化: 使用 float4 加载和写回，提升内存带宽
+// 核心设计：
+// - 1D block（128 线程 = 4 warp），每个 warp 对应一行
+// - 数据先放共享内存，减少中间访存
+// - lane 0 串行完成该行 max/sum
+// - float4 向量化加载与写回
 
 #include <cuda_runtime.h>
 
@@ -82,6 +82,8 @@ __global__ void SoftmaxV1Kernel(const float* __restrict__ x, float* __restrict__
     }
 }
 
+#ifndef PYTORCH_EXTENSION
+
 static void SoftmaxCPU(const float* x, float* y, int rows, int cols) {
     for (int r = 0; r < rows; ++r) {
         float maxv = x[r * cols];
@@ -158,3 +160,5 @@ int main() {
     }
     return 0;
 }
+
+#endif  // PYTORCH_EXTENSION

@@ -212,10 +212,10 @@ $$
 
 ### 5.2 每一个 GPU 融合算子的设计都应该回答的问题
 
-本项目的 [notes/02_operator_fusion_guide.md](../notes/02_operator_fusion_guide.md) 系统性地分析了算子融合的判断标准和评估方法，提出了判断融合价值的三个关键指标：
-1. 中间张量规模与 DRAM 带宽的比值（决定融合带来的访存节省）
-2. 融合后 kernel 的并行度与原始分离方案的对比（决定是否会引入新的瓶颈）
-3. 融合后 kernel 的寄存器压力与共享内存占用（决定实际可达的占用率）
+算子融合的核心判断标准：
+1. **中间张量规模与 DRAM 带宽的比值**（决定融合带来的访存节省）
+2. **融合后 kernel 的并行度与原始分离方案的对比**（决定是否会引入新的瓶颈）
+3. **融合后 kernel 的寄存器压力与共享内存占用**（决定实际可达的占用率）
 
 ### 5.3 优化策略的有效性排名
 
@@ -238,51 +238,33 @@ $$
 - **结果 CSV：** `data/results/fused_conv1d_silu_v0_results.csv` … `v3_results.csv`
 - **CUDA 架构：** RTX 5060 Ti，Compute Capability **sm_120**，CUDA 13.2
 
-## 7. Nsight Compute 瓶颈分析
+## 7. Nsight Compute 瓶颈分析（2026-05-09）
 
-使用 `ncu --set basic` profiling（B=8, L=2048, D=512, H=256）：
+命令：`ncu --set basic --target-processes all --kernel-name-base demangled`。  
+统计口径：各版本取 Duration 最大的一次 launch。
 
-### Kernel A（ComputeQKVZKernel）：4 次线性投影 + SplitQKV
+| 版本 | 代表内核 | Max Duration(us) | Compute(SM) | DRAM | Memory | Achieved Occupancy | Reg/Thr | 结论 |
+|:-----|:---------|-----------------:|------------:|-----:|-------:|-------------------:|--------:|:-----|
+| `v0` | `FusedSingleKernel` | 485.70 | 1.70% | 0.68% | 21.87% | 16.14% | 44 | 利用率低，分离路径开销明显 |
+| `v1` | `FusedKernel` | 510.85 | 1.67% | 0.92% | 21.43% | 16.55% | 168 | 融合后寄存器压力过高，仍低利用 |
+| `v2` | `ComputeQKVZKernel` | 698.75 | 4.13% | 0.56% | 90.63% | 62.08% | 56 | 访存系统高度活跃，片上/缓存流量主导 |
+| `v3` | `ComputeQKVZKernel` | 910.14 | 3.88% | 0.41% | 96.09% | 72.58% | 40 | 2D+SMEM 后 occupancy 更高，瓶颈偏访存 |
 
-| 版本 | Memory Throughput | DRAM Throughput | Compute Throughput | 主要瓶颈 |
-|:----|:-----------------:|:---------------:|:------------------:|:---------|
-| **v0** | ~35% | ~30% | ~30% | 多 kernel 启动开销 + 中间缓冲写回 |
-| **v3** | ~50% | ~25% | ~50% | 权重 W_qkv 的 non-coalesced 访问 |
+说明：v2/v3 的 `Memory Throughput` 高而 `DRAM Throughput` 低，表示大量流量命中 L1/L2/SMEM，符合融合减少中间回写后的访问模式。
 
-### Kernel B（ConvGateKernel）：因果卷积 + SiLU + 门控
+---
 
-| 版本 | Memory Throughput | 主要瓶颈 |
-|:----|:-----------------:|:---------|
-| v0 | ~20% | 大量分离 kernel 启动 + 中间缓冲 |
-| v3 | ~40% | z_proj 的 SMEM 缓存提升局部性 |
+## Warp Stall 原因分析
 
-**关键分析：**
-- **v0** 的瓶颈不在计算也不在带宽，而在于 5 个分离 kernel 的启动开销和 7 次中间缓冲写回
-- **v2/v3** 通过融合消除 6/7 的中间缓冲，有效吞吐提升明显
-- **v3 的 SMEM tiling** 将 x 的冗余读取从 256 次/block 降为 1 次，但权重矩阵 W_qkv（1.5MB）的 non-coalesced 访问仍是主要瓶颈
+| 版本 | #1 Stall | #2 Stall | #3 Stall | #4 Stall | #5 Stall |
+|:----|:---------|:---------|:---------|:---------|:---------|
+| v0 | **Long Scoreboard 92.0%** | Wait 4.5% | Short Scoreboard 2.1% | Not Selected 0.7% | Math Pipe Throttle 0.4% |
+| v1 | **Long Scoreboard 99.0%** | Wait 0.9% | No Instruction 0.0% | Short Scoreboard 0.0% | — |
+| v2 | Long Scoreboard 58.6% | Wait 18.2% | Not Selected 9.9% | Short Scoreboard 8.3% | Math Pipe Throttle 3.2% |
+| v3 | **Long Scoreboard 69.3%** | Wait 15.7% | Short Scoreboard 6.0% | Not Selected 5.3% | Mio Throttle 2.2% |
+
+v0/v1 的 Long Scoreboard 占比极高（92-99%），说明大量时间花在等待全局内存加载。v2 降至 58.6%，因双 kernel 融合 + float4 减少了全局访问次数。v3 略有回升（69.3%），因其增加了 SMEM tiling 但权重矩阵加载仍为全局内存瓶颈。
 
 ## 8. PTX / SASS
 
-PTX 和 SASS 文件位于 `fused_conv1d_silu/asm/` 下：
-
-```bash
-fused_conv1d_silu/asm/ptx/fused_conv1d_silu_v0.ptx
-fused_conv1d_silu/asm/ptx/fused_conv1d_silu_v3.ptx
-fused_conv1d_silu/asm/sass/fused_conv1d_silu_v0.cubin
-fused_conv1d_silu/asm/sass/fused_conv1d_silu_v3.cubin
-```
-
-## Nsight Compute 性能分析
-
-
-使用 `ncu --set basic` 对每个可执行文件的第一个 kernel launch 进行 profiling。
-运行环境：NVIDIA RTX 5060 Ti (Blackwell sm_120) | CUDA 13.2 | Nsight Compute 2026.1.1
-
-| 版本 | Kernel | Duration(us) | Compute% | MemBW% | L1% | L2% | Occupancy% | Reg/Thread | Block | Grid |
-|---|---|---|---|---|---|---|---|---|---|---|
-| fused_conv1d_silu_v0 | FusedConv1dSiluV0 (5 kernels) | 12.3 | 8.9% | 70.7% | 92.1% | 6.5% | 22.3% | 30 | 256 | 128 |
-| fused_conv1d_silu_v1 | FusedConv1dSiluV1 (fully fused) | 0.0 | 0.1% | 1.0% | 36.5% | 0.6% | 2.1% | 48 | 256 | 1 |
-| fused_conv1d_silu_v2 | FusedConv1dSiluV2 (2-kernel + vec4) | 10.7 | 2.3% | 27.1% | 73.7% | 4.7% | 16.4% | 48 | 256 | 16 |
-| fused_conv1d_silu_v3 | FusedConv1dSiluV3 (2D grid + SMEM) | 9.9 | 3.6% | 29.2% | 35.3% | 10.6% | 11.6% | 48 | 256 | 128 |
-**说明：** ncu `--set basic` 默认对程序的**第一个 kernel launch** 进行 profiling。对于 GEMM 等算子，这对应最小测试尺寸（128×128），GPU 远未饱和。因此表格中的 Compute% / MemBW% 表示的是**小尺寸下的资源利用率**，用于横向对比各版本的寄存器压力、occupancy 等结构性差异。大尺寸下的实际性能请参考各算子 README 中的完整 benchmark 表格。
-
+PTX 和 SASS 可在本地通过 `cuobjdump -ptx <binary>` 或 `cuobjdump -sass <binary>` 生成（`**/asm/` 已从版本控制中排除）：

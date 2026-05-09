@@ -14,28 +14,26 @@
 #include "common/cuda_utils.h"
 
 // ============================================================================
-// Fused Conv1D + SiLU v0: Naive baseline (separate kernels per op)
+// Fused Conv1D + SiLU v0（朴素基线）
 // ============================================================================
-// Operations:
-//   1. Linear(in_proj_qkv): x(B,L,D) @ W_qkv(D,3H) + b_qkv -> qkv(B,L,3H)
-//   2. Linear(in_proj_z):   x(B,L,D) @ W_z(D,H)   + b_z   -> z(B,L,H)
-//   3. Linear(in_proj_a):   x(B,L,D) @ W_a(D,H)   + b_a   -> a(B,L,H)
-//   4. Linear(in_proj_b):   x(B,L,D) @ W_b(D,H)   + b_b   -> b(B,L,H)
-//   5. Split qkv -> Q_raw, K_raw, V_raw (each B,L,H)
-//   6. CausalConv1d(z) + SiLU -> z_act
-//   7. CausalConv1d(a) + SiLU -> a_act
-//   8. CausalConv1d(b) + SiLU -> b_act
-//   9. V = V_raw * z_act
+// 这版是“全拆开”实现，便于对照后续融合版本：
+// 1) qkv 线性投影
+// 2) z 线性投影
+// 3) split qkv -> Q/K/V
+// 4) z 做 causal conv + SiLU
+// 5) V 与门控结果逐元素相乘
 // ============================================================================
 
 // ----------------------------------------------------------------------------
-// Kernel 1: Linear projection (GEMV per token)
+// Kernel 1：线性投影（每个 token 一次 GEMV）
 // ----------------------------------------------------------------------------
-__global__ void LinearKernel(const float* __restrict__ x,
-                             const float* __restrict__ W,
-                             const float* __restrict__ b,
-                             float* __restrict__ out,
-                             int B, int L, int D, int H_out) {
+__global__ void LinearKernel(
+  const float* __restrict__ x,
+  const float* __restrict__ W,
+  const float* __restrict__ b,
+  float* __restrict__ out,
+  int B, int L, int D, int H_out
+) {
   int b_idx = blockIdx.x;
   int t = blockIdx.y;
   int h = threadIdx.x + blockIdx.z * blockDim.x;
@@ -51,13 +49,15 @@ __global__ void LinearKernel(const float* __restrict__ x,
 }
 
 // ----------------------------------------------------------------------------
-// Kernel 2: Split qkv into Q, K, V
+// Kernel 2：把 qkv 拆成 Q / K / V
 // ----------------------------------------------------------------------------
-__global__ void SplitQKVKernel(const float* __restrict__ qkv,
-                                float* __restrict__ Q,
-                                float* __restrict__ K,
-                                float* __restrict__ V,
-                                int B, int L, int H) {
+__global__ void SplitQKVKernel(
+  const float* __restrict__ qkv,
+  float* __restrict__ Q,
+  float* __restrict__ K,
+  float* __restrict__ V,
+  int B, int L, int H
+) {
   int idx = blockIdx.x * blockDim.x + threadIdx.x;
   int total = B * L * H;
   if (idx >= total) return;
@@ -74,14 +74,16 @@ __global__ void SplitQKVKernel(const float* __restrict__ qkv,
 }
 
 // ----------------------------------------------------------------------------
-// Kernel 3: Causal Conv1D + SiLU
-// Input: u(B,L,H), kernel K(k_size, H)
-// Output: y(B,L,H) where y[t] = SiLU(sum_{i=0}^{min(t,k-1)} K[i] * u[t-i])
+// Kernel 3：Causal Conv1D + SiLU
+// 输入 u(B,L,H), 卷积核 K(k_size,H)
+// 输出 y(B,L,H), y[t] = SiLU(sum K[i] * u[t-i])
 // ----------------------------------------------------------------------------
-__global__ void CausalConv1dSiLUKernel(const float* __restrict__ u,
-                                       const float* __restrict__ K_conv,
-                                       float* __restrict__ y,
-                                       int B, int L, int H, int k_size) {
+__global__ void CausalConv1dSiLUKernel(
+  const float* __restrict__ u,
+  const float* __restrict__ K_conv,
+  float* __restrict__ y,
+  int B, int L, int H, int k_size
+) {
   int idx = blockIdx.x * blockDim.x + threadIdx.x;
   int total = B * L * H;
   if (idx >= total) return;
@@ -105,31 +107,35 @@ __global__ void CausalConv1dSiLUKernel(const float* __restrict__ u,
 }
 
 // ----------------------------------------------------------------------------
-// Kernel 4: Element-wise multiply V = V_raw * z_act
+// Kernel 4：逐元素门控，V = V_raw * z_act
 // ----------------------------------------------------------------------------
-__global__ void GateMulKernel(const float* __restrict__ V_raw,
-                              const float* __restrict__ gate,
-                              float* __restrict__ V_out,
-                              int total) {
+__global__ void GateMulKernel(
+  const float* __restrict__ V_raw,
+  const float* __restrict__ gate,
+  float* __restrict__ V_out,
+  int total
+) {
   int idx = blockIdx.x * blockDim.x + threadIdx.x;
   if (idx >= total) return;
   V_out[idx] = V_raw[idx] * gate[idx];
 }
 
 // ----------------------------------------------------------------------------
-// Kernel 5: Single fused kernel (qkv + z-conv-silu + v gate)
-// Mapping: one thread handles one (b, h), loops over t.
+// Kernel 5：单核融合（qkv + z_conv_silu + v_gate）
+// 映射：一个线程负责一个 (b,h)，在时间维 t 上顺序推进
 // ----------------------------------------------------------------------------
-__global__ void FusedSingleKernel(const float* __restrict__ x,
-                                  const float* __restrict__ W_qkv,
-                                  const float* __restrict__ b_qkv,
-                                  const float* __restrict__ W_z,
-                                  const float* __restrict__ b_z,
-                                  const float* __restrict__ K_conv,
-                                  float* __restrict__ Q,
-                                  float* __restrict__ K,
-                                  float* __restrict__ V,
-                                  int B, int L, int D, int H, int k_size) {
+__global__ void FusedSingleKernel(
+  const float* __restrict__ x,
+  const float* __restrict__ W_qkv,
+  const float* __restrict__ b_qkv,
+  const float* __restrict__ W_z,
+  const float* __restrict__ b_z,
+  const float* __restrict__ K_conv,
+  float* __restrict__ Q,
+  float* __restrict__ K,
+  float* __restrict__ V,
+  int B, int L, int D, int H, int k_size
+) {
   constexpr int kMaxKernelSize = 64;
   const int b_idx = blockIdx.x;
   const int h = blockIdx.y * blockDim.x + threadIdx.x;
@@ -179,14 +185,16 @@ __global__ void FusedSingleKernel(const float* __restrict__ x,
 // ============================================================================
 // CPU Reference Implementation
 // ============================================================================
-static void FusedConv1dSiLU_CPU(const float* x,
-                                const float* W_qkv, const float* b_qkv,
-                                const float* W_z, const float* b_z,
-                                const float* W_a, const float* b_a,
-                                const float* W_b, const float* b_b,
-                                const float* K_conv,
-                                float* Q, float* K, float* V,
-                                int B, int L, int D, int H, int k_size) {
+static void FusedConv1dSiLU_CPU(
+  const float* x,
+  const float* W_qkv, const float* b_qkv,
+  const float* W_z, const float* b_z,
+  const float* W_a, const float* b_a,
+  const float* W_b, const float* b_b,
+  const float* K_conv,
+  float* Q, float* K, float* V,
+  int B, int L, int D, int H, int k_size
+) {
   std::vector<float> qkv(B * L * 3 * H);
   std::vector<float> z(B * L * H), a(B * L * H), b_gate(B * L * H);
 
@@ -259,16 +267,18 @@ static void FusedConv1dSiLU_CPU(const float* x,
 // ============================================================================
 // GPU Naive Implementation (separate kernels)
 // ============================================================================
-static void RunGpuV0(const float* d_x,
-                     const float* d_W_qkv, const float* d_b_qkv,
-                     const float* d_W_z, const float* d_b_z,
-                     const float* d_W_a, const float* d_b_a,
-                     const float* d_W_b, const float* d_b_b,
-                     const float* d_K_conv,
-                     float* d_Q, float* d_K, float* d_V,
-                     float* d_qkv, float* d_z, float* d_a, float* d_b,
-                     float* d_z_act, float* d_a_act, float* d_b_act,
-                     int B, int L, int D, int H, int k_size) {
+static void RunGpuV0(
+  const float* d_x,
+  const float* d_W_qkv, const float* d_b_qkv,
+  const float* d_W_z, const float* d_b_z,
+  const float* d_W_a, const float* d_b_a,
+  const float* d_W_b, const float* d_b_b,
+  const float* d_K_conv,
+  float* d_Q, float* d_K, float* d_V,
+  float* d_qkv, float* d_z, float* d_a, float* d_b,
+  float* d_z_act, float* d_a_act, float* d_b_act,
+  int B, int L, int D, int H, int k_size
+) {
   // 1. Linear projections
   dim3 block_lin(256);
   dim3 grid_qkv(B, L, (3 * H + 255) / 256);
@@ -300,12 +310,14 @@ static void RunGpuV0(const float* d_x,
   GateMulKernel<<<grid_gatemul, block_gate>>>(d_V, d_z_act, d_V, total_v);
 }
 
-static void RunGpuV1SingleKernel(const float* d_x,
-                                 const float* d_W_qkv, const float* d_b_qkv,
-                                 const float* d_W_z, const float* d_b_z,
-                                 const float* d_K_conv,
-                                 float* d_Q, float* d_K, float* d_V,
-                                 int B, int L, int D, int H, int k_size) {
+static void RunGpuV1SingleKernel(
+  const float* d_x,
+  const float* d_W_qkv, const float* d_b_qkv,
+  const float* d_W_z, const float* d_b_z,
+  const float* d_K_conv,
+  float* d_Q, float* d_K, float* d_V,
+  int B, int L, int D, int H, int k_size
+) {
   const int block_size = 256;
   dim3 block(block_size);
   dim3 grid(B, (H + block_size - 1) / block_size);

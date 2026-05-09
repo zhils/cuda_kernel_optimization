@@ -1,12 +1,12 @@
-// Softmax V3: Online Softmax + 共享内存 Staging
+// Softmax V3
 //
-// 相比 V2 的改动:
-// 1. Online 算法: 单遍遍历，同时计算 max 和 sum
-// 2. 循环展开: #pragma unroll 展开内层循环
+// 这一版的重点是两件事：
+// 1) Online Softmax：单遍同时维护 row_max 和 row_sum
+// 2) 向量化 + 共享内存：先把一行搬到 smem，再做归约和写回
 //
-// 与 V2 的区别:
-// - V2: 两遍归约（先 max，再 sum）
-// - V3: Online 单遍归约（同时计算 max 和 sum）
+// 对比 v2：
+// - v2 是两遍（max 一遍 + sum 一遍）
+// - v3 把两遍合成一遍，减少同步和访存
 
 #include <cuda_runtime.h>
 
@@ -25,7 +25,7 @@
 #define BLOCK_SIZE (WARP_SIZE * WARPS_PER_BLOCK)
 
 __global__ void SoftmaxV3Kernel(
-    const float* __restrict__ x, 
+    const float* __restrict__ x,
     float* __restrict__ y,
     int rows, int cols
 ) {
@@ -103,6 +103,8 @@ __global__ void SoftmaxV3Kernel(
     }
 }
 
+#ifndef PYTORCH_EXTENSION
+
 static void SoftmaxCPU(const float* x, float* y, int rows, int cols) {
     for (int r = 0; r < rows; ++r) {
         float maxv = x[r * cols];
@@ -127,13 +129,12 @@ int main() {
     cudaDeviceProp prop;
     CHECK_CUDA(cudaGetDeviceProperties(&prop, 0));
     size_t max_smem = prop.sharedMemPerBlock;
-    
-    // Try to increase max dynamic shared memory to 96KB for sm120
+
     cudaFuncAttributes attr;
     CHECK_CUDA(cudaFuncGetAttributes(&attr, SoftmaxV3Kernel));
     size_t max_dyn_smem = max_smem;
     if (prop.major >= 12) {
-        max_dyn_smem = 96 * 1024;  // 96KB for sm120
+        max_dyn_smem = 96 * 1024;
         cudaError_t err = cudaFuncSetAttribute(SoftmaxV3Kernel,
                                                 cudaFuncAttributeMaxDynamicSharedMemorySize,
                                                 max_dyn_smem);
@@ -198,3 +199,5 @@ int main() {
     }
     return 0;
 }
+
+#endif  // PYTORCH_EXTENSION

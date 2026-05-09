@@ -14,20 +14,20 @@
 #include "common/cuda_utils.h"
 
 // ============================================================================
-// Fused L2 Norm Q/K v0: Naive baseline (separate kernels per tensor)
+// Fused L2 Norm Q/K v0（朴素基线）
 // ============================================================================
-// Operations:
-//   1. L2_Norm_Q: Q(B, N_q, H_q) -> Q_hat(B, N_q, H_q)
-//   2. L2_Norm_K: K(B, N_k, H_k) -> K_hat(B, N_k, H_k)
+// 两步分别做：
+// 1) Q 的 L2 归一化
+// 2) K 的 L2 归一化
 //
-// L2 Norm per row: x_hat = x / (sqrt(sum(x^2)) + eps)
+// 每一行：x_hat = x / (sqrt(sum(x^2)) + eps)
 // ============================================================================
 
 constexpr float kEps = 1e-6f;
 
 // ----------------------------------------------------------------------------
-// Kernel 1: L2 Normalize a 3D tensor (B, N, H)
-// Each block processes one (b, n) row, threads cooperate to compute sum of squares
+// Kernel：L2 归一化 3D 张量 (B, N, H)
+// 一个 block 处理一行 (b, n)，线程协作做平方和归约
 // ----------------------------------------------------------------------------
 __global__ void L2NormKernel(const float* __restrict__ X,
                              float* __restrict__ X_hat,
@@ -40,7 +40,7 @@ __global__ void L2NormKernel(const float* __restrict__ X,
   const float* x_row = X + row_offset;
   float* out_row = X_hat + row_offset;
 
-  // Step 1: Compute sum of squares using shared memory reduction
+  // 1) 先累计平方和
   __shared__ float s_sum[256];
   float local_sum = 0.0f;
   int tid = threadIdx.x;
@@ -52,7 +52,7 @@ __global__ void L2NormKernel(const float* __restrict__ X,
   s_sum[tid] = local_sum;
   __syncthreads();
 
-  // Warp shuffle reduction
+  // 2) block 内归约
   for (int offset = blockDim.x / 2; offset > 0; offset /= 2) {
     if (tid < offset) {
       s_sum[tid] += s_sum[tid + offset];
@@ -62,7 +62,7 @@ __global__ void L2NormKernel(const float* __restrict__ X,
 
   float norm = sqrtf(s_sum[0] + kEps);
 
-  // Step 2: Normalize each element
+  // 3) 用 norm 回写归一化结果
   for (int h = tid; h < H; h += blockDim.x) {
     out_row[h] = x_row[h] / norm;
   }
@@ -89,7 +89,7 @@ static void L2Norm_CPU(const float* X, float* X_hat, int B, int N, int H) {
 }
 
 // ============================================================================
-// GPU Naive Implementation (separate kernels for Q and K)
+// GPU 朴素实现：Q/K 分开跑两个 kernel
 // ============================================================================
 static void RunGpuV0(const float* d_Q, const float* d_K,
                      float* d_Q_hat, float* d_K_hat,
@@ -137,7 +137,7 @@ int main() {
     int N_k = std::get<3>(tc);
     int H_k = std::get<4>(tc);
 
-    // Allocate host memory
+    // ---------------- host 内存 ----------------
     std::vector<float> h_Q(B * N_q * H_q);
     std::vector<float> h_K(B * N_k * H_k);
     std::vector<float> h_Q_hat_cpu(B * N_q * H_q);
@@ -145,7 +145,7 @@ int main() {
     std::vector<float> h_Q_hat_gpu(B * N_q * H_q);
     std::vector<float> h_K_hat_gpu(B * N_k * H_k);
 
-    // Initialize with random values
+    // ---------------- 初始化随机输入 ----------------
     std::mt19937 gen(42);
     std::uniform_real_distribution<float> dist(-1.0f, 1.0f);
     auto rand_fill = [&](std::vector<float>& v) {
@@ -154,31 +154,31 @@ int main() {
     rand_fill(h_Q);
     rand_fill(h_K);
 
-    // CPU reference
+    // ---------------- CPU 参考 ----------------
     auto t0 = std::chrono::high_resolution_clock::now();
     L2Norm_CPU(h_Q.data(), h_Q_hat_cpu.data(), B, N_q, H_q);
     L2Norm_CPU(h_K.data(), h_K_hat_cpu.data(), B, N_k, H_k);
     auto t1 = std::chrono::high_resolution_clock::now();
     double cpu_ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
 
-    // Allocate device memory
+    // ---------------- 设备内存 ----------------
     float *d_Q, *d_K, *d_Q_hat, *d_K_hat;
     CHECK_CUDA(cudaMalloc(&d_Q, h_Q.size() * sizeof(float)));
     CHECK_CUDA(cudaMalloc(&d_K, h_K.size() * sizeof(float)));
     CHECK_CUDA(cudaMalloc(&d_Q_hat, h_Q_hat_gpu.size() * sizeof(float)));
     CHECK_CUDA(cudaMalloc(&d_K_hat, h_K_hat_gpu.size() * sizeof(float)));
 
-    // Copy to device
+    // ---------------- 数据拷贝 ----------------
     CHECK_CUDA(cudaMemcpy(d_Q, h_Q.data(), h_Q.size() * sizeof(float), cudaMemcpyHostToDevice));
     CHECK_CUDA(cudaMemcpy(d_K, h_K.data(), h_K.size() * sizeof(float), cudaMemcpyHostToDevice));
 
-    // Warmup
+    // ---------------- warmup ----------------
     for (int w = 0; w < kWarmup; ++w) {
       RunGpuV0(d_Q, d_K, d_Q_hat, d_K_hat, B, N_q, H_q, N_k, H_k);
     }
     CHECK_CUDA(cudaDeviceSynchronize());
 
-    // Benchmark
+    // ---------------- benchmark ----------------
     cudaEvent_t s, e;
     CHECK_CUDA(cudaEventCreate(&s));
     CHECK_CUDA(cudaEventCreate(&e));
@@ -206,7 +206,7 @@ int main() {
       gpu_ms /= static_cast<float>(gpu_times.size());
     }
 
-    // Copy back and verify
+    // ---------------- 回拷 + 校验 ----------------
     CHECK_CUDA(cudaMemcpy(h_Q_hat_gpu.data(), d_Q_hat, h_Q_hat_gpu.size() * sizeof(float), cudaMemcpyDeviceToHost));
     CHECK_CUDA(cudaMemcpy(h_K_hat_gpu.data(), d_K_hat, h_K_hat_gpu.size() * sizeof(float), cudaMemcpyDeviceToHost));
 
@@ -215,7 +215,7 @@ int main() {
     bool ok = (max_diff_q < 1e-4f && max_diff_k < 1e-4f);
     const char* check = ok ? "PASS" : "FAIL";
 
-    // Cleanup
+    // ---------------- 释放资源 ----------------
     CHECK_CUDA(cudaEventDestroy(s));
     CHECK_CUDA(cudaEventDestroy(e));
     CHECK_CUDA(cudaFree(d_Q));

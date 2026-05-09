@@ -1,10 +1,9 @@
-// Softmax V2: 在 V1 基础上使用 Warp 归约
+// Softmax V2
 //
-// 核心设计:
-// - 1维 block: 128 线程 = 4 个 warp，每个 warp 处理一行数据
-// - 共享内存缓存: exp 结果存入共享内存，避免全局内存中间读写
-// - Warp 归约: 使用 __shfl_down_sync 进行 warp shuffle 归约
-// - float4 向量化: 使用 float4 加载和写回，提升内存带宽
+// 在 v1 的基础上，把 lane0 串行归约改成 warp shuffle 归约：
+// - max 用 __shfl_down_sync 归约
+// - sum 也用 __shfl_down_sync 归约
+// 其余仍保持"共享内存 + float4"路径
 
 #include <cuda_runtime.h>
 
@@ -23,11 +22,10 @@
 #define BLOCK_SIZE (WARP_SIZE * WARPS_PER_BLOCK)
 
 __global__ void SoftmaxV2Kernel(
-    const float* __restrict__ x, 
+    const float* __restrict__ x,
     float* __restrict__ y,
     int rows, int cols
 ) {
-    
     const int warp_id = threadIdx.x / WARP_SIZE;
     const int lane = threadIdx.x % WARP_SIZE;
     const int row = blockIdx.x * WARPS_PER_BLOCK + warp_id;
@@ -94,6 +92,8 @@ __global__ void SoftmaxV2Kernel(
         row_y[c] = s_exp[c] * inv;
     }
 }
+
+#ifndef PYTORCH_EXTENSION
 
 static void SoftmaxCPU(const float* x, float* y, int rows, int cols) {
     for (int r = 0; r < rows; ++r) {
@@ -171,3 +171,5 @@ int main() {
     }
     return 0;
 }
+
+#endif  // PYTORCH_EXTENSION

@@ -2,6 +2,8 @@ set(FLASH_ATTENTION_VARIANTS
     flash_attention_v0
     flash_attention_v1
     flash_attention_v2
+    flash_attention_v3
+    flash_attention_v4
 )
 
 foreach(variant ${FLASH_ATTENTION_VARIANTS})

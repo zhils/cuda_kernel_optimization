@@ -9,6 +9,9 @@
 #include "common/benchmark.h"
 #include "common/cuda_utils.h"
 
+// Softmax V0（朴素基线）
+// 一行由一个线程顺序完成：max -> exp 累加 -> 归一化
+
 __global__ void SoftmaxNaiveKernel(const float* x, float* y, int rows, int cols) {
   int r = blockIdx.x * blockDim.x + threadIdx.x;
   if (r >= rows) return;
@@ -22,6 +25,8 @@ __global__ void SoftmaxNaiveKernel(const float* x, float* y, int rows, int cols)
   }
   for (int c = 0; c < cols; ++c) y[r * cols + c] /= sum;
 }
+
+#ifndef PYTORCH_EXTENSION
 
 static void SoftmaxCPU(const float* x, float* y, int rows, int cols) {
   for (int r = 0; r < rows; ++r) {
@@ -44,12 +49,14 @@ int main() {
   ofs << "id,group,rows,cols,cpu_ms,gpu_ms,speedup,max_abs_diff,check\n";
   for (size_t i = 0; i < cases.size(); ++i) {
     int rows = cases[i].rows, cols = cases[i].cols, n = rows * cols;
+
     std::vector<float> x(n), cpu(n), gpu(n);
     common::InitMatrix(x, rows, cols);
     auto t0 = std::chrono::high_resolution_clock::now();
     SoftmaxCPU(x.data(), cpu.data(), rows, cols);
     auto t1 = std::chrono::high_resolution_clock::now();
     double cpu_ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
+
     float *dx, *dy;
     CHECK_CUDA(cudaMalloc(&dx, n * sizeof(float)));
     CHECK_CUDA(cudaMalloc(&dy, n * sizeof(float)));
@@ -64,10 +71,12 @@ int main() {
     CHECK_CUDA(cudaGetLastError());
     float gpu_ms = 0.f;
     CHECK_CUDA(cudaEventElapsedTime(&gpu_ms, s, e));
+
     CHECK_CUDA(cudaMemcpy(gpu.data(), dy, n * sizeof(float), cudaMemcpyDeviceToHost));
     bool ok = common::CheckEqual(cpu, gpu, 1e-4f);
     ofs << i << "," << cases[i].group << "," << rows << "," << cols << "," << cpu_ms << "," << gpu_ms << ","
         << (gpu_ms > 0 ? cpu_ms / gpu_ms : 0) << "," << common::MaxAbsDiff(cpu, gpu) << "," << (ok ? "PASS" : "FAIL") << "\n";
+
     CHECK_CUDA(cudaEventDestroy(s));
     CHECK_CUDA(cudaEventDestroy(e));
     CHECK_CUDA(cudaFree(dx));
@@ -75,3 +84,5 @@ int main() {
   }
   return 0;
 }
+
+#endif  // PYTORCH_EXTENSION
