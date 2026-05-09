@@ -6,8 +6,14 @@
 #include <cstddef>
 #include <cstdint>
 
-__global__ void RMSNormV0Kernel(const float* x, float* y, const float* weight, int rows, int cols,
-                                float eps) {
+__global__ void RMSNormV0Kernel(
+  const float* x, 
+  float* y, 
+  const float* weight, 
+  int rows, 
+  int cols,
+  float eps
+) {
   int r = blockIdx.x * blockDim.x + threadIdx.x;
   if (r >= rows) return;
   float sq_sum = 0.f;
@@ -25,8 +31,14 @@ constexpr int RMSNORM_WARP_SIZE = 32;
 constexpr int RMSNORM_WARPS_PER_BLOCK = 4;
 constexpr int RMSNORM_BLOCK_SIZE = RMSNORM_WARP_SIZE * RMSNORM_WARPS_PER_BLOCK;
 
-__global__ void RMSNormV1Kernel(const float* __restrict__ x, float* __restrict__ y,
-                                const float* __restrict__ weight, int rows, int cols, float eps) {
+__global__ void RMSNormV1Kernel(
+  const float* __restrict__ x, 
+  float* __restrict__ y,
+  const float* __restrict__ weight, 
+  int rows, 
+  int cols, 
+  float eps
+) {
   const int warp_id = threadIdx.x / RMSNORM_WARP_SIZE;
   const int lane = threadIdx.x % RMSNORM_WARP_SIZE;
   const int row = blockIdx.x * RMSNORM_WARPS_PER_BLOCK + warp_id;
@@ -79,8 +91,14 @@ __global__ void RMSNormV1Kernel(const float* __restrict__ x, float* __restrict__
   }
 }
 
-__global__ void RMSNormV2Kernel(const float* __restrict__ x, float* __restrict__ y,
-                                const float* __restrict__ weight, int rows, int cols, float eps) {
+__global__ void RMSNormV2Kernel(
+  const float* __restrict__ x, 
+  float* __restrict__ y,
+  const float* __restrict__ weight, 
+  int rows, 
+  int cols, 
+  float eps
+) {
   const int warp_id = threadIdx.x / RMSNORM_WARP_SIZE;
   const int lane = threadIdx.x % RMSNORM_WARP_SIZE;
   const int row = blockIdx.x * RMSNORM_WARPS_PER_BLOCK + warp_id;
@@ -136,8 +154,14 @@ __global__ void RMSNormV2Kernel(const float* __restrict__ x, float* __restrict__
   }
 }
 
-__global__ void RMSNormV3Kernel(const float* __restrict__ x, float* __restrict__ y,
-                                const float* __restrict__ weight, int rows, int cols, float eps) {
+__global__ void RMSNormV3Kernel(
+  const float* __restrict__ x, 
+  float* __restrict__ y,
+  const float* __restrict__ weight, 
+  int rows, 
+  int cols, 
+  float eps
+) {
   const int warp_id = threadIdx.x / RMSNORM_WARP_SIZE;
   const int lane = threadIdx.x % RMSNORM_WARP_SIZE;
   const int row = blockIdx.x * RMSNORM_WARPS_PER_BLOCK + warp_id;

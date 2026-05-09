@@ -29,7 +29,9 @@ __global__ void RMSNormV1Kernel(
     const float* __restrict__ x,
     float* __restrict__ y,
     const float* __restrict__ weight,
-    int rows, int cols, float eps
+    int rows, 
+    int cols, 
+    float eps
 ) {
     // ---------------- warp 到行的映射 ----------------
     const int warp_id = threadIdx.x / WARP_SIZE;
@@ -37,13 +39,16 @@ __global__ void RMSNormV1Kernel(
     const int row = blockIdx.x * WARPS_PER_BLOCK + warp_id;
     if (row >= rows) return;
 
+    // 也就是计算起点，x就是当前这一行的起点
     const float* row_x = x + row * cols;
+    // 输出要放的位置
     float* row_y = y + row * cols;
 
     // 静态共享内存：存储每个 warp 的 sq_sum
     __shared__ float s_sq_sum[WARPS_PER_BLOCK];
     // 动态共享内存：存储 4 行数据，每行 cols 个 float
     extern __shared__ float s_data[];
+    // 计算要搬到共享内存中的什么位置
     float* s_row = s_data + warp_id * cols;
 
     // ---------------- 1) 搬运行数据到共享内存 ----------------
