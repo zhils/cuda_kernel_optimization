@@ -7,6 +7,9 @@ set(GEMM_VARIANTS
     gemm_v5
     gemm_fp16
     gemm_int8
+    gemm_fp8_cublaslt
+    quant_gemm_compare
+    quant_fp8_bias_compensate
     gemm_cublas_ref
 )
 
@@ -25,13 +28,29 @@ foreach(variant ${GEMM_VARIANTS})
         RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
 endforeach()
 
+# CUDA 13.2 + sm_120 toolchain does not expose tf32 WMMA tags by default.
+# Enable Ampere WMMA tag path for legacy tf32 kernels.
+target_compile_definitions(gemm_v4 PRIVATE __CUDA_AMPERE_MMA__)
+target_compile_definitions(gemm_v5 PRIVATE __CUDA_AMPERE_MMA__)
+
 target_link_libraries(gemm_cublas_ref PRIVATE cublas)
+
+target_link_libraries(gemm_fp8_cublaslt PRIVATE cublas cublasLt)
 
 set(ASM_OUTPUT_DIR ${CMAKE_SOURCE_DIR}/gemm/asm)
 set(NVCC_FLAGS -Xcompiler=-Wno-deprecated-declarations)
 
 foreach(variant IN LISTS GEMM_VARIANTS)
     if(${variant} STREQUAL "gemm_cublas_ref")
+        continue()
+    endif()
+    if(${variant} STREQUAL "quant_gemm_compare")
+        continue()
+    endif()
+    if(${variant} STREQUAL "quant_fp8_bias_compensate")
+        continue()
+    endif()
+    if(${variant} STREQUAL "gemm_fp8_cublaslt")
         continue()
     endif()
     add_custom_command(

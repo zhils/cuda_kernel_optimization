@@ -8,11 +8,13 @@
 #include <algorithm>
 #include <chrono>
 #include <cmath>
+#include <cstdlib>
 #include <filesystem>
 #include <fstream>
 #include <iomanip>
 #include <iostream>
 #include <limits>
+#include <string>
 #include <vector>
 
 #include "common/benchmark.h"
@@ -493,8 +495,8 @@ double RunKernel(KernelFunc kernel,
   return sum / static_cast<double>(times.size() - 2);
 }
 
-int main() {
-  constexpr int kIterations = 10;
+int main(int argc, char** argv) {
+  int kIterations = 10;
   std::vector<std::pair<int, int>> test_cases = {
       {64, 512}, {64, 1024}, {64, 4096},
       {128, 512}, {128, 1024}, {128, 4096},
@@ -502,6 +504,24 @@ int main() {
       {512, 768}, {512, 1024}, {512, 4096},
       {1024, 1024}, {2048, 4096},
   };
+
+  bool quick_mode = false;
+  for (int i = 1; i < argc; ++i) {
+    if (std::string(argv[i]) == "--quick") {
+      quick_mode = true;
+      break;
+    }
+  }
+  if (const char* env = std::getenv("NCU_QUICK")) {
+    if (std::string(env) == "1" || std::string(env) == "true") {
+      quick_mode = true;
+    }
+  }
+  if (quick_mode) {
+    kIterations = 1;
+    test_cases = {{256, 1024}};
+    std::cout << "[quick] reduced cases for profiling\n";
+  }
 
   std::filesystem::create_directories("data/results");
   std::ofstream ofs("data/results/softmax_all_comparison.csv");
@@ -534,10 +554,13 @@ int main() {
     double v1_ms = RunKernel(SoftmaxV1SharedMemKernel, h_x.data(), h_gpu.data(), rows, cols, kIterations, 256, 256 * sizeof(float));
     double v2_ms = RunKernel(SoftmaxV2WarpKernel, h_x.data(), h_gpu.data(), rows, cols, kIterations, 32);
     double v3_ms = RunKernel(SoftmaxV3VectorizedKernel, h_x.data(), h_gpu.data(), rows, cols, kIterations, 32);
-    double cub_ms = RunCUBSoftmax(h_x.data(), h_gpu.data(), rows, cols);
-    double cublas_ms = RunCuBLASSoftmax(h_x.data(), h_gpu.data(), rows, cols);
-    double cutlass_ms = RunCUTLASSSoftmax(h_x.data(), h_gpu.data(), rows, cols);
-    double cudnn_ms = RunCuDNNSoftmax(cudnn, h_x.data(), h_gpu.data(), rows, cols);
+    double cub_ms = -1.0, cublas_ms = -1.0, cutlass_ms = -1.0, cudnn_ms = -1.0;
+    if (!quick_mode) {
+      cub_ms = RunCUBSoftmax(h_x.data(), h_gpu.data(), rows, cols);
+      cublas_ms = RunCuBLASSoftmax(h_x.data(), h_gpu.data(), rows, cols);
+      cutlass_ms = RunCUTLASSSoftmax(h_x.data(), h_gpu.data(), rows, cols);
+      cudnn_ms = RunCuDNNSoftmax(cudnn, h_x.data(), h_gpu.data(), rows, cols);
+    }
 
     std::cout << std::fixed << std::setprecision(3)
               << std::setw(6) << rows
@@ -557,9 +580,9 @@ int main() {
         << v0_ms << "," << v1_ms << "," << v2_ms << "," << v3_ms << ","
         << cub_ms << "," << cublas_ms << "," << cutlass_ms << "," << cudnn_ms << ","
         << gflops / v0_ms << "," << gflops / v1_ms << "," << gflops / v2_ms << "," << gflops / v3_ms << ","
-        << gflops / cub_ms << "," << gflops / cublas_ms << ","
+        << (cub_ms > 0 ? gflops / cub_ms : -1.0) << "," << (cublas_ms > 0 ? gflops / cublas_ms : -1.0) << ","
         << (cutlass_ms > 0 ? gflops / cutlass_ms : -1.0) << ","
-        << gflops / cudnn_ms << "\n";
+        << (cudnn_ms > 0 ? gflops / cudnn_ms : -1.0) << "\n";
   }
 
   CHECK_CUDNN(cudnnDestroy(cudnn));

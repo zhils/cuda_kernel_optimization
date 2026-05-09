@@ -26,6 +26,7 @@ data/
 # IDE
 .vs/
 .vscode/
+.cursor/
 *.user
 *.suo
 
@@ -38,10 +39,15 @@ Thumbs.db
 *.swp
 *~
 
+# Personal learning notes (internal reflections, AI-generated code disclosure, self-critique, etc.)
+# Not suitable for public GitHub as an interview project
+notes/
+
+# Project documentation (HTML overview, environment notes, etc.)
+docs/
+
 # Generated ISA / disassembly (nvcc -ptx / -cubin outputs; regenerate from .cu)
-gemm/asm/
-softmax/asm/
-rmsnorm/asm/
+**/asm/
 
 # MSVC link byproducts if ever placed next to sources
 *.lib

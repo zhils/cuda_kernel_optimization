@@ -21,8 +21,8 @@ setup(
                     "-O3",
                     "--use_fast_math",
                     "-std=c++17",
-                    "-arch=sm_80",
-                    "-gencode=arch=compute_80,code=sm_80",
+                    "-arch=sm_120",
+                    "-gencode=arch=compute_120,code=sm_120",
                 ],
             },
             include_dirs=[

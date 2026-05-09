@@ -46,6 +46,9 @@ A ∈ R^{M×K}, B ∈ R^{K×N}, C ∈ R^{M×N}
 | `gemm_v4` | `gemm_v4.cu` | TF32 WMMA Tensor Core |
 | `gemm_v5` | `gemm_v5.cu` | WMMA + cp.async + 多配置自动调优 |
 | `gemm_fp16` | `gemm_fp16.cu` | FP16 WMMA (k=16) |
+| `gemm_int8` | `gemm_int8.cu` | INT8 WMMA (k=16)，per-tensor 量化 |
+| `quant_gemm_compare` | `quant_gemm_compare.cu` | FP16/FP8/INT8 舍入与 CPU 代理 GEMM 数值对比（无 FP8 kernel） |
+| `gemm_fp8_cublaslt` | `gemm_fp8_cublaslt.cu` | cuBLASLt FP8 E4M3→FP32（TN 布局），测库 FP8 吞吐 |
 | `gemm_cublas_ref` | `gemm_cublas_ref.cu` | cuBLAS FP32 参考 |
 
 ### v0 — 朴素基线
@@ -222,26 +225,31 @@ k=16，每条指令做 2×16×16 = 512 对乘加 = 1024 FLOPs，是 TF32 的 2 �
 
 ---
 
-## 4. Nsight Compute 瓶颈分析
+## 4. Nsight Compute 瓶颈分析（2026-05-09）
 
-使用 `ncu --set basic`（4096³ 规模）：
+命令：`ncu --set basic --target-processes all --kernel-name-base demangled`。  
+统计口径：每个可执行文件取 **Duration 最大** 的一次 kernel launch（见 `data/ncu_reports/text/*.txt` 与 `data/ncu_reports/summary_by_exe.csv`）。
 
-| 版本 | Memory Throughput | DRAM Throughput | Compute Throughput | Occupancy | 瓶颈 |
-|:----|:-----------------:|:---------------:|:------------------:|:---------:|:-----|
-| v0 朴素 | 93.85% | 41.54% | 93.85% | 高 | **LSU 受限**：每元素 4+ 条全局加载指令，L1 cache 94.22% |
-| v3 最优 | 60.58% | 51.30% | 70.37% | 80%+ | **均衡**：cp.async 有效隐藏延迟 |
-| v4 WMMA | 37.04% | 37.04% | 93.48% | 26.9% | **Occupancy 崩了**：64 regs/warp 的 fragment 压力，SM 等寄存器就绪 |
+| 目标 | Max Duration(us) | Compute(SM) | DRAM | Memory | Achieved Occupancy | Reg/Thr | 结论 |
+|:-----|-----------------:|------------:|-----:|-------:|-------------------:|--------:|:-----|
+| `gemm_v0` | 200.90 | 91.01% | 2.37% | 91.01% | 91.69% | 40 | 算力占主导，访存非瓶颈 |
+| `gemm_v1` | 150.59 | 91.19% | 3.18% | 91.19% | 91.85% | 40 | 与 v0 类似，算力打满 |
+| `gemm_v2` | 290.85 | 35.60% | 7.24% | 49.74% | 16.65% | 150 | 寄存器压力过高，occupancy 降低 |
+| `gemm_v3` | 242.34 | 48.09% | 7.88% | 67.04% | 29.85% | 115 | cp.async 后更均衡，仍受 occupancy 约束 |
+| `gemm_fp16` | 84.67 | 54.89% | 13.55% | 72.83% | 29.65% | 118 | Tensor Core 路径下算存较均衡 |
+| `gemm_int8` | 52.54 | 43.33% | 9.13% | 66.58% | 29.18% | 106 | INT8 更快但仍非纯带宽瓶颈 |
+| `gemm_fp8_cublaslt` | 845.15 | 87.61% | 39.19% | 60.23% | 16.48% | 255 | 库内核算力利用高，寄存器占用大 |
+| `gemm_cublas_ref` | 174.14 | 71.95% | 15.94% | 62.23% | 23.54% | 128 | cuBLAS 路径整体更偏计算密集 |
 
-对比可以看出：
-- v0 的瓶颈不是带宽，而是指令瓶颈——每访存 LSU 都被占满，但利用率低（DRAM 只用 41.54%）
-- v3 的 cp.async 把加载卸载到 DMA 单元，释放了 LSU 给计算
-- v4 的 WMMA 虽然计算跑满了（Compute 93.48%），但 occupancy 低导致整体不饱和
+补充：
+- `gemm_v4`、`gemm_v5` 当前通过 `__CUDA_AMPERE_MMA__` 兼容宏路径可在本环境完成编译与分析。
+- 详细原始报告在 `data/ncu_reports/text/gemm_*.txt`。
 
 ---
 
 ## 5. PTX/SASS 关键指令
 
-所有 kernel 的 PTX 和 SASS 在 `gemm/asm/` 下。
+所有 kernel 的 PTX 和 SASS 可在本地通过 `nvcc --ptx` 或 `--cubin` 生成（`**/asm/` 已从版本控制中排除）。
 
 | 版本 | PTX 关键指令 |
 |------|-------------|
@@ -254,8 +262,9 @@ k=16，每条指令做 2×16×16 = 512 对乘加 = 1024 FLOPs，是 TF32 的 2 �
 
 ## 6. 产物路径
 
-- 可执行文件：`build/bin/gemm_v0` … `gemm_v5`、`gemm_fp16`、`gemm_cublas_ref`
+- 可执行文件：`build/bin/gemm_v0` … `gemm_v5`、`gemm_fp16`、`gemm_int8`、`gemm_fp8_cublaslt`、`quant_gemm_compare`、`gemm_cublas_ref`
+- 低精度量化实验数据：[quantization_fp16_fp8_int8.md](quantization_fp16_fp8_int8.md)
 - 结果 CSV：`data/results/`
 - ncu 报告：`build/data/ncu_reports/`
-- PTX/SASS：`gemm/asm/ptx/`、`gemm/asm/sass/`
+- PTX/SASS：本地运行 `make gemm_v0.ptx` 或 `cuobjdump -sass <binary>` 生成
 - compute capability：**sm_120**（Blackwell），CUDA 13.2

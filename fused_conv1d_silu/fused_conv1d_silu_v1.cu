@@ -16,32 +16,35 @@
 namespace fused_v1 {
 
 // ============================================================================
-// Fused Conv1D + SiLU v1: Single kernel fusion
+// Fused Conv1D + SiLU v1（单 kernel 融合）
 // ============================================================================
-// Fuses 5 operations into 1 kernel:
-//   1. Linear(in_proj_qkv): x(B,L,D) @ W_qkv(D,3H) + b_qkv
-//   2. Linear(in_proj_z):   x(B,L,D) @ W_z(D,H)   + b_z
-//   3. Split qkv -> Q_raw, K_raw, V_raw
-//   4. CausalConv1d(z) + SiLU -> z_act
-//   5. V = V_raw * z_act
-// ============================================================================
-// Mapping: one thread handles one (b, h), loops over t=0..L-1
-// Eliminates 8 intermediate global memory writes vs v0.
+// 把 5 个步骤压成 1 个 kernel：
+// 1) qkv 线性投影
+// 2) z 线性投影
+// 3) split qkv -> Q/K/V
+// 4) causal conv(z) + SiLU
+// 5) V = V_raw * z_act
+//
+// 线程映射：一个线程负责一个 (b,h)，沿 t=0..L-1 顺序推进
+// 相比 v0，显著减少中间张量写回
 // ============================================================================
 
 constexpr int kBlockSize = 256;
 constexpr int kMaxKernelSize = 64;
 
-__global__ void FusedKernel(const float* __restrict__ x,
-                            const float* __restrict__ W_qkv,
-                            const float* __restrict__ b_qkv,
-                            const float* __restrict__ W_z,
-                            const float* __restrict__ b_z,
-                            const float* __restrict__ K_conv,
-                            float* __restrict__ Q,
-                            float* __restrict__ K,
-                            float* __restrict__ V,
-                            int B, int L, int D, int H, int k_size) {
+__global__ void FusedKernel(
+  const float* __restrict__ x,
+  const float* __restrict__ W_qkv,
+  const float* __restrict__ b_qkv,
+  const float* __restrict__ W_z,
+  const float* __restrict__ b_z,
+  const float* __restrict__ K_conv,
+  float* __restrict__ Q,
+  float* __restrict__ K,
+  float* __restrict__ V,
+  int B, int L, int D, int H, int k_size
+) {
+  // ---------------- 线程坐标 ----------------
   const int b_idx = blockIdx.x;
   const int h = blockIdx.y * blockDim.x + threadIdx.x;
   if (b_idx >= B || h >= H) return;
@@ -56,6 +59,7 @@ __global__ void FusedKernel(const float* __restrict__ x,
   const float bv = b_qkv[h + 2 * H];
   const float bz = b_z[h];
 
+  // ---------------- 环形历史缓存 ----------------
   float z_hist[kMaxKernelSize];
   #pragma unroll
   for (int i = 0; i < kMaxKernelSize; ++i) {
@@ -64,6 +68,7 @@ __global__ void FusedKernel(const float* __restrict__ x,
 
   const int ksize = (k_size <= kMaxKernelSize) ? k_size : kMaxKernelSize;
 
+  // ---------------- 按时间步推进 ----------------
   for (int t = 0; t < L; ++t) {
     const float* x_bt = x + (static_cast<size_t>(b_idx) * L + t) * D;
 
@@ -72,6 +77,7 @@ __global__ void FusedKernel(const float* __restrict__ x,
     float v_raw = bv;
     float z_proj = bz;
 
+    // q/k/v/z 投影
     for (int d = 0; d < D; ++d) {
       const float xv = x_bt[d];
       q_raw += xv * Wq[d];
@@ -82,6 +88,7 @@ __global__ void FusedKernel(const float* __restrict__ x,
 
     z_hist[t % ksize] = z_proj;
 
+    // causal conv + SiLU
     float z_conv = 0.0f;
     const int valid = (t + 1 < ksize) ? (t + 1) : ksize;
     for (int lag = 0; lag < valid; ++lag) {
@@ -92,6 +99,7 @@ __global__ void FusedKernel(const float* __restrict__ x,
     const float sigmoid = 1.0f / (1.0f + expf(-z_conv));
     const float z_act = z_conv * sigmoid;
 
+    // 回写 Q/K/V
     const size_t out_idx = (static_cast<size_t>(b_idx) * L + t) * H + h;
     Q[out_idx] = q_raw;
     K[out_idx] = k_raw;

@@ -1,10 +1,9 @@
-// Softmax V2: 在 V1 基础上使用 Warp 归约
+// Softmax V2
 //
-// 核心设计:
-// - 1维 block: 128 线程 = 4 个 warp，每个 warp 处理一行数据
-// - 共享内存缓存: exp 结果存入共享内存，避免全局内存中间读写
-// - Warp 归约: 使用 __shfl_down_sync 进行 warp shuffle 归约
-// - float4 向量化: 使用 float4 加载和写回，提升内存带宽
+// 在 v1 的基础上，把 lane0 串行归约改成 warp shuffle 归约：
+// - max 用 __shfl_down_sync 归约
+// - sum 也用 __shfl_down_sync 归约
+// 其余仍保持“共享内存 + float4”路径
 
 #include <cuda_runtime.h>
 
@@ -27,7 +26,7 @@ __global__ void SoftmaxV2Kernel(
     float* __restrict__ y,
     int rows, int cols
 ) {
-    
+    // ---------------- warp 到行的映射 ----------------
     const int warp_id = threadIdx.x / WARP_SIZE;
     const int lane = threadIdx.x % WARP_SIZE;
     const int row = blockIdx.x * WARPS_PER_BLOCK + warp_id;
@@ -43,6 +42,7 @@ __global__ void SoftmaxV2Kernel(
 
     const int cols4 = cols / 4;
 
+    // ---------------- 行数据搬到共享内存 ----------------
     for (int c = lane; c < cols4; c += WARP_SIZE) {
         const float4 v = __ldg(reinterpret_cast<const float4*>(row_x + c * 4));
         s_exp[c * 4 + 0] = v.x;
@@ -55,6 +55,7 @@ __global__ void SoftmaxV2Kernel(
     }
     __syncthreads();
 
+    // ---------------- warp 归约 row_max ----------------
     float local_max = -INFINITY;
     for (int c = lane; c < cols; c += WARP_SIZE) {
         local_max = fmaxf(local_max, s_exp[c]);
@@ -67,6 +68,7 @@ __global__ void SoftmaxV2Kernel(
     __syncthreads();
     const float row_max = s_max[warp_id];
 
+    // ---------------- warp 归约 row_sum ----------------
     float local_sum = 0.f;
     for (int c = lane; c < cols; c += WARP_SIZE) {
         const float e = __expf(s_exp[c] - row_max);
@@ -81,6 +83,7 @@ __global__ void SoftmaxV2Kernel(
     __syncthreads();
     const float inv = 1.f / s_sum[warp_id];
 
+    // ---------------- 写回 ----------------
     for (int c = lane; c < cols4; c += WARP_SIZE) {
         const float4 e = *reinterpret_cast<const float4*>(s_exp + c * 4);
         float4 out;

@@ -1,10 +1,10 @@
-// RMSNorm V1: 1维 block + float4 向量化 + 共享内存 staging
+// RMSNorm V1
 //
-// 核心设计:
-// — 1维 block: 128 线程 = 4 个 warp，每个 warp 处理一行数据
-// — 共享内存 staging: 数据先加载到共享内存，后续计算从共享内存读取
-// — 串行归约: 每个 warp 的 lane 0 计算该行的 sq_sum
-// — float4 向量化: 使用 float4 加载和写回，提升内存带宽
+// 核心设计：
+// - 1D block：每个 warp 处理一行
+// - 共享内存 staging：行数据先落到 smem
+// - lane0 串行归约平方和
+// - float4 向量化读写
 
 #include <cuda_runtime.h>
 
@@ -24,13 +24,14 @@
 #define WARP_SIZE 32
 #define WARPS_PER_BLOCK 4
 
-// ---------- 1D Block Kernel: 每个 warp 处理一行 ----------
+// ---------- 1D Block Kernel：每个 warp 处理一行 ----------
 __global__ void RMSNormV1Kernel(
     const float* __restrict__ x,
     float* __restrict__ y,
     const float* __restrict__ weight,
     int rows, int cols, float eps
 ) {
+    // ---------------- warp 到行的映射 ----------------
     const int warp_id = threadIdx.x / WARP_SIZE;
     const int lane = threadIdx.x % WARP_SIZE;
     const int row = blockIdx.x * WARPS_PER_BLOCK + warp_id;
@@ -39,13 +40,13 @@ __global__ void RMSNormV1Kernel(
     const float* row_x = x + row * cols;
     float* row_y = y + row * cols;
 
-    // 静态共享内存: 存储每个 warp 的 sq_sum (4 个 float)
+    // 静态共享内存：存储每个 warp 的 sq_sum
     __shared__ float s_sq_sum[WARPS_PER_BLOCK];
-    // 动态共享内存: 存储 4 行数据，每行 cols 个 float
+    // 动态共享内存：存储 4 行数据，每行 cols 个 float
     extern __shared__ float s_data[];
-    float* s_row = s_data + warp_id * cols;  // 每个 warp 指向自己的行
+    float* s_row = s_data + warp_id * cols;
 
-    // Step 1: 每个 warp 协作加载一行数据到共享内存 (float4 向量化)
+    // ---------------- 1) 搬运行数据到共享内存 ----------------
     const int cols4 = cols / 4;
     for (int c = lane; c < cols4; c += WARP_SIZE) {
         const float4 v = *reinterpret_cast<const float4*>(row_x + c * 4);
@@ -54,13 +55,13 @@ __global__ void RMSNormV1Kernel(
         s_row[c * 4 + 2] = v.z;
         s_row[c * 4 + 3] = v.w;
     }
-    // 处理尾巴 (cols 不是 4 的倍数)
+    // 处理尾项（cols 不是 4 的倍数）
     for (int c = cols4 * 4 + lane; c < cols; c += WARP_SIZE) {
         s_row[c] = row_x[c];
     }
     __syncthreads();
 
-    // Step 2: 每个 warp 的 lane 0 串行计算平方和 (从共享内存读取)
+    // ---------------- 2) lane0 串行归约平方和 ----------------
     if (lane == 0) {
         float sq_sum = 0.f;
         for (int c = 0; c < cols; ++c) {
@@ -71,7 +72,7 @@ __global__ void RMSNormV1Kernel(
     }
     __syncthreads();
 
-    // Step 3: 计算 RMS 并写回结果 (从共享内存读取，float4 向量化写回)
+    // ---------------- 3) 计算 RMS 并写回 ----------------
     const float rms = rsqrtf(s_sq_sum[warp_id] / static_cast<float>(cols) + eps);
     for (int c = lane; c < cols4; c += WARP_SIZE) {
         const float4 vx = *reinterpret_cast<const float4*>(s_row + c * 4);
@@ -83,7 +84,7 @@ __global__ void RMSNormV1Kernel(
         vy.w = vx.w * rms * vw.w;
         *reinterpret_cast<float4*>(row_y + c * 4) = vy;
     }
-    // 处理尾巴 (cols 不是 4 的倍数)
+    // 处理尾项（cols 不是 4 的倍数）
     for (int c = cols4 * 4 + lane; c < cols; c += WARP_SIZE) {
         row_y[c] = s_row[c] * rms * weight[c];
     }

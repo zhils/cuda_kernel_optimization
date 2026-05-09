@@ -133,22 +133,25 @@ SMEM 排布：
 
 ---
 
-## 4. Nsight Compute 瓶颈分析
+## 4. Nsight Compute 瓶颈分析（2026-05-09）
 
-`ncu --set basic`（4096×4096）：
+命令：`ncu --set basic --target-processes all --kernel-name-base demangled`。  
+统计口径：每个版本取 Duration 最大的一次 launch。
 
-| 版本 | Memory Throughput | DRAM Throughput | Compute Throughput | Occupancy | 瓶颈 |
-|:----|:-----------------:|:---------------:|:------------------:|:---------:|:-----|
-| v1 | 51.45% | 38.02% | 51.45% | 72.82% | 均衡（occupancy 良好） |
-| v3 | **85.30%** | **85.30%** | 6.00% | 52.71% | **DRAM 带宽饱和** |
+| 版本 | Max Duration(us) | Compute(SM) | DRAM | Memory | Achieved Occupancy | Reg/Thr | 结论 |
+|:-----|-----------------:|------------:|-----:|-------:|-------------------:|--------:|:-----|
+| `rmsnorm_v0` | 908.22 | 0.95% | 4.55% | 12.81% | 16.48% | 39 | 基线版本利用率很低 |
+| `rmsnorm_v1` | 697.54 | 51.31% | 39.07% | 51.31% | 8.33% | 40 | 算存均衡，但 occupancy 受共享内存限制 |
+| `rmsnorm_v2` | 321.18 | 10.20% | 82.86% | 82.86% | 8.33% | 40 | 转为明显带宽受限 |
+| `rmsnorm_v3` | 334.18 | 5.88% | 86.90% | 86.90% | 38.68% | 40 | DRAM 接近饱和，符合 memory-bound 预期 |
 
-v3 的 weight SMEM caching 把 DRAM 吞吐从 38% 拉到 85%，与上面 386/448=86% 的自洽。
+结论：v2/v3 的优化方向本质是把瓶颈“推”到内存带宽上；v3 的吞吐上限主要由 DRAM 决定。
 
 ---
 
 ## 5. PTX/SASS
 
-PTX 和 SASS 在 `rmsnorm/asm/` 下。
+PTX 和 SASS 可在本地通过 `cuobjdump -ptx <binary>` 或 `cuobjdump -sass <binary>` 生成（`**/asm/` 已从版本控制中排除）。
 
 关键 PTX 指令：
 - 向量化加载：`ld.global.nc.v4.f32`
@@ -160,6 +163,5 @@ PTX 和 SASS 在 `rmsnorm/asm/` 下。
 ## 6. 产物路径
 
 - 可执行文件：`build/bin/rmsnorm_v0` … `rmsnorm_v3`
-- 设备代码唯一入口：`rmsnorm/rmsnorm_kernels.cuh`
-- ncu 报告：`build/data/ncu_reports/`
-- PTX/SASS：`rmsnorm/asm/ptx/`、`rmsnorm/asm/sass/`
+- ncu 报告：`data/ncu_reports/`
+- PTX/SASS：本地运行 `cuobjdump -ptx <binary>` 生成

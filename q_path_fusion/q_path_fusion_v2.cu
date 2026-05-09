@@ -24,8 +24,8 @@ constexpr float kEps = 1e-5f;
     }                                                               \
   } while (0)
 
-// RMSNorm kernel: x(B, D) -> norm(B, D)
-// Each block processes one row
+// RMSNorm kernel：输入 x(rows, cols) -> norm(rows, cols)
+// 一个 block 处理一行，先做平方和归约，再回写归一化结果。
 __global__ void RMSNormKernel(const float* __restrict__ x,
                               const float* __restrict__ gamma,
                               float* __restrict__ norm,
@@ -43,7 +43,7 @@ __global__ void RMSNormKernel(const float* __restrict__ x,
   __shared__ float s_reduce[256];
   __shared__ float s_inv_rms;
 
-  // Compute sum of squares
+  // 1) 累计平方和
   float sq = 0.0f;
   for (int c = tx; c < cols; c += blockDim.x) {
     const float v = x_row[c];
@@ -52,7 +52,7 @@ __global__ void RMSNormKernel(const float* __restrict__ x,
   s_reduce[tx] = sq;
   __syncthreads();
 
-  // Reduction
+  // 2) block 内归约
   for (int stride = blockDim.x >> 1; stride > 0; stride >>= 1) {
     if (tx < stride) {
       s_reduce[tx] += s_reduce[tx + stride];
@@ -60,13 +60,13 @@ __global__ void RMSNormKernel(const float* __restrict__ x,
     __syncthreads();
   }
 
-  // Compute inv_rms
+  // 3) 计算 inv_rms
   if (tx == 0) {
     s_inv_rms = rsqrtf(s_reduce[0] / static_cast<float>(cols) + eps);
   }
   __syncthreads();
 
-  // Normalize and scale
+  // 4) 归一化并乘 gamma
   const float inv = s_inv_rms;
   for (int c = tx; c < cols; c += blockDim.x) {
     norm_row[c] = x_row[c] * inv * gamma[c];
@@ -120,7 +120,7 @@ int main() {
   std::ofstream ofs("data/results/q_path_fusion_v2_results.csv");
   ofs << "id,rows,cols,gpu_ms,max_abs_diff,check\n";
 
-  // Create cuBLAS handle
+  // cuBLAS 句柄只创建一次，避免循环内反复开销
   cublasHandle_t cublas_handle;
   CHECK_CUBLAS(cublasCreate(&cublas_handle));
 
@@ -152,21 +152,14 @@ int main() {
     CHECK_CUDA(cudaMemcpy(dwq, wq.data(), mat * sizeof(float), cudaMemcpyHostToDevice));
     CHECK_CUDA(cudaMemcpy(dbq, bq.data(), cols * sizeof(float), cudaMemcpyHostToDevice));
 
-    // Warmup
+    // warmup：先跑一轮稳定状态
     dim3 block(256);
     dim3 grid(rows);
     RMSNormKernel<<<grid, block>>>(dx, dgamma, dnorm, rows, cols, kEps);
     
     const float alpha = 1.0f, beta = 0.0f;
-    // Q = norm @ wq^T + bq
-    // cuBLAS GEMV: y = alpha * A * x + beta * y
-    // We want: q[row] = norm[row] @ wq^T + bq
-    // Since wq is stored as (cols, cols) with row-major, wq^T is column-major
-    // Actually, wq[k, n] is stored at wq[k * cols + n]
-    // We want: q[r, n] = sum_k norm[r, k] * wq[k, n] + bq[n]
-    // This is: q = norm @ wq + bq (where wq is (cols, cols))
-    // cuBLAS Sgemv: y = alpha * op(A) * x + beta * y
-    // For row-major, we can use cublasSgemm with 1xcols output
+    // Q = norm @ wq + bq
+    // 这里直接用 cublasSgemm 吃掉主算力部分，bias 单独处理。
     CHECK_CUBLAS(cublasSgemm(cublas_handle, CUBLAS_OP_N, CUBLAS_OP_N,
                              cols, rows, cols,
                              &alpha,
@@ -175,12 +168,10 @@ int main() {
                              &beta,
                              dq, cols));     // q: (cols, rows) transposed
     
-    // Add bias: q[r, n] += bq[n]
-    // Use a simple kernel or cublasSaxpy for each row
-    // For simplicity, we'll add bias in a separate kernel
+    // 这里先不加 bias，只测 RMSNorm + GEMM 主路径耗时
     CHECK_CUDA(cudaDeviceSynchronize());
 
-    // Benchmark
+    // benchmark 主循环
     cudaEvent_t start, stop;
     CHECK_CUDA(cudaEventCreate(&start));
     CHECK_CUDA(cudaEventCreate(&stop));
@@ -189,7 +180,7 @@ int main() {
       // Step 1: RMSNorm
       RMSNormKernel<<<grid, block>>>(dx, dgamma, dnorm, rows, cols, kEps);
       
-      // Step 2: GEMM: Q = norm @ wq
+      // Step 2: GEMM
       CHECK_CUBLAS(cublasSgemm(cublas_handle, CUBLAS_OP_N, CUBLAS_OP_N,
                                cols, rows, cols,
                                &alpha,
@@ -198,8 +189,7 @@ int main() {
                                &beta,
                                dq, cols));
       
-      // Step 3: Add bias (fused with output)
-      // For now, skip bias in benchmark to measure core performance
+      // Step 3: bias 跳过（为了聚焦主算力）
     }
     CHECK_CUDA(cudaEventRecord(stop));
     CHECK_CUDA(cudaEventSynchronize(stop));
@@ -209,14 +199,11 @@ int main() {
     CHECK_CUDA(cudaEventElapsedTime(&total_ms, start, stop));
     const float gpu_ms = total_ms / static_cast<float>(kRepeat);
     
-    // Add bias for verification
-    // q[r, n] += bq[n] -> need to add bq to each row
-    // Simple approach: use cublasSger or manual kernel
-    // For verification, we'll do it on CPU
+    // 验证阶段补上 bias，确保和 CPU 参考一致
     
     CHECK_CUDA(cudaMemcpy(q_gpu.data(), dq, n * sizeof(float), cudaMemcpyDeviceToHost));
     
-    // Add bias on CPU for verification
+    // 在 host 侧加 bias（逻辑清晰，便于 debug）
     for (int r = 0; r < rows; ++r) {
       for (int c = 0; c < cols; ++c) {
         q_gpu[r * cols + c] += bq[c];

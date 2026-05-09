@@ -1,5 +1,8 @@
-// RMSNorm V3: weight 缓存在共享内存，x/y 走全局内存；每 warp 一行，warp shuffle 归约平方和
-// Block: 128 线程 = 4 warps，每 block 最多处理 4 行
+// RMSNorm V3
+// - weight 先缓存到共享内存
+// - 每个 warp 处理一行
+// - 用 warp shuffle 归约平方和
+// Block: 128 线程 = 4 个 warp，每个 block 最多覆盖 4 行
 
 #include <cuda_runtime.h>
 
@@ -31,10 +34,12 @@ __global__ void RMSNormV3Kernel(
     const float* __restrict__ weight,
     int rows, int cols, float eps
 ) {
+    // ---------------- warp 到行的映射 ----------------
     const int warp_id = threadIdx.x / WARP_SIZE;
     const int lane = threadIdx.x % WARP_SIZE;
     const int row = blockIdx.x * WARPS_PER_BLOCK + warp_id;
 
+    // ---------------- 先把 weight 搬进共享内存 ----------------
     extern __shared__ float s_weight[];
     for (int c = threadIdx.x; c < cols; c += BLOCK_SIZE) {
         s_weight[c] = weight[c];
@@ -52,6 +57,7 @@ __global__ void RMSNormV3Kernel(
                         (reinterpret_cast<std::uintptr_t>(row_y) % 16u == 0u) &&
                         (reinterpret_cast<std::uintptr_t>(weight) % 16u == 0u);
 
+    // ---------------- 计算平方和 ----------------
     float local_sum = 0.f;
     if (align4) {
         for (int c = lane; c < cols4; c += WARP_SIZE) {
@@ -72,6 +78,7 @@ __global__ void RMSNormV3Kernel(
     const float sq_sum = __shfl_sync(0xffffffff, local_sum, 0);
     const float rms = rsqrtf(sq_sum / static_cast<float>(cols) + eps);
 
+    // ---------------- 回写归一化结果 ----------------
     if (align4) {
         for (int c = lane; c < cols4; c += WARP_SIZE) {
             const float4 vx = __ldg(reinterpret_cast<const float4*>(row_x + c * 4));
@@ -114,11 +121,13 @@ int main() {
     std::ofstream ofs("data/results/rmsnorm_v3_results.csv");
     ofs << "id,rows,cols,gpu_ms,bandwidth_gb_s,max_abs_diff,check\n";
 
+    // 这里保留几档典型尺寸，方便看带宽随规模变化
     std::vector<std::pair<int, int>> test_sizes = {
         {128, 128}, {256, 256}, {512, 512}, {1024, 1024}, {4096, 4096}
     };
 
     for (int i = 0; i < kTestCases; ++i) {
+        // ---------------- host 数据与 CPU 参考 ----------------
         int rows = test_sizes[i].first;
         int cols = test_sizes[i].second;
         int n = rows * cols;
@@ -127,6 +136,7 @@ int main() {
         std::vector<float> cpu(n), gpu(n);
         RMSNormCPU(x.data(), cpu.data(), w.data(), rows, cols, EPS);
 
+        // ---------------- 设备内存 ----------------
         float *dx, *dy, *dw;
         CHECK_CUDA(cudaMalloc(&dx, n * sizeof(float)));
         CHECK_CUDA(cudaMalloc(&dy, n * sizeof(float)));
@@ -134,6 +144,7 @@ int main() {
         CHECK_CUDA(cudaMemcpy(dx, x.data(), n * sizeof(float), cudaMemcpyHostToDevice));
         CHECK_CUDA(cudaMemcpy(dw, w.data(), cols * sizeof(float), cudaMemcpyHostToDevice));
 
+        // ---------------- warmup + benchmark ----------------
         const size_t smem_size = cols * sizeof(float);
         dim3 block(BLOCK_SIZE);
         dim3 grid((rows + WARPS_PER_BLOCK - 1) / WARPS_PER_BLOCK);

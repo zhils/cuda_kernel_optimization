@@ -1,10 +1,10 @@
-// Softmax V1: 在 V0 基础上增加向量化加载和共享内存缓存
+// Softmax V1
 //
-// 核心设计:
-// - 1维 block: 128 线程 = 4 个 warp，每个 warp 处理一行数据
-// - 共享内存缓存: exp 结果存入共享内存，避免全局内存中间读写
-// - 串行归约: 每个 warp 的 lane 0 串行计算 max 和 sum
-// - float4 向量化: 使用 float4 加载和写回，提升内存带宽
+// 核心设计：
+// - 1D block（128 线程 = 4 warp），每个 warp 对应一行
+// - 数据先放共享内存，减少中间访存
+// - lane 0 串行完成该行 max/sum
+// - float4 向量化加载与写回
 
 #include <cuda_runtime.h>
 
@@ -24,6 +24,7 @@
 
 __global__ void SoftmaxV1Kernel(const float* __restrict__ x, float* __restrict__ y,
                                 int rows, int cols) {
+    // ---------------- warp 到行的映射 ----------------
     const int warp_id = threadIdx.x / WARP_SIZE;
     const int lane = threadIdx.x % WARP_SIZE;
     const int row = blockIdx.x * WARPS_PER_BLOCK + warp_id;
@@ -39,6 +40,7 @@ __global__ void SoftmaxV1Kernel(const float* __restrict__ x, float* __restrict__
 
     const int cols4 = cols / 4;
 
+    // ---------------- 行数据搬到共享内存 ----------------
     for (int c = lane; c < cols4; c += WARP_SIZE) {
         const float4 v = __ldg(reinterpret_cast<const float4*>(row_x + c * 4));
         s_exp[c * 4 + 0] = v.x;
@@ -51,6 +53,7 @@ __global__ void SoftmaxV1Kernel(const float* __restrict__ x, float* __restrict__
     }
     __syncthreads();
 
+    // ---------------- lane0 串行算 row_max / row_sum ----------------
     if (lane == 0) {
         float row_max = s_exp[0];
         for (int c = 1; c < cols; ++c) {
@@ -67,6 +70,7 @@ __global__ void SoftmaxV1Kernel(const float* __restrict__ x, float* __restrict__
     }
     __syncthreads();
 
+    // ---------------- 按 inv 写回 ----------------
     const float inv = 1.f / s_sum[warp_id];
     for (int c = lane; c < cols4; c += WARP_SIZE) {
         const float4 e = *reinterpret_cast<const float4*>(s_exp + c * 4);

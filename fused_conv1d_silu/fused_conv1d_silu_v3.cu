@@ -16,22 +16,19 @@
 namespace fused_v3 {
 
 // ============================================================================
-// Fused Conv1D + SiLU v3: SMEM-tiled dual-kernel fusion
+// Fused Conv1D + SiLU v3
 // ============================================================================
-// Key innovations over v2:
-//   1. 2D thread mapping: grid(B*L, ceil(H/256)) × block(256)
-//      → same block serves all h for one (b,t)
-//   2. __shared__ tiling for x_bt: cooperative load once, all h reuse
-//      → eliminates 256× redundant x reads
-//   3. Weights loaded directly (coalesced): adjacent h → contiguous rows
-//   4. Kernel B: 2D grid + shared memory tiling for z_proj along time dim
+// 这一版的思路：
+// 1) 用 2D grid 把 (b,t) 固定在一个 block，h 维在线程里展开
+// 2) x_bt 先放共享内存，避免每个 h 线程重复从全局内存读
+// 3) 保持双 kernel：A 负责 Q/K/V/z，B 负责 conv + SiLU + 门控
 // ============================================================================
 
 constexpr int kBlockSize = 256;
 constexpr int kMaxD = 512;
 
 // ----------------------------------------------------------------------------
-// Kernel A: Compute Q, K, V_raw, z_proj
+// Kernel A：计算 Q / K / V_raw / z_proj
 // grid(B*L, ceil(H/256)) × block(256)
 // ----------------------------------------------------------------------------
 __global__ void ComputeQKVZKernel(const float* __restrict__ x,
@@ -46,6 +43,7 @@ __global__ void ComputeQKVZKernel(const float* __restrict__ x,
                                   int B, int L, int D, int H) {
   __shared__ float x_smem[kMaxD];
 
+  // ---------------- 坐标映射 ----------------
   const int b = blockIdx.x / L;
   const int t = blockIdx.x % L;
   const int h_group = blockIdx.y;
@@ -57,6 +55,7 @@ __global__ void ComputeQKVZKernel(const float* __restrict__ x,
   const size_t x_base = (static_cast<size_t>(b) * L + t) * D;
   const float* x_bt = x + x_base;
 
+  // ---------------- x_bt 协作加载到 smem ----------------
   for (int d = threadIdx.x; d < D; d += kBlockSize) {
     x_smem[d] = x_bt[d];
   }
@@ -64,6 +63,7 @@ __global__ void ComputeQKVZKernel(const float* __restrict__ x,
 
   if (h >= H) return;
 
+  // ---------------- 四条投影一起算 ----------------
   const float* Wq = W_qkv + static_cast<size_t>(h) * D;
   const float* Wk = W_qkv + static_cast<size_t>(h + H) * D;
   const float* Wv = W_qkv + static_cast<size_t>(h + 2 * H) * D;
@@ -74,6 +74,7 @@ __global__ void ComputeQKVZKernel(const float* __restrict__ x,
   float v_raw = b_qkv[h + 2 * H];
   float zp = b_z[h];
 
+  // ---------------- 向量化主循环 + 尾项 ----------------
   int d = 0;
   for (; d + 3 < D; d += 4) {
     const float4 xv = reinterpret_cast<const float4*>(x_smem)[d / 4];
@@ -102,7 +103,7 @@ __global__ void ComputeQKVZKernel(const float* __restrict__ x,
 }
 
 // ----------------------------------------------------------------------------
-// Kernel B: V = V_raw * SiLU(CausalConv1d(z_proj))
+// Kernel B：V = V_raw * SiLU(CausalConv1d(z_proj))
 // grid(B*L, ceil(H/256)) × block(256)
 // ----------------------------------------------------------------------------
 __global__ void ConvGateKernel(const float* __restrict__ z_proj,
@@ -121,6 +122,7 @@ __global__ void ConvGateKernel(const float* __restrict__ z_proj,
 
   const size_t base = (static_cast<size_t>(b) * L) * H;
 
+  // ---------------- 时间窗口搬到共享内存 ----------------
   for (int i = 0; i < k_size; ++i) {
     int ti = t - i;
     if (ti >= 0 && i < 4) {
@@ -132,6 +134,7 @@ __global__ void ConvGateKernel(const float* __restrict__ z_proj,
 
   if (h >= H) return;
 
+  // ---------------- 卷积 + SiLU + 门控 ----------------
   float z_conv = 0.0f;
   for (int i = 0; i < k_size; ++i) {
     int ti = t - i;

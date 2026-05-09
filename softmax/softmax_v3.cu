@@ -1,12 +1,12 @@
-// Softmax V3: Online Softmax + 共享内存 Staging
+// Softmax V3
 //
-// 相比 V2 的改动:
-// 1. Online 算法: 单遍遍历，同时计算 max 和 sum
-// 2. 循环展开: #pragma unroll 展开内层循环
+// 这一版的重点是两件事：
+// 1) Online Softmax：单遍同时维护 row_max 和 row_sum
+// 2) 向量化 + 共享内存：先把一行搬到 smem，再做归约和写回
 //
-// 与 V2 的区别:
-// - V2: 两遍归约（先 max，再 sum）
-// - V3: Online 单遍归约（同时计算 max 和 sum）
+// 对比 v2：
+// - v2 是两遍（max 一遍 + sum 一遍）
+// - v3 把两遍合成一遍，减少同步和访存
 
 #include <cuda_runtime.h>
 
@@ -29,6 +29,7 @@ __global__ void SoftmaxV3Kernel(
     float* __restrict__ y,
     int rows, int cols
 ) {
+    // ---------------- 索引与行指针 ----------------
     const int warp_id = threadIdx.x / WARP_SIZE;
     const int lane = threadIdx.x % WARP_SIZE;
     const int row = blockIdx.x * WARPS_PER_BLOCK + warp_id;
@@ -44,6 +45,7 @@ __global__ void SoftmaxV3Kernel(
 
     const int cols4 = cols / 4;
 
+    // ---------------- 先把这一行搬到共享内存 ----------------
     #pragma unroll 4
     for (int c = lane; c < cols4; c += WARP_SIZE) {
         const float4 v = __ldg(reinterpret_cast<const float4*>(row_x + c * 4));
@@ -57,6 +59,7 @@ __global__ void SoftmaxV3Kernel(
     }
     __syncthreads();
 
+    // ---------------- Online 计算 row_max / row_sum ----------------
     float local_max = -INFINITY;
     float local_sum = 0.f;
 
@@ -84,6 +87,7 @@ __global__ void SoftmaxV3Kernel(
     }
     __syncthreads();
 
+    // ---------------- 用 row_max / row_sum 写回 ----------------
     const float row_max = s_max[warp_id];
     const float row_sum = s_sum[warp_id];
     const float inv = 1.f / row_sum;
@@ -128,7 +132,7 @@ int main() {
     CHECK_CUDA(cudaGetDeviceProperties(&prop, 0));
     size_t max_smem = prop.sharedMemPerBlock;
     
-    // Try to increase max dynamic shared memory to 96KB for sm120
+    // 尝试把动态共享内存上限拉高（sm_120 上通常可到 96KB）
     cudaFuncAttributes attr;
     CHECK_CUDA(cudaFuncGetAttributes(&attr, SoftmaxV3Kernel));
     size_t max_dyn_smem = max_smem;
@@ -150,15 +154,18 @@ int main() {
             continue;
         }
 
+        // ---------------- 准备数据 + CPU 参考 ----------------
         std::vector<float> x(n), cpu(n), gpu(n);
         common::InitMatrix(x, rows, cols);
         SoftmaxCPU(x.data(), cpu.data(), rows, cols);
 
+        // ---------------- 设备内存 ----------------
         float *dx, *dy;
         CHECK_CUDA(cudaMalloc(&dx, n * sizeof(float)));
         CHECK_CUDA(cudaMalloc(&dy, n * sizeof(float)));
         CHECK_CUDA(cudaMemcpy(dx, x.data(), n * sizeof(float), cudaMemcpyHostToDevice));
 
+        // ---------------- warmup + 计时 ----------------
         dim3 block(BLOCK_SIZE);
         dim3 grid((rows + WARPS_PER_BLOCK - 1) / WARPS_PER_BLOCK);
         SoftmaxV3Kernel<<<grid, block, smem_size>>>(dx, dy, rows, cols);

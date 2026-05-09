@@ -16,24 +16,23 @@
 namespace fused_v2 {
 
 // ============================================================================
-// Fused Conv1D + SiLU v2: Full-parallelism dual-kernel fusion
+// Fused Conv1D + SiLU v2（双 kernel 融合）
 // ============================================================================
-// Fuses 5 operations into 2 kernels (from v0's 5 kernels):
-//   Kernel A (ComputQKVZ):  linear_qkv + linear_z + split_qkv
-//   Kernel B (ConvGate):    causal_conv1d + SiLU + gate_mul
+// 从 v0 的多步拆分，合并成两个阶段：
+//   A) ComputeQKVZ：linear_qkv + linear_z + split
+//   B) ConvGate：causal_conv + SiLU + gate_mul
 //
-// Key differences from v1:
-// - Thread mapping: one thread per (b,t,h) → B×L×H threads, matching v0
-// - Restores full GPU parallelism vs v1's serial-L bottleneck
-// - 1 intermediate buffer (z_proj) vs v0's 7 intermediate buffers
-// - float4 vectorized global memory loads
+// 与 v1 的区别：
+// - v1 是每线程串行扫 L；v2 恢复到 (b,t,h) 全并行
+// - 仅保留一个中间缓冲 z_proj
+// - 主路径使用 float4 访存
 // ============================================================================
 
 constexpr int kBlockSize = 256;
 
 // ----------------------------------------------------------------------------
-// Kernel A: Compute Q, K, V_raw, z_proj from x
-// Thread mapping: grid(B*L, ceil(H/256)) × block(256)
+// Kernel A：由 x 计算 Q/K/V_raw/z_proj
+// 线程映射：grid(B*L, ceil(H/256)) × block(256)
 // ----------------------------------------------------------------------------
 __global__ void ComputeQKVZKernel(const float* __restrict__ x,
                                   const float* __restrict__ W_qkv,
@@ -47,6 +46,7 @@ __global__ void ComputeQKVZKernel(const float* __restrict__ x,
                                   int B, int L, int D, int H) {
   const int global_idx = blockIdx.x * blockDim.x + threadIdx.x;
   const int total_threads = blockDim.x * gridDim.x;
+
   for (int idx = global_idx; idx < B * L * H; idx += total_threads) {
     int b = idx / (L * H);
     int rem1 = idx % (L * H);
@@ -93,8 +93,8 @@ __global__ void ComputeQKVZKernel(const float* __restrict__ x,
 }
 
 // ----------------------------------------------------------------------------
-// Kernel B: Compute V = V_raw * SiLU(CausalConv1d(z_proj))
-// Thread mapping: grid(B*L, ceil(H/256)) × block(256)
+// Kernel B：V = V_raw * SiLU(CausalConv1d(z_proj))
+// 线程映射：grid(B*L, ceil(H/256)) × block(256)
 // ----------------------------------------------------------------------------
 __global__ void ConvGateKernel(const float* __restrict__ z_proj,
                                const float* __restrict__ K_conv,

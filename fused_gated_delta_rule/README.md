@@ -1,161 +1,131 @@
-# Fused Gated Delta Rule CUDA 优化复盘
+# Fused Gated Delta Rule
 
-本文档描述 `fused_gated_delta_rule/` 下各版本内核的设计与结论。
+## 目标
 
----
+将 Gated Delta Rule 的三个核心步骤合为一个 CUDA kernel，减少中间张量全局内存读写：
 
-## 1. 项目目标
-
-实现一个融合算子，将 Gated Delta Rule 的三个核心步骤合并为单个 CUDA kernel，减少内存搬运：
-
-- **Compute_Decay_Gate** — 计算衰减门控（decay gate），控制历史状态的遗忘速度
-- **Compute_Delta_Gate** — 计算增量门控（delta gate），控制新输入的更新强度
-- **Recurrent_Delta_Rule_Update** — 递归增量规则更新，包含状态更新和输出生成
+1. **Compute Decay Gate** — 计算衰减门控（sigmoid），控制历史状态遗忘速度
+2. **Compute Delta Gate** — 计算增量门控（softplus），控制新输入更新强度
+3. **Recurrent Delta Update** — 递归状态更新和输出生成
 
 ---
 
-## 2. 数学表达式
+## 数学定义
 
-### 2.1 符号定义
-
-| 符号 | 含义 | 维度 |
-|------|------|------|
-| $x$ | 输入序列 | $(B, L, D)$ |
-| $W_{decay}$ | 衰减门控投影权重 | $(D, H)$ |
-| $b_{decay}$ | 衰减门控偏置 | $(H)$ |
-| $W_{delta}$ | 增量门控投影权重 | $(D, H)$ |
-| $b_{delta}$ | 增量门控偏置 | $(H)$ |
-| $W_{state}$ | 状态投影权重 | $(D, H)$ |
-| $b_{state}$ | 状态偏置 | $(H)$ |
-| $\alpha$ | 衰减门控（decay gate） | $(B, L, H)$ |
-| $\delta$ | 增量门控（delta gate） | $(B, L, H)$ |
-| $s$ | 状态向量（state） | $(B, H)$ |
-| $o$ | 输出序列 | $(B, L, H)$ |
-| $\sigma$ | Sigmoid 激活函数 | — |
-| $\epsilon$ | 数值稳定常数 | $10^{-6}$ |
-
-### 2.2 融合前向计算流程
-
-**Step 1: 计算 Decay Gate**
-
-```
-for each (b, t):
-    alpha_raw[b, t] = x[b, t] @ W_decay^T + b_decay      # (H,)
-    alpha[b, t] = sigmoid(alpha_raw[b, t])                  # (H,), 范围 (0, 1)
-```
-
-**Step 2: 计算 Delta Gate**
-
-```
-for each (b, t):
-    delta_raw[b, t] = x[b, t] @ W_delta^T + b_delta       # (H,)
-    delta[b, t] = softplus(delta_raw[b, t])                 # (H,), 范围 (0, +inf)
-```
-
-**Step 3: 计算输入到状态的投影**
-
-```
-for each (b, t):
-    u[b, t] = x[b, t] @ W_state^T + b_state               # (H,)
-```
-
-**Step 4: Recurrent Delta Rule Update（状态更新 + 输出）**
-
-```
-for each batch b:
-    s = 0                                                   # 初始化状态为 0
-    for t = 0 to L-1:
-        # 状态更新：s_new = alpha * s_old + delta * u
-        s = alpha[b, t] * s + delta[b, t] * u[b, t]         # (H,)
-        
-        # 输出：o = s（或额外的输出投影）
-        o[b, t] = s                                         # (H,)
-```
-
-### 2.3 完整数学公式
-
-**Decay Gate：**
+### Decay Gate
 
 $$
-\alpha_{b,t,h} = \sigma\left(\sum_{d=0}^{D-1} x_{b,t,d} \cdot W_{decay,h,d} + b_{decay,h}\right)
+\alpha_{b,t,h} = \sigma\left(\sum_{d} x_{b,t,d} \cdot W_{decay,h,d} + b_{decay,h}\right)
 $$
 
-**Delta Gate：**
+### Delta Gate
 
 $$
-\delta_{b,t,h} = \text{softplus}\left(\sum_{d=0}^{D-1} x_{b,t,d} \cdot W_{delta,h,d} + b_{delta,h}\right)
+\delta_{b,t,h} = \text{softplus}\left(\sum_{d} x_{b,t,d} \cdot W_{delta,h,d} + b_{delta,h}\right)
 $$
 
-**State Projection：**
+### State Projection
 
 $$
-u_{b,t,h} = \sum_{d=0}^{D-1} x_{b,t,d} \cdot W_{state,h,d} + b_{state,h}
+u_{b,t,h} = \sum_{d} x_{b,t,d} \cdot W_{state,h,d} + b_{state,h}
 $$
 
-**Recurrent State Update：**
+### Recurrent State Update
 
 $$
 s_{b,t,h} = \alpha_{b,t,h} \cdot s_{b,t-1,h} + \delta_{b,t,h} \cdot u_{b,t,h}
 $$
 
-其中 $s_{b,-1,h} = 0$（初始状态为零）。
+---
 
-**Output：**
+## 版本演进
 
-$$
-o_{b,t,h} = s_{b,t,h}
-$$
+### v0：基线（逐个操作分离）
 
-### 2.4 Softplus 激活函数
+每个步骤独立为 CUDA kernel，中间结果写回全局内存。
 
-$$
-\text{softplus}(x) = \ln(1 + e^x)
-$$
+```
+5 kernels: W_decay @ x → alpha (sigmoid)
+           W_delta @ x → delta (softplus)
+           W_state @ x → u
+           alpha * s + delta * u → s (recurrent)
+           s → output
+```
 
-等价于数值稳定形式：
+### v1：访存效率优化（单 kernel 全融合 + SMEM 缓存 + float4）
 
-$$
-\text{softplus}(x) = \max(0, x) + \ln(1 + e^{-|x|})
-$$
+将 5 个 kernel 融合为 **单个 kernel**，grid(B) 每 block 处理一个 batch：
 
-### 2.5 融合优势
+| 优化 | 说明 |
+|------|------|
+| **全融合** | 投影 + 递联合并，消除 alpha/delta/u 三个中间缓冲（B×L×H ×3） |
+| **SMEM 缓存 x** | 每时间步将 x[t][D] 加载到 SMEM，所有 h 线程共享，加载仅 1 次 |
+| **float4 向量化** | float4 向量化加载 x 到 SMEM，指令数降为 1/4 |
+| **寄存器状态** | 状态 s 在寄存器中跨时间步递推，不写回全局内存 |
+| **1 次 syncthreads** | 每时间步仅需 1 次 barrier（SMEM 加载后 + 计算后各 1 次） |
 
-将三个步骤融合为单个 kernel 的优势：
+**预期效果：** kernel launch 从 4 次降至 1 次，中间缓冲全局读写减少 3×B×L×H×4B，访存总量降低约 60%。
 
-1. **减少全局内存搬运**：$\alpha, \delta, u$ 可以直接在寄存器/共享内存中计算并使用，无需写回全局内存
-2. **隐藏延迟**：门控计算和状态更新可以流水线化
-3. **更好的占用率**：单个 kernel 可以更好地利用 GPU 资源
+### v2：计算强度优化（双 head ILP + FMA + float4 权重加载）
+
+在 v1 基础上，核心优化方向是提升计算吞吐：
+
+| 优化 | 说明 |
+|------|------|
+| **双 head ILP** | 每线程处理 2 个 h，6 路（3 投影 ×2h）累加器交错调度 |
+| **`__fmaf_rn`** | 融合乘加 `A += x * W` → `__fmaf_rn(x, W, A)`，指令数减半 |
+| **float4 权重加载** | `float4` 一次加载 4 个 weight，与 x 的 4 个元素逐次 FMA |
+| **`#pragma unroll 4`** | 展开内层 matvec 循环，暴露 ILP |
+| **block=128** | 减少线程数，增加每线程计算密度（每线程 h 数翻倍） |
+
+| 版本 | 策略 | Kernel 数 | 中间缓冲 | SMEM 用途 | 计算方式 | 每线程 h |
+|:----|------|:---------:|:--------:|:---------:|:--------:|:--------:|
+| v0 | 分离 kernel | 4 | alpha, delta, u | 仅归约 | 标量乘加 | 1 |
+| v1 | 全融合 | 1 | 无 | s_x[D] 缓存 x | 标量乘加 | 1 |
+| v2 | ILP + FMA | 1 | 无 | s_x[D] 缓存 x | **float4 FMA** | **2** |
 
 ---
 
-## 3. 版本演进
+## INT8 量化补偿实验
 
-### 3.1 v0：朴素基线（逐个操作分离）
+对三张投影权重做 INT8 量化的 CPU 仿真精度实验：
 
-**文件：** `fused_gated_delta_rule_v0.cu`
+| 方案 | 说明 |
+|------|------|
+| A | per-tensor INT8 反量化后计算 |
+| B | per-channel（按输出头）INT8 |
+| C | A + per-head output bias correction |
+| D | A + state 投影分支保留 FP32 残差 |
 
-- 每个操作单独实现为 CUDA kernel，中间结果写回全局内存
-- Decay Gate、Delta Gate、State Projection 分别计算
-- Recurrent Update 单独一个 kernel
-- 用于验证正确性和作为后续融合优化的基准
+构建运行：
+
+```bash
+cmake --build build --target fused_gated_delta_rule_compensation_test
+./build/bin/fused_gated_delta_rule_compensation_test
+```
 
 ---
 
-## 4. 产物路径
+## Nsight Compute 瓶颈分析
 
-- **可执行文件：** `build/bin/fused_gated_delta_rule_v0`
-- **结果 CSV：** `data/results/fused_gated_delta_rule_v0_results.csv`
+`ncu --set basic`，`fused_gated_delta_rule_v0`：
+
+| 内核 | Duration(us) | Compute(SM) | DRAM | Achieved Occupancy | Reg/Thr |
+|:----|:-----------:|:-----------:|:----:|:------------------:|:-------:|
+| `RecurrentDeltaRuleKernel` | 814.21 | 2.28% | 31.69% | 16.53% | 40 |
+
+时间维串行递推导致并行度受限，为延迟/带宽混合瓶颈。v1/v2 通过消除中间缓冲与 ILP 优化提升有效吞吐。
 
 ---
 
-## PTX / SASS
+## 构建
 
-PTX 和 SASS 在 `fused_gated_delta_rule/asm/` 下。
+```bash
+cd build && cmake .. -DCMAKE_CUDA_ARCHITECTURES=120 && make fused_gated_delta_rule_v0 -j$(nproc)
+cd ..
+./build/bin/fused_gated_delta_rule_v0
 
-使用 `cuobjdump -sass` 可查看 SASS 反汇编。
-
-## 产物路径
-
-- 可执行文件：`build/bin/`
-- 结果 CSV：`data/results/`
-- PTX/SASS：`fused_gated_delta_rule/asm/ptx/`、`fused_gated_delta_rule/asm/sass/`
+# v1/v2 同理
+./build/bin/fused_gated_delta_rule_v1
+./build/bin/fused_gated_delta_rule_v2
+```

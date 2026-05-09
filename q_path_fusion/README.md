@@ -1,51 +1,55 @@
-# Q 路径融合（Q Path Fusion）
+# Q Path Fusion
 
-## 1. 目标
+## 目标
 
-将注意力模块中 Query 分支的两步计算融合到一条路径：
-
-1. `RMSNorm`
-2. `Linear(Q)`（即乘 `W_q` 加 `b_q`）
-
-融合后减少中间张量回写，便于后续继续做向量化、warp/block 归约、分块 GEMM 等优化。
-
-## 2. 数学表达式
-
-设输入为 `X \in R^{R x D}`，其中 `R` 是行数（token 数），`D` 是隐藏维度。  
-`gamma \in R^D` 为 RMSNorm 权重，`W_q \in R^{D x D}`，`b_q \in R^D`。
-
-对第 `r` 行：
-
-```text
-s_r = sqrt( (1 / D) * sum_{k=0}^{D-1} X_{r,k}^2 + eps )
-N_{r,k} = (X_{r,k} / s_r) * gamma_k
-Q_{r,n} = sum_{k=0}^{D-1} N_{r,k} * W_{q,k,n} + b_{q,n}
-```
-
-矩阵形式可写为：
-
-```text
-N = RMSNorm(X; gamma, eps)
-Q = N * W_q + b_q
-```
-
-## 3. 版本规划
-
-- `v0`: 朴素融合版（正确性基线）
-- `v1`: 访存优化版（并行归约 + 共享内存缓存 `norm`）
-- `v2`: 在 `v1` 基础上改为 warp-per-row（`block=128`，每 lane 同时算 2 个输出）
-- `v2_bq_only`: `v2` 对照版（只缓存 `bq`，`wq` 直接访存；每 lane 同算 2 输出）
-- `v3`: 在 `v2` 基础上增加 `wq` tile 双缓冲（ping-pong）
-
+将注意力模块中 Query 分支的两步计算（RMSNorm + Linear）融合到一条路径，减少中间张量全局内存读写。
 
 ---
 
-## PTX / SASS
+## 数学定义
 
-PTX 和 SASS 在 `q_path_fusion/asm/` 下。
+设输入 $X \in \mathbb{R}^{R \times D}$，gamma ∈ R^D 为 RMSNorm 权重，$W_q \in \mathbb{R}^{D \times D}$，$b_q \in \mathbb{R}^D$。
 
-## 产物路径
+$$
+N = \text{RMSNorm}(X; \gamma, \epsilon)
+$$
 
-- 可执行文件：`build/bin/`
-- 结果 CSV：`data/results/`
-- PTX/SASS：`q_path_fusion/asm/ptx/`、`q_path_fusion/asm/sass/`
+$$
+Q = N \cdot W_q + b_q
+$$
+
+---
+
+## 版本规划
+
+| 版本 | 做法 |
+|:----|------|
+| v0 | 朴素融合（正确性基线） |
+| v1 | 并行归约 + SMEM 缓存 norm |
+| v2 | Warp-per-row（block=128，每 lane 同时算 2 输出） |
+| v2_bq_only | v2 对照版（只缓存 bq，wq 直接访存） |
+
+---
+
+## 构建
+
+```bash
+cd build && cmake .. -DCMAKE_CUDA_ARCHITECTURES=120 && make q_path_fusion_v2 -j$(nproc)
+cd ..
+./build/bin/q_path_fusion_v2
+```
+
+---
+
+## Nsight Compute 瓶颈分析（2026-05-09）
+
+命令：`ncu --set basic --target-processes all --kernel-name-base demangled`。  
+统计口径：每个版本取 Duration 最大的一次 launch。
+
+| 版本 | 代表内核 | Max Duration(us) | Compute(SM) | DRAM | Memory | Achieved Occupancy | Reg/Thr | 结论 |
+|:-----|:---------|-----------------:|------------:|-----:|-------:|-------------------:|--------:|:-----|
+| `q_path_fusion_v0` | `QPathFusionV0Kernel` | 166.91 | 72.45% | 4.13% | 72.45% | 88.76% | 34 | 计算占主导，occupancy 较高 |
+| `q_path_fusion_v1` | `QPathFusionV1Kernel` | 161.60 | 75.89% | 4.42% | 75.89% | 89.03% | 34 | 相比 v0 有小幅提升 |
+| `q_path_fusion_v2` | `RMSNormKernel` | 697.89 | 17.81% | 81.28% | 81.28% | 95.80% | 18 | 以 RMSNorm 阶段的带宽瓶颈为主 |
+
+原始报告：`data/ncu_reports/text/q_path_fusion_v0.txt`、`q_path_fusion_v1.txt`、`q_path_fusion_v2.txt`。
