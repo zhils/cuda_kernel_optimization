@@ -6,18 +6,18 @@ BIN="${ROOT_DIR}/build/bin"
 RUN_ID="${RUN_ID:-ncu_$(date -u +%Y%m%dT%H%M%SZ)}"
 OUT_DIR="${ROOT_DIR}/data/ncu_reports/${RUN_ID}"
 TEXT_DIR="${OUT_DIR}/text"
+CACHE_PATH="${ROOT_DIR}/data/baselines/autotune_cache.json"
+CATALOG_PATH="${ROOT_DIR}/configs/kernel_catalog.json"
 mkdir -p "${TEXT_DIR}"
 
 NCU="ncu --set basic --target-processes all --kernel-name-base demangled --print-summary per-kernel"
 ALLOW_NCU_FAIL="${ALLOW_NCU_FAIL:-0}"
 
-TARGETS=(
-  gemm_v0 gemm_v1 gemm_v2 gemm_v3 gemm_v4 gemm_fp16
-  softmax_v0 softmax_v1 softmax_v2 softmax_v3
-  flash_attention_v3 flash_attention_v4
-  fused_gated_delta_rule_v1 fused_gated_delta_rule_v2
-  fused_l2_norm_qk_v1 fused_l2_norm_qk_v2
-  fused_output_norm_gate_v1 fused_output_norm_gate_v2
+mapfile -t TARGETS < <(
+  python3 "${ROOT_DIR}/scripts/kernel_dispatch.py" \
+    --catalog "${CATALOG_PATH}" \
+    --tier profile_all \
+    --autotune-cache "${CACHE_PATH}"
 )
 
 if [[ -n "${NCU_ALL_QUICK:-}" ]]; then

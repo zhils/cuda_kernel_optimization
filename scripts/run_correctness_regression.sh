@@ -7,35 +7,36 @@ RESULTS_ROOT="${ROOT_DIR}/data/results"
 eval "$(python3 "${ROOT_DIR}/scripts/collect_env_manifest.py" --results-root "${RESULTS_ROOT}" --run-id "${RUN_ID:-}" --emit-shell)"
 LOG_DIR="${RUN_DIR}/regression_logs"
 SUMMARY_PATH="${RUN_DIR}/regression_summary.csv"
+CACHE_PATH="${ROOT_DIR}/data/baselines/autotune_cache.json"
+CATALOG_PATH="${ROOT_DIR}/configs/kernel_catalog.json"
 mkdir -p "${LOG_DIR}"
 
-# 统一小规模正确性回归。每个二进制都会打印 PASS/FAIL。
-TARGETS=(
-  gemm_v1
-  gemm_v2
-  gemm_v3
-  gemm_v4
-  gemm_fp16
-  gemm_int8
-  softmax_v1
-  softmax_v2
-  softmax_v3
-  rmsnorm_v1
-  rmsnorm_v2
-  rmsnorm_v3
-  flash_attention_v1
-  flash_attention_v3
-  fused_conv1d_silu_v1
-  fused_conv1d_silu_v3
-  fused_gated_delta_rule_v1
-  fused_gated_delta_rule_v2
-  fused_l2_norm_qk_v1
-  fused_l2_norm_qk_v2
-  fused_output_norm_gate_v1
-  fused_output_norm_gate_v2
-  q_path_fusion_v1
-  q_path_fusion_v2
+mapfile -t TARGETS < <(
+  python3 "${ROOT_DIR}/scripts/kernel_dispatch.py" \
+    --catalog "${CATALOG_PATH}" \
+    --tier smoke \
+    --autotune-cache "${CACHE_PATH}"
 )
+
+GEMM_CASES_PATH="${ROOT_DIR}/data/gemm/test_cases.csv"
+GEMM_CASES_BACKUP=""
+if [[ "${RANDOM_GEMM_CASES:-0}" == "1" ]]; then
+  GEMM_CASES_BACKUP="${ROOT_DIR}/data/gemm/test_cases.backup.${RUN_ID}.csv"
+  cp "${GEMM_CASES_PATH}" "${GEMM_CASES_BACKUP}"
+  python3 "${ROOT_DIR}/scripts/generate_random_gemm_cases.py" \
+    --output "${GEMM_CASES_PATH}" \
+    --count "${RANDOM_GEMM_CASES_COUNT:-12}" \
+    --seed "${RANDOM_GEMM_CASES_SEED:-20260511}"
+  echo "[regression] RANDOM_GEMM_CASES enabled, backup=${GEMM_CASES_BACKUP}"
+fi
+
+restore_gemm_cases() {
+  if [[ -n "${GEMM_CASES_BACKUP}" && -f "${GEMM_CASES_BACKUP}" ]]; then
+    mv "${GEMM_CASES_BACKUP}" "${GEMM_CASES_PATH}"
+    echo "[regression] restored ${GEMM_CASES_PATH}"
+  fi
+}
+trap restore_gemm_cases EXIT
 
 echo "[regression] building ${#TARGETS[@]} targets..."
 cmake --build "${BUILD_DIR}" --target "${TARGETS[@]}"

@@ -5,6 +5,8 @@ ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 BIN="${ROOT_DIR}/build/bin"
 RUN_ID="${RUN_ID:-ncu_$(date -u +%Y%m%dT%H%M%SZ)}"
 OUT_DIR="${ROOT_DIR}/data/ncu_reports/${RUN_ID}/stall"
+CACHE_PATH="${ROOT_DIR}/data/baselines/autotune_cache.json"
+CATALOG_PATH="${ROOT_DIR}/configs/kernel_catalog.json"
 mkdir -p "${OUT_DIR}"
 
 STALL_METRICS="\
@@ -19,16 +21,11 @@ smsp__average_warps_issue_stalled_math_pipe_throttle_per_issue_active.ratio"
 NCU="ncu --target-processes all --kernel-name-base demangled --print-summary per-kernel --metrics ${STALL_METRICS}"
 ALLOW_NCU_FAIL="${ALLOW_NCU_FAIL:-0}"
 
-TARGETS=(
-  gemm_v3 gemm_v4 gemm_fp16
-  softmax_v3
-  rmsnorm_v3
-  flash_attention_v3 flash_attention_v4
-  fused_conv1d_silu_v3
-  fused_gated_delta_rule_v2
-  fused_l2_norm_qk_v2
-  fused_output_norm_gate_v2
-  q_path_fusion_v2
+mapfile -t TARGETS < <(
+  python3 "${ROOT_DIR}/scripts/kernel_dispatch.py" \
+    --catalog "${CATALOG_PATH}" \
+    --tier profile_stall \
+    --autotune-cache "${CACHE_PATH}"
 )
 
 if [[ -n "${NCU_STALL_QUICK:-}" ]]; then

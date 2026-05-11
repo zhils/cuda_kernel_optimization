@@ -7,25 +7,15 @@ RESULTS_ROOT="${ROOT_DIR}/data/results"
 eval "$(python3 "${ROOT_DIR}/scripts/collect_env_manifest.py" --results-root "${RESULTS_ROOT}" --run-id "${RUN_ID:-}" --emit-shell)"
 LOG_DIR="${RUN_DIR}/repro_logs"
 SUMMARY_PATH="${RUN_DIR}/summary_standardized.csv"
+CACHE_PATH="${ROOT_DIR}/data/baselines/autotune_cache.json"
+CATALOG_PATH="${ROOT_DIR}/configs/kernel_catalog.json"
 mkdir -p "${LOG_DIR}"
 
-# 选择每个算子的一版主力实现 + 参考实现。
-TARGETS=(
-  gemm_v3
-  gemm_v4
-  gemm_fp16
-  gemm_cublas_ref
-  softmax_v3
-  softmax_benchmark_all
-  rmsnorm_v3
-  rmsnorm_cub_ref
-  flash_attention_v3
-  flash_attention_v4
-  fused_conv1d_silu_v3
-  fused_gated_delta_rule_v2
-  fused_l2_norm_qk_v2
-  fused_output_norm_gate_v2
-  q_path_fusion_v2
+mapfile -t TARGETS < <(
+  python3 "${ROOT_DIR}/scripts/kernel_dispatch.py" \
+    --catalog "${CATALOG_PATH}" \
+    --tier full \
+    --autotune-cache "${CACHE_PATH}"
 )
 
 echo "[repro] environment:"

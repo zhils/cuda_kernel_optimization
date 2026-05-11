@@ -20,6 +20,15 @@ case "${TIER}" in
     export RUN_ID
     bash "${ROOT_DIR}/scripts/run_correctness_regression.sh"
     bash "${ROOT_DIR}/scripts/run_benchmark_repro.sh"
+    AUTO_TUNE_UPDATE="${AUTO_TUNE_UPDATE:-1}"
+    AUTO_TUNE_CACHE="${AUTO_TUNE_CACHE:-${ROOT_DIR}/data/baselines/autotune_cache.json}"
+    if [[ "${AUTO_TUNE_UPDATE}" == "1" ]]; then
+      python3 "${ROOT_DIR}/scripts/update_autotune_cache.py" \
+        --summary "${ROOT_DIR}/data/results/runs/${RUN_ID}/summary_standardized.csv" \
+        --output "${AUTO_TUNE_CACHE}"
+    else
+      echo "[suite] AUTO_TUNE_UPDATE disabled"
+    fi
     PERF_GATE="${PERF_GATE:-1}"
     PERF_GATE_BASELINE="${PERF_GATE_BASELINE:-${ROOT_DIR}/data/baselines/perf_golden.csv}"
     PERF_GATE_WARN_MS_REGRESS_PCT="${PERF_GATE_WARN_MS_REGRESS_PCT:-8}"
