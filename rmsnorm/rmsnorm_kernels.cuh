@@ -129,6 +129,7 @@ __global__ void RMSNormV2Kernel(
     const float val = s_row[c];
     local_sum += val * val;
   }
+  // 区别只是变成了规约求和
 #pragma unroll
   for (int offset = 16; offset > 0; offset >>= 1) {
     local_sum += __shfl_down_sync(0xffffffff, local_sum, offset);

@@ -31,7 +31,6 @@ endforeach()
 # CUDA 13.2 + sm_120 toolchain does not expose tf32 WMMA tags by default.
 # Enable Ampere WMMA tag path for legacy tf32 kernels.
 target_compile_definitions(gemm_v4 PRIVATE __CUDA_AMPERE_MMA__)
-target_compile_definitions(gemm_v5 PRIVATE __CUDA_AMPERE_MMA__)
 
 target_link_libraries(gemm_cublas_ref PRIVATE cublas)
 target_link_libraries(gemm_fp8 PRIVATE cublasLt)

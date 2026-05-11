@@ -130,8 +130,11 @@ __global__ void fused_gdr_v2_kernel(
     int nthreads = blockDim.x;
     int h_pairs = (H + 2 * nthreads - 1) / (2 * nthreads);
 
-    float s_reg0[2] = {0.0f, 0.0f};
-    float s_reg1[2] = {0.0f, 0.0f};
+    // 每个线程可能跨多个 pair（当 H > 2 * nthreads），
+    // 状态槽位索引应使用 pair 序号 p，而不是 h0/2 的全局编号。
+    constexpr int kMaxPairsPerThread = 8;
+    float s_reg0[kMaxPairsPerThread] = {0.0f};
+    float s_reg1[kMaxPairsPerThread] = {0.0f};
 
     for (int t = 0; t < L; ++t) {
         // float4 加载 x[t] → SMEM
@@ -152,11 +155,12 @@ __global__ void fused_gdr_v2_kernel(
         __syncthreads();
 
         for (int p = 0; p < h_pairs; ++p) {
+            if (p >= kMaxPairsPerThread) break;
             int h0 = (tid * 2 + 0) + p * (2 * nthreads);
             int h1 = (tid * 2 + 1) + p * (2 * nthreads);
             if (h0 >= H) break;
 
-            int idx0 = h0 / 2;
+            int idx0 = p;
             float s0_val = s_reg0[idx0];
             float s1_val = (h1 < H) ? s_reg1[idx0] : 0.0f;
 

@@ -1,71 +1,53 @@
-#!/bin/bash
-# 收集所有缺失的 ncu profiling 数据
-# 用法: bash run_ncu_all.sh
+#!/usr/bin/env bash
+set -euo pipefail
 
-set -e
+ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+BIN="${ROOT_DIR}/build/bin"
+RUN_ID="${RUN_ID:-ncu_$(date -u +%Y%m%dT%H%M%SZ)}"
+OUT_DIR="${ROOT_DIR}/data/ncu_reports/${RUN_ID}"
+TEXT_DIR="${OUT_DIR}/text"
+mkdir -p "${TEXT_DIR}"
 
 NCU="ncu --set basic --target-processes all --kernel-name-base demangled --print-summary per-kernel"
-BIN="./build/bin"
-OUT="data/ncu_reports/text"
+ALLOW_NCU_FAIL="${ALLOW_NCU_FAIL:-0}"
 
-mkdir -p "$OUT"
+TARGETS=(
+  gemm_v0 gemm_v1 gemm_v2 gemm_v3 gemm_v4 gemm_fp16
+  softmax_v0 softmax_v1 softmax_v2 softmax_v3
+  flash_attention_v3 flash_attention_v4
+  fused_gated_delta_rule_v1 fused_gated_delta_rule_v2
+  fused_l2_norm_qk_v1 fused_l2_norm_qk_v2
+  fused_output_norm_gate_v1 fused_output_norm_gate_v2
+)
 
-# ===== GEMM 系列（缺失 Compute/DRAM/Memory/Occupancy） =====
-echo "=== gemm_v0 ==="
-$NCU $BIN/gemm_v0 -c 1 -n 1 2>&1 | tee "$OUT/gemm_v0.txt" | grep -E "(Duration|Compute|DRAM|Memory|Occupancy|Registers)"
+if [[ -n "${NCU_ALL_QUICK:-}" ]]; then
+  TARGETS=(gemm_v3 rmsnorm_v3 softmax_v3)
+fi
 
-echo "=== gemm_v1 ==="
-$NCU $BIN/gemm_v1 -c 1 -n 1 2>&1 | tee "$OUT/gemm_v1.txt" | grep -E "(Duration|Compute|DRAM|Memory|Occupancy|Registers)"
+run_target() {
+  local t="$1"
+  local out="${TEXT_DIR}/${t}.txt"
+  echo "=== ${t} ==="
 
-echo "=== gemm_v2 ==="
-$NCU $BIN/gemm_v2 -c 1 -n 1 2>&1 | tee "$OUT/gemm_v2.txt" | grep -E "(Duration|Compute|DRAM|Memory|Occupancy|Registers)"
+  if [[ "${t}" == gemm_* ]]; then
+    if ! ${NCU} "${BIN}/${t}" -c 1 -n 1 > "${out}" 2>&1; then
+      return 1
+    fi
+  else
+    if ! ${NCU} "${BIN}/${t}" > "${out}" 2>&1; then
+      return 1
+    fi
+  fi
+  grep -E "(Duration|Compute|DRAM|Memory|Occupancy|Registers)" "${out}" || true
+}
 
-echo "=== gemm_v3 ==="
-$NCU $BIN/gemm_v3 -c 1 -n 1 2>&1 | tee "$OUT/gemm_v3.txt" | grep -E "(Duration|Compute|DRAM|Memory|Occupancy|Registers)"
-
-echo "=== gemm_v4 ==="
-$NCU $BIN/gemm_v4 -c 1 -n 1 2>&1 | tee "$OUT/gemm_v4.txt" | grep -E "(Duration|Compute|DRAM|Memory|Occupancy|Registers)"
-
-echo "=== gemm_fp16 ==="
-$NCU $BIN/gemm_fp16 -c 1 -n 1 2>&1 | tee "$OUT/gemm_fp16.txt" | grep -E "(Duration|Compute|DRAM|Memory|Occupancy|Registers)"
-
-# ===== Softmax 系列（缺少 Duration 和 Memory 列） =====
-for v in v0 v1 v2 v3; do
-    echo "=== softmax_${v} ==="
-    $NCU $BIN/softmax_${v} 2>&1 | tee "$OUT/softmax_${v}.txt" | grep -E "(Duration|Compute|DRAM|Memory|Occupancy|Registers)"
+for t in "${TARGETS[@]}"; do
+  if [[ "${ALLOW_NCU_FAIL}" == "1" ]]; then
+    run_target "${t}" || echo "[ncu][warn] failed target=${t}"
+  else
+    run_target "${t}"
+  fi
 done
 
-# ===== Flash Attention v3/v4（全新，未在表中） =====
-echo "=== flash_attention_v3 ==="
-$NCU $BIN/flash_attention_v3 2>&1 | tee "$OUT/flash_attention_v3.txt" | grep -E "(Duration|Compute|DRAM|Memory|Occupancy|Registers)"
-
-echo "=== flash_attention_v4 ==="
-$NCU $BIN/flash_attention_v4 2>&1 | tee "$OUT/flash_attention_v4.txt" | grep -E "(Duration|Compute|DRAM|Memory|Occupancy|Registers)"
-
-# ===== Fused Gated Delta Rule v1/v2（全新） =====
-echo "=== fused_gated_delta_rule_v1 ==="
-$NCU $BIN/fused_gated_delta_rule_v1 2>&1 | tee "$OUT/fused_gated_delta_rule_v1.txt" | grep -E "(Duration|Compute|DRAM|Memory|Occupancy|Registers)"
-
-echo "=== fused_gated_delta_rule_v2 ==="
-$NCU $BIN/fused_gated_delta_rule_v2 2>&1 | tee "$OUT/fused_gated_delta_rule_v2.txt" | grep -E "(Duration|Compute|DRAM|Memory|Occupancy|Registers)"
-
-# ===== Fused L2 Norm Q/K v1/v2（全新） =====
-echo "=== fused_l2_norm_qk_v1 ==="
-$NCU $BIN/fused_l2_norm_qk_v1 2>&1 | tee "$OUT/fused_l2_norm_qk_v1.txt" | grep -E "(Duration|Compute|DRAM|Memory|Occupancy|Registers)"
-
-echo "=== fused_l2_norm_qk_v2 ==="
-$NCU $BIN/fused_l2_norm_qk_v2 2>&1 | tee "$OUT/fused_l2_norm_qk_v2.txt" | grep -E "(Duration|Compute|DRAM|Memory|Occupancy|Registers)"
-
-# ===== Fused Output Norm Gate v1/v2（全新） =====
-echo "=== fused_output_norm_gate_v1 ==="
-$NCU $BIN/fused_output_norm_gate_v1 2>&1 | tee "$OUT/fused_output_norm_gate_v1.txt" | grep -E "(Duration|Compute|DRAM|Memory|Occupancy|Registers)"
-
-echo "=== fused_output_norm_gate_v2 ==="
-$NCU $BIN/fused_output_norm_gate_v2 2>&1 | tee "$OUT/fused_output_norm_gate_v2.txt" | grep -E "(Duration|Compute|DRAM|Memory|Occupancy|Registers)"
-
-echo ""
-echo "========== 全部完成 =========="
-echo "结果保存至 data/ncu_reports/text/"
-echo ""
-echo "请将以下文件内容发给我："
-ls -1 "$OUT"/*.txt
+echo "[ncu] done run_id=${RUN_ID}"
+echo "[ncu] text reports: ${TEXT_DIR}"

@@ -5,6 +5,7 @@
 #include <fstream>
 #include <iomanip>
 #include <iostream>
+#include <string>
 #include <vector>
 
 #include "common/benchmark.h"
@@ -32,7 +33,10 @@ __global__ void GemmV2Kernel(
     const float* __restrict__ A, 
     const float* __restrict__ B,
     float* __restrict__ C, 
-    int M, int N, int K) {
+    int M, 
+    int N, 
+    int K
+) {
 
     __shared__ float As[kBlockM][kTileK + kPadA];
     __shared__ float Bs[kTileK + kPadB][kBlockN];
@@ -40,8 +44,10 @@ __global__ void GemmV2Kernel(
     const int tx = threadIdx.x;
     const int ty = threadIdx.y;
     const int tid = ty * kBlockThreadsX + tx;
-
+    
+    // 先计算在A中的起始位置
     const int row_start = blockIdx.y * kBlockM + ty * kTM;
+    // 计算在B中起始位置
     const int col_start = blockIdx.x * kBlockN + tx * kTN;
 
     float sum[kTM][kTN] = {};
@@ -209,20 +215,24 @@ int main() {
         ms /= kRepeat;
 
         CHECK_CUDA(cudaMemcpy(C_gpu.data(), d_C, M * N * sizeof(float), cudaMemcpyDeviceToHost));
+        bool did_verify = (M <= kMaxCpuVerifyDim && N <= kMaxCpuVerifyDim);
         bool ok = true;
-        if (M <= kMaxCpuVerifyDim && N <= kMaxCpuVerifyDim) {
+        if (did_verify) {
             ok = common::CheckEqual(C_cpu, C_gpu, 1e-3f);
         }
         double gflops = (2.0 * M * N * K) / (ms * 1e6);
+        const char* check = did_verify ? (ok ? "PASS" : "FAIL") : "NOT_RUN";
+        const std::string max_abs_diff =
+            did_verify ? std::to_string(common::MaxAbsDiff(C_cpu, C_gpu)) : "";
 
         std::cout << M << "x" << N << "x" << K << " | " << std::fixed << std::setprecision(4) << ms << " ms"
                   << " | " << std::setprecision(1) << gflops << " GFLOP/s"
-                  << " | " << (ok ? "PASS" : "FAIL") << "\n";
+                  << " | " << check << "\n";
 
         ofs << i << ",gemm_v2," << M << "," << N << "," << K << ","
             << ms << "," << gflops << ","
-            << common::MaxAbsDiff(C_cpu, C_gpu) << ","
-            << (ok ? "PASS" : "FAIL") << "\n";
+            << max_abs_diff << ","
+            << check << "\n";
 
         CHECK_CUDA(cudaEventDestroy(start));
         CHECK_CUDA(cudaEventDestroy(stop));

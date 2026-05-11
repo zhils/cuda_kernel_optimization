@@ -5,57 +5,67 @@
 #include <fstream>
 #include <iomanip>
 #include <iostream>
+#include <string>
 #include <vector>
 
 #include "common/benchmark.h"
 #include "common/cuda_utils.h"
 
-constexpr int kTileM = 16;
-constexpr int kTileN = 16;
-constexpr int kTileK = 16;
+constexpr int TM = 16;
+constexpr int TN = 16;
+constexpr int TK = 16;
 
-__global__ void GemmV1Kernel(const float* __restrict__ A, const float* __restrict__ B,
-    float* __restrict__ C, int M, int N, int K) {
-    const int block_row = blockIdx.y * kTileM;
-    const int block_col = blockIdx.x * kTileN;
-    const int thread_row = threadIdx.y;
-    const int thread_col = threadIdx.x;
-    const int row = block_row + thread_row;
-    const int col = block_col + thread_col;
+__global__ void GemmV1Kernel(
+    const float* __restrict__ A,
+    const float* __restrict__ B,
+    float* __restrict__  C,
+    int M,
+    int N,
+    int K
+){
+    // 主要思路：一个block负责C中TM*TN范围的大小
 
-    if (row >= M || col >= N) return;
+    // 首先是获取当前BLOCK在c中的位置
+    const int row = blockIdx.y * TM;
+    const int col = blockIdx.x * TN;
+    // 当前线程是属于偏移
+    const int tx = threadIdx.x;
+    const int ty = threadIdx.y;
+    bool valid = (row + ty < M && col + tx < N);
 
-    __shared__ float As[kTileM][kTileK];
-    __shared__ float Bs[kTileK][kTileN];
+    __shared__ float As[TM][TK];
+    __shared__ float Bs[TK][TN];
+    // 计算在共享内存中的坐标
 
+    int num_k = (K + TK- 1) / TK;
     float sum = 0.0f;
-
-    const int num_k_tiles = (K + kTileK - 1) / kTileK;
-
-    for (int t = 0; t < num_k_tiles; ++t) {
-        const int k_start = t * kTileK;
-
-        if (thread_col < kTileK && k_start + thread_col < K) {
-            As[thread_row][thread_col] = A[row * K + (k_start + thread_col)];
+    
+    for(int t = 0; t < num_k; ++t){
+        // 首先将数据加载到共享内存
+        if(t * TK + tx < K){
+            As[ty][tx] = A[(row + ty) * K + t * TK + tx];        
         } else {
-            As[thread_row][thread_col] = 0.0f;
+            As[ty][tx] = 0.0f;
         }
 
-        if (thread_row < kTileK && k_start + thread_row < K) {
-            Bs[thread_row][thread_col] = B[(k_start + thread_row) * N + col];
+        if(TK * t + ty < K){
+            Bs[ty][tx] = B[(ty + t * TK) * N + col + tx];
         } else {
-            Bs[thread_row][thread_col] = 0.0f;
+            Bs[ty][tx] = 0.0f;
         }
         __syncthreads();
 
-        #pragma unroll
-        for (int k = 0; k < kTileK; ++k) {
-            sum += As[thread_row][k] * Bs[k][thread_col];
+        // 然后计算对应结果
+        for(int k = 0; k < TK; ++k){
+           sum += As[ty][k] * Bs[k][tx];
         }
         __syncthreads();
     }
 
-    C[row * N + col] = sum;
+    if(valid){
+        C[(row + ty) * N + col + tx] = sum;
+    }
+
 }
 
 static void GemmCPU(const float* A, const float* B, float* C, int M, int N, int K) {
@@ -94,8 +104,8 @@ int main() {
         CHECK_CUDA(cudaMemcpy(d_A, A.data(), M * K * sizeof(float), cudaMemcpyHostToDevice));
         CHECK_CUDA(cudaMemcpy(d_B, B.data(), K * N * sizeof(float), cudaMemcpyHostToDevice));
 
-        dim3 block(kTileN, kTileM);
-        dim3 grid((N + kTileN - 1) / kTileN, (M + kTileM - 1) / kTileM);
+        dim3 block(TN, TM);
+        dim3 grid((N + TN - 1) / TN, (M + TM - 1) / TM);
 
         GemmV1Kernel<<<grid, block>>>(d_A, d_B, d_C, M, N, K);
         CHECK_CUDA(cudaDeviceSynchronize());
@@ -114,20 +124,24 @@ int main() {
         ms /= kRepeat;
 
         CHECK_CUDA(cudaMemcpy(C_gpu.data(), d_C, M * N * sizeof(float), cudaMemcpyDeviceToHost));
+        bool did_verify = (M <= kMaxCpuVerifyDim && N <= kMaxCpuVerifyDim);
         bool ok = true;
-        if (M <= kMaxCpuVerifyDim && N <= kMaxCpuVerifyDim) {
+        if (did_verify) {
             ok = common::CheckEqual(C_cpu, C_gpu, 1e-3f);
         }
         double gflops = (2.0 * M * N * K) / (ms * 1e6);
+        const char* check = did_verify ? (ok ? "PASS" : "FAIL") : "NOT_RUN";
+        const std::string max_abs_diff =
+            did_verify ? std::to_string(common::MaxAbsDiff(C_cpu, C_gpu)) : "";
 
         std::cout << M << "x" << N << "x" << K << " | " << std::fixed << std::setprecision(4) << ms << " ms"
                   << " | " << std::setprecision(1) << gflops << " GFLOP/s"
-                  << " | " << (ok ? "PASS" : "FAIL") << "\n";
+                  << " | " << check << "\n";
 
         ofs << i << ",gemm_v1," << M << "," << N << "," << K << ","
             << ms << "," << gflops << ","
-            << common::MaxAbsDiff(C_cpu, C_gpu) << ","
-            << (ok ? "PASS" : "FAIL") << "\n";
+            << max_abs_diff << ","
+            << check << "\n";
 
         CHECK_CUDA(cudaEventDestroy(start));
         CHECK_CUDA(cudaEventDestroy(stop));

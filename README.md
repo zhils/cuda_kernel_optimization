@@ -29,7 +29,7 @@
 
 | 算子 | 目录 | 优化版本数 | 关键成果 |
 |------|------|:----------:|----------|
-| GEMM | [gemm/](gemm/README.md) | 6（v0~v5 + fp16） | FP32 CUDA Core 达 12.52 TFLOPS（峰值 53%），FP16 Tensor Core 达 37.39 TFLOPS |
+| GEMM | [gemm/](gemm/README.md) | 5（v0~v4 + fp16） | FP32 CUDA Core 达 12.52 TFLOPS（峰值 53%），FP16 Tensor Core 达 37.39 TFLOPS |
 | Softmax | [softmax/](softmax/README.md) | 4（v0~v3） | Online 单遍算法 + float4 向量化 + Warp Shuffle，Memory Throughput 84.87% |
 | RMSNorm | [rmsnorm/](rmsnorm/README.md) | 4（v0~v3） | 带宽从 106 GB/s 提升至 386 GB/s（GDDR7 理论带宽 86%） |
 | Fused Conv1D+SiLU | [fused_conv1d_silu/](fused_conv1d_silu/README.md) | 4（v0~v3） | 端到端 2.6× 加速（5 kernel → 2 kernel 融合） |
@@ -67,6 +67,24 @@ Ridge Point = 23.5 TFLOPS / 448 GB/s ≈ 52.5 FLOP/Byte。当算术强度 < 52.5
 3. **Nsight Compute Profiling**：定量测量 Memory Throughput、Compute Throughput、Occupancy、Stall Reasons
 4. **PTX/SASS 分析**：检查寄存器溢出、FMA 使用、循环展开等编译器行为
 5. **单变量 A/B 测试**：每版只改一个瓶颈，量化对比收益
+
+---
+
+## P0 工程化基线
+
+- 分层入口：
+  - `bash scripts/benchmark_suite.sh smoke`
+  - `bash scripts/benchmark_suite.sh full`
+  - `bash scripts/benchmark_suite.sh profile`
+- 正确性回归：`bash scripts/run_correctness_regression.sh`
+- 可复现实验：`bash scripts/run_benchmark_repro.sh`
+- 标准化汇总（schema v1）：`data/results/summary_standardized.csv`
+- 回归汇总：`data/results/regression_summary.csv`
+- 性能门禁基线：`data/baselines/perf_golden.csv`
+- 性能门禁报告：`data/results/runs/<run_id>/performance_regression_check.csv`
+- 性能门禁摘要（PR 友好）：`data/results/runs/<run_id>/performance_gate_summary.md`
+- 运行报告：`data/results/runs/<run_id>/report.md`
+- 协议文档：`docs/repro_and_regression_protocol.md`
 
 ---
 
@@ -198,7 +216,7 @@ cd ..
 │   │   └── cuda_utils.h
 │   └── src/benchmark.cpp
 │
-├── gemm/                         通用矩阵乘（v0~v5 + fp16 + int8 + cuBLAS/cuBLASLt）
+├── gemm/                         通用矩阵乘（v0~v4 + fp16 + int8 + cuBLAS/cuBLASLt）
 ├── softmax/                      Softmax（v0~v3 + cuDNN 参考）
 ├── rmsnorm/                      RMSNorm（v0~v3）
 ├── flash_attention/              Flash Attention（v0~v4）
