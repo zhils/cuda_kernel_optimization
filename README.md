@@ -5,6 +5,8 @@
 > RMSNorm 达 386 GB/s(显存带宽 86%)，端到端融合算子达 2.6× 加速。
 > 完整 Nsight Compute 瓶颈分析 + Warp Stall 原因分解。
 
+📘 项目总览文档（细致版）：`PROJECT_OVERVIEW.md`
+
 ---
 
 ## 性能摘要

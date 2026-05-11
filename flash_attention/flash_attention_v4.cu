@@ -33,8 +33,11 @@ __global__ void flash_attn_v4_kernel(
     const float* __restrict__ K,
     const float* __restrict__ V,
     float* __restrict__ O,
-    int B, int H, int N, int D)
-{
+    int B, 
+    int H, 
+    int N, 
+    int D
+){
     int bh = blockIdx.x;
     int q_tile_id = blockIdx.y;
     if (bh >= B * H) return;
