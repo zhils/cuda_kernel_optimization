@@ -8,6 +8,10 @@ OUT_DIR="${ROOT_DIR}/data/ncu_reports/${RUN_ID}"
 TEXT_DIR="${OUT_DIR}/text"
 CACHE_PATH="${ROOT_DIR}/data/baselines/autotune_cache.json"
 CATALOG_PATH="${ROOT_DIR}/configs/kernel_catalog.json"
+DISPATCH_ARCH="${DISPATCH_ARCH:-sm120}"
+DISPATCH_DTYPE="${DISPATCH_DTYPE:-any}"
+DISPATCH_LAYOUT="${DISPATCH_LAYOUT:-any}"
+DISPATCH_SHAPE_BUCKET="${DISPATCH_SHAPE_BUCKET:-any}"
 mkdir -p "${TEXT_DIR}"
 
 NCU="ncu --set basic --target-processes all --kernel-name-base demangled --print-summary per-kernel"
@@ -17,7 +21,11 @@ mapfile -t TARGETS < <(
   python3 "${ROOT_DIR}/scripts/kernel_dispatch.py" \
     --catalog "${CATALOG_PATH}" \
     --tier profile_all \
-    --autotune-cache "${CACHE_PATH}"
+    --autotune-cache "${CACHE_PATH}" \
+    --arch "${DISPATCH_ARCH}" \
+    --dtype "${DISPATCH_DTYPE}" \
+    --layout "${DISPATCH_LAYOUT}" \
+    --shape-bucket "${DISPATCH_SHAPE_BUCKET}"
 )
 
 if [[ -n "${NCU_ALL_QUICK:-}" ]]; then

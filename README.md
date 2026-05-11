@@ -84,6 +84,8 @@ Ridge Point = 23.5 TFLOPS / 448 GB/s ≈ 52.5 FLOP/Byte。当算术强度 < 52.5
 - 性能门禁报告：`data/results/runs/<run_id>/performance_regression_check.csv`
 - 性能门禁摘要（PR 友好）：`data/results/runs/<run_id>/performance_gate_summary.md`
 - 自动调优缓存：`data/baselines/autotune_cache.json`
+- 统一调度目录：`configs/kernel_catalog.json`（支持 arch/dtype/layout/shape_bucket 路由）
+- 随机鲁棒性回归：`RANDOM_GEMM_CASES=1 RANDOM_SOFTMAX_CASES=1 RANDOM_QPATH_CASES=1 bash scripts/run_correctness_regression.sh`
 - 运行报告：`data/results/runs/<run_id>/report.md`
 - 协议文档：`docs/repro_and_regression_protocol.md`
 

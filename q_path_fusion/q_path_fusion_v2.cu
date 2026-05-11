@@ -11,6 +11,7 @@
 
 #include "common/benchmark.h"
 #include "common/cuda_utils.h"
+#include "common/kernel_config.h"
 
 constexpr float kEps = 1e-5f;
 
@@ -153,9 +154,8 @@ int main() {
     CHECK_CUDA(cudaMemcpy(dbq, bq.data(), cols * sizeof(float), cudaMemcpyHostToDevice));
 
     // warmup：先跑一轮稳定状态
-    dim3 block(256);
-    dim3 grid(rows);
-    RMSNormKernel<<<grid, block>>>(dx, dgamma, dnorm, rows, cols, kEps);
+    common::LaunchConfig1D launch_cfg = common::MakeLaunchConfig1D(rows, 256);
+    RMSNormKernel<<<launch_cfg.grid, launch_cfg.block>>>(dx, dgamma, dnorm, rows, cols, kEps);
     
     const float alpha = 1.0f, beta = 0.0f;
     // Q = norm @ wq + bq
@@ -178,7 +178,7 @@ int main() {
     CHECK_CUDA(cudaEventRecord(start));
     for (int rep = 0; rep < kRepeat; ++rep) {
       // Step 1: RMSNorm
-      RMSNormKernel<<<grid, block>>>(dx, dgamma, dnorm, rows, cols, kEps);
+      RMSNormKernel<<<launch_cfg.grid, launch_cfg.block>>>(dx, dgamma, dnorm, rows, cols, kEps);
       
       // Step 2: GEMM
       CHECK_CUBLAS(cublasSgemm(cublas_handle, CUBLAS_OP_N, CUBLAS_OP_N,

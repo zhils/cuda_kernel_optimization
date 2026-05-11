@@ -10,6 +10,7 @@
 
 #include "common/benchmark.h"
 #include "common/cuda_utils.h"
+#include "common/kernel_config.h"
 
 constexpr int kTM = 8;
 constexpr int kTN = 8;
@@ -195,10 +196,10 @@ int main() {
         CHECK_CUDA(cudaMemcpy(d_A, A.data(), M * K * sizeof(float), cudaMemcpyHostToDevice));
         CHECK_CUDA(cudaMemcpy(d_B, B.data(), K * N * sizeof(float), cudaMemcpyHostToDevice));
 
-        dim3 block(kBlockThreadsX, kBlockThreadsY);
-        dim3 grid((N + kBlockN - 1) / kBlockN, (M + kBlockM - 1) / kBlockM);
+        common::GemmLaunchConfig launch_cfg = common::MakeGemmLaunchConfig(
+            M, N, kBlockM, kBlockN, kTileK, kBlockThreadsX, kBlockThreadsY);
 
-        GemmV2Kernel<<<grid, block>>>(d_A, d_B, d_C, M, N, K);
+        GemmV2Kernel<<<launch_cfg.grid, launch_cfg.block>>>(d_A, d_B, d_C, M, N, K);
         CHECK_CUDA(cudaDeviceSynchronize());
 
         cudaEvent_t start, stop;
@@ -206,7 +207,7 @@ int main() {
         CHECK_CUDA(cudaEventCreate(&stop));
         CHECK_CUDA(cudaEventRecord(start));
         for (int r = 0; r < kRepeat; ++r) {
-            GemmV2Kernel<<<grid, block>>>(d_A, d_B, d_C, M, N, K);
+            GemmV2Kernel<<<launch_cfg.grid, launch_cfg.block>>>(d_A, d_B, d_C, M, N, K);
         }
         CHECK_CUDA(cudaEventRecord(stop));
         CHECK_CUDA(cudaEventSynchronize(stop));

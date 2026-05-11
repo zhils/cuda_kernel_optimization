@@ -9,13 +9,21 @@ LOG_DIR="${RUN_DIR}/repro_logs"
 SUMMARY_PATH="${RUN_DIR}/summary_standardized.csv"
 CACHE_PATH="${ROOT_DIR}/data/baselines/autotune_cache.json"
 CATALOG_PATH="${ROOT_DIR}/configs/kernel_catalog.json"
+DISPATCH_ARCH="${DISPATCH_ARCH:-sm120}"
+DISPATCH_DTYPE="${DISPATCH_DTYPE:-any}"
+DISPATCH_LAYOUT="${DISPATCH_LAYOUT:-any}"
+DISPATCH_SHAPE_BUCKET="${DISPATCH_SHAPE_BUCKET:-any}"
 mkdir -p "${LOG_DIR}"
 
 mapfile -t TARGETS < <(
   python3 "${ROOT_DIR}/scripts/kernel_dispatch.py" \
     --catalog "${CATALOG_PATH}" \
     --tier full \
-    --autotune-cache "${CACHE_PATH}"
+    --autotune-cache "${CACHE_PATH}" \
+    --arch "${DISPATCH_ARCH}" \
+    --dtype "${DISPATCH_DTYPE}" \
+    --layout "${DISPATCH_LAYOUT}" \
+    --shape-bucket "${DISPATCH_SHAPE_BUCKET}"
 )
 
 echo "[repro] environment:"

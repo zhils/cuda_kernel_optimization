@@ -9,34 +9,79 @@ LOG_DIR="${RUN_DIR}/regression_logs"
 SUMMARY_PATH="${RUN_DIR}/regression_summary.csv"
 CACHE_PATH="${ROOT_DIR}/data/baselines/autotune_cache.json"
 CATALOG_PATH="${ROOT_DIR}/configs/kernel_catalog.json"
+DISPATCH_ARCH="${DISPATCH_ARCH:-sm120}"
+DISPATCH_DTYPE="${DISPATCH_DTYPE:-any}"
+DISPATCH_LAYOUT="${DISPATCH_LAYOUT:-any}"
+DISPATCH_SHAPE_BUCKET="${DISPATCH_SHAPE_BUCKET:-any}"
 mkdir -p "${LOG_DIR}"
 
 mapfile -t TARGETS < <(
   python3 "${ROOT_DIR}/scripts/kernel_dispatch.py" \
     --catalog "${CATALOG_PATH}" \
     --tier smoke \
-    --autotune-cache "${CACHE_PATH}"
+    --autotune-cache "${CACHE_PATH}" \
+    --arch "${DISPATCH_ARCH}" \
+    --dtype "${DISPATCH_DTYPE}" \
+    --layout "${DISPATCH_LAYOUT}" \
+    --shape-bucket "${DISPATCH_SHAPE_BUCKET}"
 )
 
-GEMM_CASES_PATH="${ROOT_DIR}/data/gemm/test_cases.csv"
-GEMM_CASES_BACKUP=""
+declare -a CASE_BACKUPS=()
+
+backup_and_generate_cases() {
+  local target_csv="$1"
+  shift
+  local backup_csv="${target_csv}.backup.${RUN_ID}.csv"
+  cp "${target_csv}" "${backup_csv}"
+  CASE_BACKUPS+=("${target_csv}|${backup_csv}")
+  python3 "${ROOT_DIR}/scripts/generate_random_matrix_cases.py" --output "${target_csv}" "$@"
+}
+
 if [[ "${RANDOM_GEMM_CASES:-0}" == "1" ]]; then
-  GEMM_CASES_BACKUP="${ROOT_DIR}/data/gemm/test_cases.backup.${RUN_ID}.csv"
-  cp "${GEMM_CASES_PATH}" "${GEMM_CASES_BACKUP}"
-  python3 "${ROOT_DIR}/scripts/generate_random_gemm_cases.py" \
-    --output "${GEMM_CASES_PATH}" \
+  backup_and_generate_cases "${ROOT_DIR}/data/gemm/test_cases.csv" \
     --count "${RANDOM_GEMM_CASES_COUNT:-12}" \
-    --seed "${RANDOM_GEMM_CASES_SEED:-20260511}"
-  echo "[regression] RANDOM_GEMM_CASES enabled, backup=${GEMM_CASES_BACKUP}"
+    --seed "${RANDOM_GEMM_CASES_SEED:-20260511}" \
+    --min-rows 96 --max-rows 1536 \
+    --min-cols 96 --max-cols 1536 \
+    --align 16 \
+    --max-elements "${RANDOM_GEMM_CASES_MAX_ELEMENTS:-6291456}" \
+    --square-only
+  echo "[regression] RANDOM_GEMM_CASES enabled"
 fi
 
-restore_gemm_cases() {
-  if [[ -n "${GEMM_CASES_BACKUP}" && -f "${GEMM_CASES_BACKUP}" ]]; then
-    mv "${GEMM_CASES_BACKUP}" "${GEMM_CASES_PATH}"
-    echo "[regression] restored ${GEMM_CASES_PATH}"
-  fi
+if [[ "${RANDOM_SOFTMAX_CASES:-0}" == "1" ]]; then
+  backup_and_generate_cases "${ROOT_DIR}/data/softmax/test_cases.csv" \
+    --count "${RANDOM_SOFTMAX_CASES_COUNT:-12}" \
+    --seed "${RANDOM_SOFTMAX_CASES_SEED:-20260512}" \
+    --min-rows 64 --max-rows 4096 \
+    --min-cols 64 --max-cols 2048 \
+    --align 16 \
+    --max-elements "${RANDOM_SOFTMAX_CASES_MAX_ELEMENTS:-8388608}"
+  echo "[regression] RANDOM_SOFTMAX_CASES enabled"
+fi
+
+if [[ "${RANDOM_QPATH_CASES:-0}" == "1" ]]; then
+  backup_and_generate_cases "${ROOT_DIR}/data/q_path_fusion/test_cases.csv" \
+    --count "${RANDOM_QPATH_CASES_COUNT:-10}" \
+    --seed "${RANDOM_QPATH_CASES_SEED:-20260513}" \
+    --min-rows 64 --max-rows 2048 \
+    --min-cols 64 --max-cols 1024 \
+    --align 16 \
+    --max-elements "${RANDOM_QPATH_CASES_MAX_ELEMENTS:-4194304}"
+  echo "[regression] RANDOM_QPATH_CASES enabled"
+fi
+
+restore_case_files() {
+  for pair in "${CASE_BACKUPS[@]}"; do
+    local target="${pair%%|*}"
+    local backup="${pair##*|}"
+    if [[ -f "${backup}" ]]; then
+      mv "${backup}" "${target}"
+      echo "[regression] restored ${target}"
+    fi
+  done
 }
-trap restore_gemm_cases EXIT
+trap restore_case_files EXIT
 
 echo "[regression] building ${#TARGETS[@]} targets..."
 cmake --build "${BUILD_DIR}" --target "${TARGETS[@]}"

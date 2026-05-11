@@ -95,5 +95,33 @@
     "fused_l2_norm_qk": ["fused_l2_norm_qk_v1", "fused_l2_norm_qk_v2"],
     "fused_output_norm_gate": ["fused_output_norm_gate_v1", "fused_output_norm_gate_v2"],
     "q_path_fusion": ["q_path_fusion_v1", "q_path_fusion_v2"]
-  }
+  },
+  "routing_rules": [
+    {
+      "name": "sm120_full_fp32_large_gemm_prefers_tf32_tc",
+      "match": {
+        "tier": ["full", "profile_all", "profile_stall", "profile_roofline"],
+        "arch": ["sm120"],
+        "dtype": ["fp32", "any"],
+        "layout": ["row_major", "any"],
+        "shape_bucket": ["large"]
+      },
+      "preferred_by_family": {
+        "gemm": "gemm_v4"
+      }
+    },
+    {
+      "name": "sm120_full_fp32_small_medium_gemm_prefers_cuda_core",
+      "match": {
+        "tier": ["full", "profile_all", "profile_stall", "profile_roofline"],
+        "arch": ["sm120"],
+        "dtype": ["fp32", "any"],
+        "layout": ["row_major", "any"],
+        "shape_bucket": ["small", "medium"]
+      },
+      "preferred_by_family": {
+        "gemm": "gemm_v3"
+      }
+    }
+  ]
 }

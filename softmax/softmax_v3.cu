@@ -19,6 +19,7 @@
 
 #include "common/benchmark.h"
 #include "common/cuda_utils.h"
+#include "common/kernel_config.h"
 
 #define WARP_SIZE 32
 #define WARPS_PER_BLOCK 4
@@ -160,9 +161,9 @@ int main() {
         CHECK_CUDA(cudaMalloc(&dy, n * sizeof(float)));
         CHECK_CUDA(cudaMemcpy(dx, x.data(), n * sizeof(float), cudaMemcpyHostToDevice));
 
-        dim3 block(BLOCK_SIZE);
-        dim3 grid((rows + WARPS_PER_BLOCK - 1) / WARPS_PER_BLOCK);
-        SoftmaxV3Kernel<<<grid, block, smem_size>>>(dx, dy, rows, cols);
+        common::LaunchConfig1D launch_cfg =
+            common::MakeWarpRowLaunchConfig(rows, WARPS_PER_BLOCK, WARP_SIZE);
+        SoftmaxV3Kernel<<<launch_cfg.grid, launch_cfg.block, smem_size>>>(dx, dy, rows, cols);
         CHECK_CUDA(cudaDeviceSynchronize());
 
         cudaEvent_t s, e;
@@ -170,7 +171,7 @@ int main() {
         CHECK_CUDA(cudaEventCreate(&e));
         CHECK_CUDA(cudaEventRecord(s));
         for (int rep = 0; rep < kRepeat; ++rep) {
-            SoftmaxV3Kernel<<<grid, block, smem_size>>>(dx, dy, rows, cols);
+            SoftmaxV3Kernel<<<launch_cfg.grid, launch_cfg.block, smem_size>>>(dx, dy, rows, cols);
         }
         CHECK_CUDA(cudaEventRecord(e));
         CHECK_CUDA(cudaEventSynchronize(e));
