@@ -38,6 +38,8 @@ Thumbs.db
 *.tmp
 *.swp
 *~
+__pycache__/
+*.pyc
 
 # Personal learning notes (internal reflections, AI-generated code disclosure, self-critique, etc.)
 # Not suitable for public GitHub as an interview project
