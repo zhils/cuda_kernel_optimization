@@ -8,15 +8,17 @@
 
 ## 数学定义
 
-对张量 $X \in \mathbb{R}^{(B, N, H)}$ 每行做 L2 归一化：
+对张量 `X`（形状 `(B,N,H)`）每行做 L2 归一化：
 
 $$
 \|x_{b,n}\|_2 = \sqrt{\sum_{h=0}^{H-1} x_{b,n,h}^2}
 $$
+纯文本：`norm2(x[b,n]) = sqrt(sum_{h=0..H-1}(x[b,n,h]^2))`。
 
 $$
 \hat{x}_{b,n,h} = \frac{x_{b,n,h}}{\|x_{b,n}\|_2 + \epsilon}
 $$
+纯文本：`x_hat[b,n,h] = x[b,n,h] / (norm2(x[b,n]) + eps)`。
 
 ---
 
@@ -62,7 +64,7 @@ Q 和 K 的 L2 归一化分别实现为独立 CUDA kernel。
 
 | 内核 | Duration(us) | Compute(SM) | DRAM | Memory | Achieved Occupancy | Reg/Thr |
 |:----|:-----------:|:-----------:|:----:|:------:|:------------------:|:-------:|
-| `L2NormKernel` (v0) | 402.53 | 29.08% | 25.20% | — | 89.22% | 22 |
+| `L2NormKernel` (v0) | 402.53 | 29.08% | 25.20% | 29.08% | 89.22% | 22 |
 | `FusedL2NormKernel` (v1) | 225.24 | 20.76% | 4.31% | 11.81% | 67.13%¹ | 36 |
 | `FusedL2NormV2Kernel` (v2) | 238.10 | 12.96% | 5.34% | 10.59% | 55.21%¹ | 48 |
 
@@ -93,3 +95,21 @@ cd ..
 ./build/bin/fused_l2_norm_qk_v1
 ./build/bin/fused_l2_norm_qk_v2
 ```
+
+---
+
+## 主场景性能口径（统一）
+
+主指标统一为主场景 `gpu_ms`，NCU 吞吐仅用于瓶颈归因。
+
+| 实现 | 主场景维度 | GPU耗时(ms) | 校验状态 | 数据文件 |
+|---|---|---:|---|---|
+| `fused_l2_norm_qk_v2` | `B=8,N_q=2048,H_q=256,N_k=2048,H_k=256` | 0.19774 | PASS | `data/results/fused_l2_norm_qk_v2_results.csv` |
+
+环境口径：`RTX 5060 Ti (sm_120) + CUDA 13.2`。
+统一汇总：`data/results/main_scenario_unified.csv`（retest tag: `20260512_manual_retest`）。
+
+## 已知边界与后续补充
+
+- 当前主场景为 `N_q=N_k`，尚未系统覆盖非对称长度（`N_q != N_k`）。
+- 建议补充更大 `H`（如 512）及跨 batch 的吞吐扩展曲线。

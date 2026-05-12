@@ -18,28 +18,33 @@
 $$
 gate_{b,t,h} = \text{SiLU}\left(\sum_{d} x_{b,t,d} \cdot W_{gate,h,d} + b_{gate,h}\right)
 $$
+纯文本：`gate[b,t,h] = SiLU(sum_d(x[b,t,d] * W_gate[h,d]) + b_gate[h])`。
 
 ### RMSNorm
 
 $$
 \text{RMS}(gate_{b,t}) = \sqrt{\frac{1}{H} \sum_h gate_{b,t,h}^2 + \epsilon}
 $$
+纯文本：`RMS(gate[b,t]) = sqrt((1/H) * sum_h(gate[b,t,h]^2) + eps)`。
 
 $$
 \hat{x}_{b,t,h} = \frac{gate_{b,t,h}}{\text{RMS}(gate_{b,t})} \cdot g_h
 $$
+纯文本：`x_hat[b,t,h] = gate[b,t,h] / RMS(gate[b,t]) * g[h]`。
 
 ### Multiply Gate
 
 $$
 y_{b,t,h} = \hat{x}_{b,t,h} \cdot gate_{b,t,h}
 $$
+纯文本：`y[b,t,h] = x_hat[b,t,h] * gate[b,t,h]`。
 
 ### Linear Output Projection
 
 $$
 o_{b,t,d} = \sum_h y_{b,t,h} \cdot W_{out,d,h} + b_{out,d}
 $$
+纯文本：`o[b,t,d] = sum_h(y[b,t,h] * W_out[d,h]) + b_out[d]`。
 
 ---
 
@@ -88,10 +93,10 @@ $$
 |:----|:-----------:|:-----------:|:----:|:------:|:------------------:|:-------:|
 | `LinearOutputKernel` (v0) | 385.38 | 11.73% | 0.49% | 95.81% | 90.97% | 38 |
 | `fused_output_norm_gate_v1_kernel` (v1) | 11.54¹ | 7.29% | 1.58% | 51.09% | 69.89%² | 38 |
-| `fused_output_norm_gate_v2_kernel` (v2) | 8.37¹ | 6.25% | 2.35% | 19.81% | —² | — |
+| `fused_output_norm_gate_v2_kernel` (v2) | 8.37¹ | 6.25% | 2.35% | 19.81% | 27.89%² | 42 |
 
 ¹ v1/v2 数据取自 B=128 配置（小规模），大规模下数值会更高。
-² v1 Occupancy 取自 Grid=256 配置（69.89%），v2 小规模时 Occupancy 较低。
+² v1 Occupancy 取自 Grid=256 配置（69.89%），v2 取自同口径小规模 profile（27.89%）。
 
 Occupancy 高、缓存流量高，主受访存路径与数据重用模式影响。v1/v2 将消除中间张量全局读写，提升有效访存带宽利用率。
 
@@ -118,3 +123,21 @@ cd ..
 ./build/bin/fused_output_norm_gate_v1
 ./build/bin/fused_output_norm_gate_v2
 ```
+
+---
+
+## 主场景性能口径（统一）
+
+主指标统一为主场景 `gpu_ms`，NCU 吞吐仅用于瓶颈归因。
+
+| 实现 | 主场景维度 | GPU耗时(ms) | 校验状态 | 数据文件 |
+|---|---|---:|---|---|
+| `fused_output_norm_gate_v2` | `B=8,L=2048,D_in=512,H=256,D_out=512` | 16.0584 | PASS | `data/results/fused_output_norm_gate_v2_results.csv` |
+
+环境口径：`RTX 5060 Ti (sm_120) + CUDA 13.2`。
+统一汇总：`data/results/main_scenario_unified.csv`（retest tag: `20260512_manual_retest`）。
+
+## 已知边界与后续补充
+
+- 当前 v2 对中等隐藏维度最优，超大 `H/D_out` 的块配置尚未单独调优。
+- 建议补充门控激活分布变化（稀疏/饱和）下的性能与数值敏感性分析。

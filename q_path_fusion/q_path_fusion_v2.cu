@@ -154,8 +154,11 @@ int main() {
     CHECK_CUDA(cudaMemcpy(dbq, bq.data(), cols * sizeof(float), cudaMemcpyHostToDevice));
 
     // warmup：先跑一轮稳定状态
-    common::LaunchConfig1D launch_cfg = common::MakeLaunchConfig1D(rows, 256);
-    RMSNormKernel<<<launch_cfg.grid, launch_cfg.block>>>(dx, dgamma, dnorm, rows, cols, kEps);
+    // RMSNormKernel 语义是“每个 block 处理一整行”，
+    // 因此 grid.x 必须等于 rows，不能用 ceil(rows / block_x) 的普通 1D 映射。
+    dim3 block(256);
+    dim3 grid(rows);
+    RMSNormKernel<<<grid, block>>>(dx, dgamma, dnorm, rows, cols, kEps);
     
     const float alpha = 1.0f, beta = 0.0f;
     // Q = norm @ wq + bq
@@ -178,7 +181,7 @@ int main() {
     CHECK_CUDA(cudaEventRecord(start));
     for (int rep = 0; rep < kRepeat; ++rep) {
       // Step 1: RMSNorm
-      RMSNormKernel<<<launch_cfg.grid, launch_cfg.block>>>(dx, dgamma, dnorm, rows, cols, kEps);
+      RMSNormKernel<<<grid, block>>>(dx, dgamma, dnorm, rows, cols, kEps);
       
       // Step 2: GEMM
       CHECK_CUBLAS(cublasSgemm(cublas_handle, CUBLAS_OP_N, CUBLAS_OP_N,

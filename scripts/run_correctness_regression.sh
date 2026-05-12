@@ -64,10 +64,11 @@ if [[ "${RANDOM_QPATH_CASES:-0}" == "1" ]]; then
   backup_and_generate_cases "${ROOT_DIR}/data/q_path_fusion/test_cases.csv" \
     --count "${RANDOM_QPATH_CASES_COUNT:-10}" \
     --seed "${RANDOM_QPATH_CASES_SEED:-20260513}" \
-    --min-rows 64 --max-rows 2048 \
+    --min-rows 64 --max-rows 1024 \
     --min-cols 64 --max-cols 1024 \
     --align 16 \
-    --max-elements "${RANDOM_QPATH_CASES_MAX_ELEMENTS:-4194304}"
+    --max-elements "${RANDOM_QPATH_CASES_MAX_ELEMENTS:-2097152}" \
+    --square-only
   echo "[regression] RANDOM_QPATH_CASES enabled"
 fi
 

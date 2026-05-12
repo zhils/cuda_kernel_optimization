@@ -6,10 +6,17 @@
 
 ## 1. 数学定义
 
-```
-C[m, n] = Σ_{k=0}^{K-1} A[m, k] * B[k, n]
-A ∈ R^{M×K}, B ∈ R^{K×N}, C ∈ R^{M×N}
-```
+$$
+C_{m,n} = \sum_{k=0}^{K-1} A_{m,k}\,B_{k,n}
+$$
+
+纯文本：`C[m,n] = sum_{k=0..K-1}(A[m,k] * B[k,n])`。
+
+$$
+A \in \mathbb{R}^{M\times K},\quad B \in \mathbb{R}^{K\times N},\quad C \in \mathbb{R}^{M\times N}
+$$
+
+纯文本：`A:(M,K), B:(K,N), C:(M,N)`。
 
 方阵（M=N=K）下：
 - 计算量：2×N³ FLOPs（N³ 次乘 + N³ 次加）
@@ -160,11 +167,11 @@ wmma::load_matrix_sync(b_frag, smem_b, 16);
 wmma::mma_sync(c_frag, a_frag, b_frag, c_frag);  // 16×16 × 16×16 × k=8
 ```
 
-Blackwell 的 TF32 WMMA 只支持 m16n16k8。一条 mma_sync 做 2×16×8 = 256 对乘加 = 512 FLOPs。v0~v3 的 CUDA Core FMA 一个时钟周期每 core 一对乘加 = 2 FLOPs，128 core × 2 = 256 FLOPs/cycle/SM。
+Blackwell 的 TF32 WMMA 在当前路径下采用 `m16n16k8`。按 warp 级口径，一条 `mma_sync` 的计算量为 `2*m*n*k = 2*16*16*8 = 4096 FLOPs`。对比 CUDA Core FP32 路径，理论上每 SM 每周期可提供 `128 core * 2 FLOPs = 256 FLOPs/cycle/SM`。
 
-**问题在于 occupancy：** WMMA fragment 占寄存器太多（每个 warp 存 8×16×16 = 2048 个 float 的 fragment，每个 warp 64 寄存器），occupancy 降到 26.9%。CUDA Core V3 的 occupancy > 80%。
+在本项目统一 NCU 口径（`ncu --set basic`，取每个可执行文件 `Duration` 最大的 launch）下，`gemm_v3` 的 Achieved Occupancy 为 `29.85%`，`gemm_v4` 为 `26.93%`。WMMA 路径寄存器/片上资源压力更大、并发度更低，是 `v4` 慢于 `v3` 的主要因素之一。
 
-**4096³：12.57 ms / 10.94 TFLOPS** — 比 V3 慢 14%。
+**4096³：12.57 ms / 10.94 TFLOPS** — 相比 `v3`（10.98 ms / 12.52 TFLOPS）慢约 14%。
 
 ### gemm_fp16 — FP16 K=16 Tensor Core
 
@@ -182,6 +189,8 @@ k=16，每条指令做 2×16×16 = 512 对乘加 = 1024 FLOPs，是 TF32 的 2 �
 ---
 
 ## 3. 性能数据（RTX 5060 Ti, CUDA 13.2）
+
+说明：本节为历史批次对比数据；当前发布口径请以文末“主场景性能口径（统一）”和对应 `data/results/*.csv` 为准。
 
 ### 3.1 执行时间（ms）
 
@@ -208,6 +217,20 @@ k=16，每条指令做 2×16×16 = 512 对乘加 = 1024 FLOPs，是 TF32 的 2 �
 - cuBLAS FP32（16.33 TFLOPS）走 BF16×9 仿真，不受 CUDA Core 上限约束，等效利用 TC k=16 的能力
 - gemm_fp16（37.39 TFLOPS）接近 cuBLAS FP16（49.30 TFLOPS）的 **76%**
 
+### 3.2.1 4096³ 重点对照（补充 cuBLAS FP16）
+
+| 实现 | GPU ms | TFLOPS |
+|------|-------:|-------:|
+| `gemm_v3` | 10.98 | 12.52 |
+| `gemm_v4` | 12.57 | 10.94 |
+| `cuBLAS FP32` | 8.42 | 16.33 |
+| `gemm_fp16` | 3.68 | 37.39 |
+| `cuBLAS FP16` | 2.79 | 49.30 |
+
+注：`cuBLAS FP16` 的 `2.79 ms` 由同场景算量 `2MNK` 与 `49.30 TFLOPS` 换算得到。
+
+结论：在 4096³ 主场景，手写 `gemm_fp16` 达到 `cuBLAS FP16` 的约 **76%**（37.39 / 49.30）。
+
 ### 3.3 相对 cuBLAS FP32 的吞吐比值
 
 | 规模 | v0 | v1 | v2 | v3 | v4 | gemm_fp16 |
@@ -231,6 +254,7 @@ k=16，每条指令做 2×16×16 = 512 对乘加 = 1024 FLOPs，是 TF32 的 2 �
 | `gemm_v1` | 150.59 | 91.19% | 3.18% | 91.19% | 91.85% | 40 | 与 v0 类似，算力打满 |
 | `gemm_v2` | 290.85 | 35.60% | 7.24% | 49.74% | 16.65% | 150 | 寄存器压力过高，occupancy 降低 |
 | `gemm_v3` | 242.34 | 48.09% | 7.88% | 67.04% | 29.85% | 115 | cp.async 后更均衡，仍受 occupancy 约束 |
+| `gemm_v4` | 244.19 | 77.90% | 11.33% | 30.35% | 26.93% | 128 | TF32 WMMA 路径寄存器压力更高，并发度偏低 |
 | `gemm_fp16` | 84.67 | 54.89% | 13.55% | 72.83% | 29.65% | 118 | Tensor Core 路径下算存较均衡 |
 | `gemm_int8` | 52.54 | 43.33% | 9.13% | 66.58% | 29.18% | 106 | INT8 更快但仍非纯带宽瓶颈 |
 | `gemm_fp8_cublaslt` | 845.15 | 87.61% | 39.19% | 60.23% | 16.48% | 255 | 库内核算力利用高，寄存器占用大 |
@@ -277,3 +301,24 @@ v4 的 Math Pipe Throttle 占 72.9%，说明 Tensor Core WMMA 指令已完全占
 - ncu 报告：`build/data/ncu_reports/`
 - PTX/SASS：本地运行 `make gemm_v0.ptx` 或 `cuobjdump -sass <binary>` 生成
 - compute capability：**sm_120**（Blackwell），CUDA 13.2
+
+---
+
+## 主场景性能口径（统一）
+
+主指标统一为主场景 `gpu_ms`，NCU 吞吐仅用于瓶颈归因。
+
+| 实现 | 主场景维度 | GPU耗时(ms) | 校验状态 | 数据文件 |
+|---|---|---:|---|---|
+| `gemm_v3` (FP32) | `M=1024,N=1024,K=1024` | 0.196845 | PASS | `data/results/gemm_v3_results.csv` |
+| `gemm_fp16` | `M=4096,N=4096,K=4096` | 4.35315 | NOT_RUN* | `data/results/gemm_fp16_results.csv` |
+
+`*` 说明：`gemm_fp16` 在 `M,N,K<=1024` 的对比项已完成误差校验；主场景 `4096^3` 当前仅记录性能数据，未执行同口径正确性校验。
+
+环境口径：`RTX 5060 Ti (sm_120) + CUDA 13.2`。
+统一汇总：`data/results/main_scenario_unified.csv`（retest tag: `20260512_manual_retest`）。
+
+## 已知边界与后续补充
+
+- 当前 FP32/FP16 主口径来自不同目标可执行文件，建议后续增加统一批次的并排实测表。
+- 建议补充 `M!=N!=K` 的非方阵场景，以覆盖推理服务常见形状分布。

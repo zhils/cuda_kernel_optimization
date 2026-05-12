@@ -2,9 +2,11 @@
 
 ## 数学定义
 
-```
-softmax(x_i) = exp(x_i - max(x)) / Σ_j exp(x_j - max(x))
-```
+$$
+\mathrm{softmax}(x_i)=\frac{\exp(x_i-\max(x))}{\sum_j \exp(x_j-\max(x))}
+$$
+
+纯文本：`softmax(x_i) = exp(x_i - max(x)) / sum_j exp(x_j - max(x))`。
 
 **算术强度：**
 - 计算量 ≈ 3 × rows × cols FLOPs（max + exp + sum + normalize）
@@ -18,11 +20,11 @@ softmax(x_i) = exp(x_i - max(x)) / Σ_j exp(x_j - max(x))
 | 版本 | 做法 | Memory Throughput | Compute Throughput | Occupancy |
 |:----|------|:-----------------:|:------------------:|:---------:|
 | v0 | 朴素三遍扫描（max → exp/sum → normalize），每行 1 线程 | ~90% | ~15% | 高 |
-| v1 | SMEM staging + float4 向量化 + warp 内归约 | 待测量 | 待测量 | 待测量 |
-| v2 | 8-warp 在线归约，增大并行度 | 待测量 | 待测量 | 待测量 |
-| v3 | **Online 单遍算法 + SMEM + Warp Shuffle** | **84.87%** | 13.46% | 36.17% |
+| v1 | SMEM staging + float4 向量化 + warp 内归约 | 60.29% | 60.29% | 8.33% |
+| v2 | 8-warp 在线归约，增大并行度 | 84.14% | 15.51% | 8.31% |
+| v3 | **Online 单遍算法 + SMEM + Warp Shuffle** | **85.03%** | 12.96% | 8.31% |
 
-性能数据来自 `ncu --set basic`（1024×1024 规模）。
+性能数据来自 `ncu --set basic`（4096×4096，取主场景对应 kernel）。
 
 ### v0 — 朴素基线
 
@@ -107,7 +109,7 @@ out.w = __expf(d.w - row_max) * inv;
 | 目标 | Max Duration(us) | Compute(SM) | DRAM | Memory | Achieved Occupancy | Reg/Thr | 结论 |
 |:-----|-----------------:|------------:|-----:|-------:|-------------------:|--------:|:-----|
 | `softmax_v0` | 647.65 | 0.69% | 2.78% | 12.30% | 16.64% | 40 | 朴素版本并行与访存效率都低 |
-| `softmax_v1` | 86.02 | 79.99% | 11.74% | 79.99% | 33.55% | 42 | 当前实现中性能最好，算存利用均高 |
+| `softmax_v1` | 86.02 | 79.99% | 11.74% | 79.99% | 33.55% | 42 | 在该批 NCU 统计里 Duration 较短，算存利用均高 |
 | `softmax_v2` | 340.06 | 16.02% | 84.51% | 84.51% | 8.31% | 43 | 带宽受限明显 |
 | `softmax_v3` | 338.94 | 12.96% | 84.86% | 84.86% | 8.31% | 40 | 与 v2 接近，瓶颈仍在 DRAM |
 | `softmax_cudnn_ref` | 309.92 | 14.74% | 87.98% | 87.98% | 48.54% | 80 | 参考库路径同样偏带宽瓶颈 |
@@ -157,3 +159,26 @@ cd ..
 make softmax_cudnn_ref -j$(nproc)
 ./build/bin/softmax_cudnn_ref
 ```
+
+---
+
+## 主场景性能口径（统一）
+
+主指标统一为主场景 `gpu_ms`，NCU 吞吐仅用于瓶颈归因。
+
+| 实现 | 主场景维度 | GPU耗时(ms) | 校验状态 | 数据文件 |
+|---|---|---:|---|---|
+| `softmax_v1` | `rows=4096,cols=4096` | 1.96468 | PASS | `data/results/softmax_v1_results.csv` |
+| `softmax_v2` | `rows=4096,cols=4096` | 0.475152 | PASS | `data/results/softmax_v2_results.csv` |
+| `softmax_v3` | `rows=4096,cols=4096` | 0.344838 | PASS | `data/results/softmax_v3_results.csv` |
+
+注：本表按当前 `data/results/*_results.csv` 实测数据更新；若重新跑 benchmark，请同步刷新本节数值。
+统一汇总：`data/results/main_scenario_unified.csv`（retest tag: `20260512_manual_retest`）。
+按上述统一口径，当前主场景（4096x4096）最快版本为 `softmax_v3`。
+
+环境口径：`RTX 5060 Ti (sm_120) + CUDA 13.2`。
+
+## 已知边界与后续补充
+
+- 当前结果显示主场景仍偏 memory-bound，后续可补 `cols` 分桶下的最优 block/warp 路由。
+- 建议补充 `causal mask` 与变长序列版本的统一性能口径，增强工程完整性。

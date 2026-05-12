@@ -17,24 +17,28 @@
 $$
 \alpha_{b,t,h} = \sigma\left(\sum_{d} x_{b,t,d} \cdot W_{decay,h,d} + b_{decay,h}\right)
 $$
+纯文本：`alpha[b,t,h] = sigmoid(sum_d(x[b,t,d] * W_decay[h,d]) + b_decay[h])`。
 
 ### Delta Gate
 
 $$
 \delta_{b,t,h} = \text{softplus}\left(\sum_{d} x_{b,t,d} \cdot W_{delta,h,d} + b_{delta,h}\right)
 $$
+纯文本：`delta[b,t,h] = softplus(sum_d(x[b,t,d] * W_delta[h,d]) + b_delta[h])`。
 
 ### State Projection
 
 $$
 u_{b,t,h} = \sum_{d} x_{b,t,d} \cdot W_{state,h,d} + b_{state,h}
 $$
+纯文本：`u[b,t,h] = sum_d(x[b,t,d] * W_state[h,d]) + b_state[h]`。
 
 ### Recurrent State Update
 
 $$
 s_{b,t,h} = \alpha_{b,t,h} \cdot s_{b,t-1,h} + \delta_{b,t,h} \cdot u_{b,t,h}
 $$
+纯文本：`s[b,t,h] = alpha[b,t,h] * s[b,t-1,h] + delta[b,t,h] * u[b,t,h]`。
 
 ---
 
@@ -112,9 +116,9 @@ cmake --build build --target fused_gated_delta_rule_compensation_test
 
 | 内核 | Duration(us) | Compute(SM) | DRAM | Memory | Achieved Occupancy | Reg/Thr |
 |:----|:-----------:|:-----------:|:----:|:------:|:------------------:|:-------:|
-| `RecurrentDeltaRuleKernel` (v0) | 814.21 | 2.28% | 31.69% | — | 16.53% | 40 |
+| `RecurrentDeltaRuleKernel` (v0) | 814.21 | 2.28% | 31.69% | 31.69% | 16.53% | 40 |
 | `fused_gdr_v1_kernel` (v1) | 368.17¹ | 1.70% | 0.53% | 22.08% | 16.67% | 40 |
-| `fused_gdr_v2_kernel` (v2) | 145.94¹ | — | — | — | 8.33% | 78 |
+| `fused_gdr_v2_kernel` (v2) | 145.94¹ | 0.09% | 0.61% | 29.22% | 8.33% | 78 |
 
 ¹ v1 数值为 4×1024×512×256 配置，v2 为 8×2048×512×256 配置。
 
@@ -143,3 +147,21 @@ cd ..
 ./build/bin/fused_gated_delta_rule_v1
 ./build/bin/fused_gated_delta_rule_v2
 ```
+
+---
+
+## 主场景性能口径（统一）
+
+主指标统一为主场景 `gpu_ms`，NCU 吞吐仅用于瓶颈归因。
+
+| 实现 | 主场景维度 | GPU耗时(ms) | 校验状态 | 数据文件 |
+|---|---|---:|---|---|
+| `fused_gated_delta_rule_v2` | `B=8,L=2048,D=512,H=256` | 109.07 | PASS | `data/results/fused_gated_delta_rule_v2_results.csv` |
+
+环境口径：`RTX 5060 Ti (sm_120) + CUDA 13.2`。
+统一汇总：`data/results/main_scenario_unified.csv`（retest tag: `20260512_manual_retest`）。
+
+## 已知边界与后续补充
+
+- 当前重点在前向递推与融合访存优化，未覆盖训练反向路径。
+- 建议增加更长序列（`L>=4096`）下的稳定性与吞吐趋势测试。

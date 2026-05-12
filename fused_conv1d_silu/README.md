@@ -2,6 +2,8 @@
 
 本文档描述 `fused_conv1d_silu/` 下各版本内核的设计与结论。
 
+说明：本文第 3/4 节包含历史批次实验数据；当前发布口径请以文末“主场景性能口径（统一）”和对应 `data/results/*.csv` 为准。
+
 ---
 
 ## 1. 项目目标
@@ -22,13 +24,13 @@
 
 | 符号 | 含义 | 维度 |
 |------|------|------|
-| $x$ | 输入序列 | $(B, L, D)$ |
-| $W_{qkv}$ | QKV 投影权重 | $(D, 3 \cdot H)$ |
-| $b_{qkv}$ | QKV 投影偏置 | $(3 \cdot H)$ |
-| $W_z, W_a, W_b$ | 门控投影权重 | $(D, H)$ |
-| $b_z, b_a, b_b$ | 门控投影偏置 | $(H)$ |
-| $K_{conv}$ | 因果卷积核 | $(k_{size}, H)$ |
-| $Q, K, V$ | 输出 QKV | $(B, L, H)$ |
+| `x` | 输入序列 | `(B, L, D)` |
+| `W_qkv` | QKV 投影权重 | `(D, 3*H)` |
+| `b_qkv` | QKV 投影偏置 | `(3*H)` |
+| `W_z, W_a, W_b` | 门控投影权重 | `(D, H)` |
+| `b_z, b_a, b_b` | 门控投影偏置 | `(H)` |
+| `K_conv` | 因果卷积核 | `(k_size, H)` |
+| `Q, K, V` | 输出 QKV | `(B, L, H)` |
 
 ### 2.2 前向计算流程
 
@@ -81,16 +83,18 @@ K = K_raw                                # K 保持不变
 $$
 \text{SiLU}(x) = x \cdot \sigma(x) = x \cdot \frac{1}{1 + e^{-x}}
 $$
+纯文本：`SiLU(x) = x * sigmoid(x) = x / (1 + exp(-x))`。
 
 ### 2.4 Causal Conv1D 的数学定义
 
-对于输入 $u \in \mathbb{R}^{(B, L, H)}$，卷积核 $K \in \mathbb{R}^{(k_{size}, H)}$：
+对于输入 `u`（形状 `(B,L,H)`），卷积核 `K`（形状 `(k_size,H)`）：
 
 $$
 y_{b,t,h} = \sum_{i=0}^{\min(t, k_{size}-1)} K_{i,h} \cdot u_{b, t-i, h}
 $$
+纯文本：`y[b,t,h] = sum_{i=0..min(t,k_size-1)}(K[i,h] * u[b,t-i,h])`。
 
-其中 $b$ 是 batch，$t$ 是时间步，$h$ 是通道。
+其中 `b` 是 batch，`t` 是时间步，`h` 是通道。
 
 ---
 
@@ -164,11 +168,12 @@ $$
 - x 的冗余读取仅占总带宽的 ~25%，消除后大矩阵提升约 3%
 - 主要瓶颈已转移到权重矩阵 W_qkv（1.5MB）的 non-coalesced 访问
 
-**B=8, L=2048, D=512, H=256 性能：** 52.92 ms（**比 v0 快 2.6x，比 v2 快 5%**）
+**B=8, L=2048, D=512, H=256 性能（历史批次）：** 52.92 ms（**比 v0 快 2.6x，比 v2 快 5%**）。  
+当前发布口径见文末主场景表（`61.2775 ms`）。
 
 ---
 
-## 4. 完整性能对比
+## 4. 历史批次性能对比（非当前发布口径）
 
 测试环境：**RTX 5060 Ti（sm_120, 16GB），CUDA 13.2**，B=8, L=2048, D=512, H=256, k_size=4。
 
@@ -226,9 +231,10 @@ $$
 3. **float4 向量化加载**（v2）：**~20-30%** — 减少指令数，提高带宽利用率
 4. **SMEM tiling**（v3）：**~5%** — 当前场景下 x 非主要瓶颈
 
-### 5.4 硬件差异影响（RTX 3080 Ti vs RTX 5060 Ti）
+### 5.4 当前环境口径（RTX 5060 Ti）
 
-本项目最初在 RTX 3080 Ti（sm_86, Ampere）上开发，当前测试在 RTX 5060 Ti（sm_120, Blackwell）上。Blackwell 的 L2 缓存更大，部分缓解了 SMEM tiling 优化的收益，因此 v3 相对 v2 的提升从 Ampere 上的 3% 变化到 Blackwell 上的 5%。
+本目录中的性能结论统一以本地环境为准：`RTX 5060 Ti (sm_120, Blackwell) + CUDA 13.2`。  
+若后续更换硬件平台，请重新运行本目录的 benchmark 并覆盖对应数据表。
 
 ---
 
@@ -268,3 +274,21 @@ v0/v1 的 Long Scoreboard 占比极高（92-99%），说明大量时间花在等
 ## 8. PTX / SASS
 
 PTX 和 SASS 可在本地通过 `cuobjdump -ptx <binary>` 或 `cuobjdump -sass <binary>` 生成（`**/asm/` 已从版本控制中排除）：
+
+---
+
+## 主场景性能口径（统一）
+
+主指标统一为主场景 `gpu_ms`，NCU 吞吐仅用于瓶颈归因。
+
+| 实现 | 主场景维度 | GPU耗时(ms) | 校验状态 | 数据文件 |
+|---|---|---:|---|---|
+| `fused_conv1d_silu_v3` | `B=8,L=2048,D=512,H=256,k=4` | 61.137 | PASS | `data/results/fused_conv1d_silu_v3_results.csv` |
+
+环境口径：`RTX 5060 Ti (sm_120) + CUDA 13.2`。
+统一汇总：`data/results/main_scenario_unified.csv`（retest tag: `20260512_manual_retest`）。
+
+## 已知边界与后续补充
+
+- 第 4 节为历史批次对比，当前发布口径以本节主场景表和 `data/results/*_results.csv` 为准。
+- 建议补充更长序列（`L=4096/8192`）与更大通道（`H=512`）的稳定性与吞吐数据。

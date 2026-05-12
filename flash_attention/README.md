@@ -6,13 +6,19 @@
 
 ## 数学定义
 
-```
-Attention(Q, K, V) = softmax(Q @ K^T / sqrt(D)) @ V
+$$
+\mathrm{Attention}(Q,K,V)=\mathrm{softmax}\left(\frac{QK^T}{\sqrt{D}}\right)V
+$$
 
-其中 Q, K, V ∈ R^{B×H×N×D}，softmax 作用于最后一维
-```
+纯文本：`Attention(Q,K,V) = softmax((Q @ K^T) / sqrt(D)) @ V`。
 
-**朴素实现（v0）：** 显式计算并存储 S = Q @ K^T ∈ R^{B×H×N×N}，再 softmax → P ∈ R^{B×H×N×N}，再 P @ V → O。内存 O(N²)，带宽 O(N²·D)。
+$$
+Q,K,V \in \mathbb{R}^{B\times H\times N\times D}
+$$
+
+纯文本：`Q,K,V` 的形状均为 `(B,H,N,D)`，`softmax` 作用在最后一维。
+
+**朴素实现（v0）：** 显式计算并存储 `S = Q @ K^T`（形状 `(B,H,N,N)`），再 softmax 得 `P`（形状 `(B,H,N,N)`），再 `P @ V -> O`。内存 `O(N^2)`，带宽 `O(N^2 * D)`。
 
 **Flash Attention（v1）：** 将 Q、K、V 沿 N 维分块（Br=32，Bc=32），每个 tile 内计算局部 S 并立即通过 online softmax 累加到 O 的寄存器累加器中。内存 O(Br·Bc + (Br+2·Bc)·D)，带宽 O(N·D × N/Bc)——不物化 N² 矩阵。
 
@@ -39,7 +45,7 @@ Attention(Q, K, V) = softmax(Q @ K^T / sqrt(D)) @ V
 ### v0：朴素基线（显式 N² 矩阵）
 
 - 3 个 kernel：ComputeScores + SoftmaxScores + ApplyValues
-- 显式存储 S(P) ∈ R^{B×H×N×N} → 内存 O(N²)，大 N 时不可行
+- 显式存储 `S/P`（形状 `(B,H,N,N)`）→ 内存 `O(N^2)`，大 N 时不可行
 - 用于验证正确性和衡量 Flash Attention 的加速比
 
 ### v1：Tiled Online-Softmax（Flash Attention）
@@ -113,13 +119,13 @@ Attention(Q, K, V) = softmax(Q @ K^T / sqrt(D)) @ V
 | `flash_attention_v0` | 599.97 | 0.69% | 2.46% | 11.53% | 33.04% | 40 | 多 kernel 分离路径，整体利用率低 |
 | `flash_attention_v1` | 705.70 | 0.81% | 0.19% | 0.81% | 16.67% | 72 | 当前 launch 网格太小（`Waves/SM≈0.01`），严重欠并行 |
 | `flash_attention_v2` | 551.23 | 65.09% | 0.08% | 65.09% | 27.01% | 37 | 当前为 fallback v2 内核，具备可分析的中等算力利用 |
-| `flash_attention_v3` | 76.28¹ | 1.07% | 0.82% | 1.06% | —³ | 96 | 2D Grid 消除外层 Q 循环，grid 并行度由 N/Br 决定 |
-| `flash_attention_v4` | 76.09¹ | 1.30% | 0.67% | 1.36% | —³ | 72 | Bank-free SMEM + ILP + FMA，Waves/SM 仍偏小 |
+| `flash_attention_v3` | 6300.00¹ | 36.61% | 0.95% | 36.61% | 33.32% | 96 | 2D Grid 消除外层 Q 循环，grid 并行度由 N/Br 决定 |
+| `flash_attention_v4` | 4610.00¹ | 50.86% | 2.15% | 50.86% | 44.88% | 72 | Bank-free SMEM + ILP + FMA，算力利用进一步提升 |
 
 补充：
 - 由于当前工具链无法汇编 WGMMA PTX，`flash_attention_v2` 暂时使用可移植 fallback kernel 保持可构建/可分析。
 - 原始报告：`data/ncu_reports/text/flash_attention_v0.txt`、`flash_attention_v1.txt`、`flash_attention_v2.txt`。
-- ¹ v3/v4 的 ncu 数据取自 B=1,H=1,N=64,D=32 小规模（grid=2 blocks，Waves/SM≈0.02）。随着 N 增大，grid blocks 增至 N/Br×B×H，Occupancy 和吞吐将大幅提升。
+- ¹ v3/v4 的 ncu 数据来自 `data/ncu_reports/manual_fill/flash_attention_v3.txt` 与 `flash_attention_v4.txt`（按各可执行文件 Duration 最大 launch 统计）。
 - v3/v4 的大规模 profiling 可在本地运行 `NCU_QUICK=1 ncu --set basic ./build/bin/flash_attention_v3` 获得。
 
 ---
@@ -155,15 +161,19 @@ cd ..
 - FlashAttention: Fast and Memory-Efficient Exact Attention with IO-Awareness (Dao et al., 2022)
 - Online softmax: "Online normalizer calculation for softmax" (Milakov & Gimelshein, 2018)
 
-## Nsight Compute 性能分析
+## 主场景性能口径（统一）
 
+主指标统一为主场景 `gpu_ms`，NCU 吞吐仅用于瓶颈归因。
 
-使用 `ncu --set basic` 对每个可执行文件的第一个 kernel launch 进行 profiling。
-运行环境：NVIDIA RTX 5060 Ti (Blackwell sm_120) | CUDA 13.2 | Nsight Compute 2026.1.1
+| 实现 | 主场景维度 | GPU耗时(ms) | 校验状态 | 数据文件 |
+|---|---|---:|---|---|
+| `flash_attention_v4` | `B=1,H=8,N=1024,D=32` | 4.23957 | PASS | `data/results/flash_attention_v4_results.csv` |
 
-| 版本 | Kernel | Duration(us) | Compute% | MemBW% | L1% | L2% | Occupancy% | Reg/Thread | Block | Grid |
-|---|---|---|---|---|---|---|---|---|---|---|
-| flash_attention_v0 | FlashAttnNaiveKernel | 122.8 | 0.1% | 1.2% | 44.1% | 0.2% | 4.2% | 36 | 64 | 1 |
-| flash_attention_v1 | FlashAttnTiledKernel | 148.9 | 0.6% | 0.9% | 20.1% | 0.1% | 16.7% | 96 | 256 | 1 |
-**说明：** ncu `--set basic` 默认对程序的**第一个 kernel launch** 进行 profiling。对于 GEMM 等算子，这对应最小测试尺寸（128×128），GPU 远未饱和。因此表格中的 Compute% / MemBW% 表示的是**小尺寸下的资源利用率**，用于横向对比各版本的寄存器压力、occupancy 等结构性差异。大尺寸下的实际性能请参考各算子 README 中的完整 benchmark 表格。
+环境口径：`RTX 5060 Ti (sm_120) + CUDA 13.2`。
+统一汇总：`data/results/main_scenario_unified.csv`（retest tag: `20260512_manual_retest`）。
+
+## 已知边界与后续补充
+
+- 当前 `v2` 为可移植 fallback 路径，不代表最终 Tensor Core/WGMMA 上限。
+- 建议补充 `N=2048/4096` 的同口径 NCU 与主场景表，形成大序列趋势曲线。
 

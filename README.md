@@ -9,21 +9,29 @@
 
 ---
 
-## 性能摘要
+## 统一口径性能摘要（主场景 GPU 耗时）
 
-| 算子 | 规模 | 基线(v0) | 最优版 | 加速比 | 瓶颈类型 | 关键优化 |
-|:-----|:----|:--------:|:------:|:------:|:--------:|:---------|
-| GEMM FP32 | 4096³ | 1.42 TFLOPS | **12.52 TFLOPS** | **8.8×** | 计算受限 | cp.async + 8×4 分块 |
-| GEMM FP16 | 4096³ | — | **37.39 TFLOPS** | — | 计算受限 | Tensor Core k=16 |
-| RMSNorm | 4096² | 106 GB/s | **386 GB/s** | **3.6×** | 带宽受限 | float4 + warp shuffle |
-| Softmax | 4096² | 16.64% Occupancy | **84.86% MemUtil** | — | 带宽受限 | Online 单遍算法 |
-| Fused Conv1D+SiLU | B=8,L=2048,D=512,H=256 | 137.36 ms | **52.92 ms** | **2.6×** | 访存偏重 | 双 kernel 融合 + float4 |
-| Flash Attention | B=1,H=1,N=1024 | 49.10 ms¹ | 36.39 ms¹ | 1.3× | 计算/访存混合 | Tiled Online-Softmax |
-| Fused Gated Delta Rule | B=8,L=2048,D=512,H=256 | 1.36 ms | 0.19 ms | — | 时间维串行 | 全融合 + ILP + FMA |
-| Fused Output Norm Gate | B=8,L=2048,D=512,H=256 | 1.10 ms² | 0.19 ms² | **5.7×** | SMEM 密集 | 全融合 + 权重复用 |
+统计原则（已统一到本项目文档口径）：
 
-¹ flash_attention v0 为朴素 3-kernel 基线，v1 为 tiled 版本。  
-² fused_output_norm_gate v0 实际运行在 B=8 时数据，v2 为加速后。
+- 主指标：**每个算子的主场景维度下 GPU 耗时（ms）**
+- 辅助指标：NCU 吞吐/occupancy/stall（用于归因，不作为主排序指标）
+- 环境口径：**本地 RTX 5060 Ti（sm_120）+ CUDA 13.2**
+
+| 算子 | 主场景维度 | GPU耗时(ms) | 校验状态 | 数据文件 |
+|:-----|:-----------|------------:|:---------|:---------|
+| GEMM FP32 (`gemm_v3`) | `M=1024, N=1024, K=1024` | 0.196845 | PASS | `data/results/gemm_v3_results.csv` |
+| GEMM FP16 (`gemm_fp16`) | `M=4096, N=4096, K=4096` | 4.35315 | NOT_RUN* | `data/results/gemm_fp16_results.csv` |
+| Softmax (`softmax_v3`) | `rows=4096, cols=4096` | 0.344838 | PASS | `data/results/softmax_v3_results.csv` |
+| RMSNorm (`rmsnorm_v3`) | `rows=4096, cols=4096` | 0.373722 | PASS | `data/results/rmsnorm_v3_results.csv` |
+| Flash Attention (`flash_attention_v4`) | `B=1, H=8, N=1024, D=32` | 4.23957 | PASS | `data/results/flash_attention_v4_results.csv` |
+| Fused Conv1D+SiLU (`v3`) | `B=8, L=2048, D=512, H=256, k=4` | 61.137 | PASS | `data/results/fused_conv1d_silu_v3_results.csv` |
+| Fused Gated Delta Rule (`v2`) | `B=8, L=2048, D=512, H=256` | 109.07 | PASS | `data/results/fused_gated_delta_rule_v2_results.csv` |
+| Fused L2 Norm QK (`v2`) | `B=8, N_q=2048, H_q=256, N_k=2048, H_k=256` | 0.19774 | PASS | `data/results/fused_l2_norm_qk_v2_results.csv` |
+| Fused Output Norm Gate (`v2`) | `B=8, L=2048, D_in=512, H=256, D_out=512` | 16.0584 | PASS | `data/results/fused_output_norm_gate_v2_results.csv` |
+| Q Path Fusion (`v2`) | `rows=1024, cols=1024` | 0.182544 | PASS | `data/results/q_path_fusion_v2_results.csv` |
+
+`*` 说明：`gemm_fp16` 在 `M,N,K<=1024` 的对比项已完成误差校验；主场景 `4096^3` 当前仅记录性能数据，未执行同口径正确性校验。
+统一汇总：`data/results/main_scenario_unified.csv`（retest tag: `20260512_manual_retest`）。
 
 ---
 
@@ -49,14 +57,15 @@
 | 算子 | 算术强度(FLOP/Byte) | Ridge Point | 瓶颈类别 | NWU 实测 |
 |:-----|:------------------:|:-----------:|:--------:|:--------:|
 | GEMM N=4096 | N/6 ≈ 683 | 52.5 | **计算受限** | 53% 峰值利用率 |
-| GEMM N=128 | N/6 ≈ 21 | 52.5 | **访存受限** | — |
+| GEMM N=128 | N/6 ≈ 21 | 52.5 | **访存受限** | Memory 52.49%，Compute 38.90%（`gemm_v2`） |
 | Softmax | 3N² / (8N²) ≈ 0.38 | 52.5 | **访存受限** | 84.86% MemUtil |
 | RMSNorm | 4C / (8C) = 0.5 | 52.5 | **访存受限** | 86.90% DRAM Util |
-| Flash Attention | N/4 | 52.5 | 混合（取决于 N） | — |
-| Conv1D+SiLU | ~1.5 | 52.5 | **访存受限** | — |
-| Output Norm Gate | ~2 | 52.5 | **访存受限** | — |
+| Flash Attention | N/4 | 52.5 | 混合（取决于 N） | Memory 50.87%，Compute 50.87%（`flash_attention_v4`） |
+| Conv1D+SiLU | ~1.5 | 52.5 | **访存受限** | Memory 98.69%，Compute 3.29%（`fused_conv1d_silu_v3`） |
+| Output Norm Gate | ~2 | 52.5 | **访存受限** | Memory 97.65%，Compute 15.89%（`fused_output_norm_gate_v2`） |
 
 Ridge Point = 23.5 TFLOPS / 448 GB/s ≈ 52.5 FLOP/Byte。当算术强度 < 52.5 为访存受限。
+上述空缺项已按当前本地环境（RTX 5060 Ti + CUDA 13.2）重新运行 `ncu --set basic` 回填，原始报告位于 `data/ncu_reports/manual_fill/`。
 
 ---
 
@@ -89,14 +98,43 @@ Ridge Point = 23.5 TFLOPS / 448 GB/s ≈ 52.5 FLOP/Byte。当算术强度 < 52.5
 - 统一调度目录：`configs/kernel_catalog.json`（支持 arch/dtype/layout/shape_bucket 路由）
 - 随机鲁棒性回归：`RANDOM_GEMM_CASES=1 RANDOM_SOFTMAX_CASES=1 RANDOM_QPATH_CASES=1 bash scripts/run_correctness_regression.sh`
 - 运行报告：`data/results/runs/<run_id>/report.md`
+- 最优实现汇总（自动生成）：
+  - `python3 scripts/update_best_impl_summary.py`
+  - `data/results/best_impl_summary.csv`
+  - `data/results/best_impl_summary.md`
 - 协议文档：`docs/repro_and_regression_protocol.md`
+
+---
+
+## 测试覆盖与充分性
+
+本项目已引入算子级测试审计机制，用于判断“正确性测试是否充分、性能测试是否充分”：
+
+- 审计脚本：`scripts/audit_operator_tests.py`
+- 一键补测 + 审计入口：`bash scripts/run_operator_test_supplement.sh`
+- 审计结果文件：`docs/operator_test_coverage_audit.md`
+
+当前审计结论（以最新审计报告为准）：
+
+- 覆盖范围：`gemm`、`softmax`、`rmsnorm`、`flash_attention`、`fused_conv1d_silu`、`fused_gated_delta_rule`、`fused_l2_norm_qk`、`fused_output_norm_gate`、`q_path_fusion`
+- 正确性充分性：上述算子均满足“至少 1 行 PASS 且 0 行 FAIL”
+- 性能充分性：上述算子均满足“至少 1 行有效 `gpu_ms`（>0）”
+- 样本规模：每算子当前报告均含 5 个规模点，可覆盖小/中/大维度的基础回归
+- 当前状态：未发现阻断项，结论为“可用于持续回归与版本对比”
+
+建议在每次批量优化后执行一次：
+
+```bash
+bash scripts/run_operator_test_supplement.sh
+```
 
 ---
 
 ## Nsight Compute 瓶颈总览
 
 命令：`ncu --set basic --target-processes all --kernel-name-base demangled`。  
-统计口径：每个可执行文件取 Duration 最大的一次 kernel launch。
+统计口径：每个可执行文件取 Duration 最大的一次 kernel launch。  
+说明：以下 NCU 指标仅用于**辅助归因**（判断是访存、计算还是调度瓶颈），主性能排序以上一节的主场景 GPU 耗时为准。
 
 | 目标 | Max Duration(us) | Compute(SM) | DRAM | Memory | Achieved Occupancy | 瓶颈分析 |
 |:-----|-----------------:|------------:|-----:|-------:|-------------------:|:---------|

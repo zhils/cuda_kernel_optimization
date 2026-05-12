@@ -57,3 +57,8 @@ y = torch.ops.cuda_kernel_ops.rmsnorm_forward(x, weight, 1e-5, 3)
 ```bash
 python test_ops.py
 ```
+
+## Known Gaps And Next Steps
+
+- Current extension focuses on forward APIs; backward/autograd kernels are not included.
+- Recommended additions: version compatibility matrix (PyTorch/CUDA), and benchmark parity checks against `build/bin` executables.

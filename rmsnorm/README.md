@@ -2,13 +2,19 @@
 
 ## 1. 数学定义
 
-```
-y = x / sqrt(mean(x²) + eps) × gamma
+$$
+y = \frac{x}{\sqrt{\mathrm{mean}(x^2)+\epsilon}}\cdot \gamma
+$$
 
-mean(x²) = (1/C) × Σ_{i=0}^{C-1} xᵢ²
-```
+纯文本：`y = x / sqrt(mean(x^2) + eps) * gamma`。
 
-其中 x ∈ R^{R×C}，gamma ∈ R^C，eps = 1e-5（数值稳定常数）。
+$$
+\mathrm{mean}(x^2)=\frac{1}{C}\sum_{i=0}^{C-1}x_i^2
+$$
+
+纯文本：`mean(x^2) = (1/C) * sum_{i=0..C-1}(x_i^2)`。
+
+其中 `x` 形状为 `(R,C)`，`gamma` 形状为 `(C)`，`eps = 1e-5`（数值稳定常数）。
 
 **算术强度：**
 - 计算量 ≈ 4×R×C FLOPs（平方和 + rsqrt + 乘法缩放 + gamma 乘）
@@ -178,3 +184,21 @@ PTX 和 SASS 可在本地通过 `cuobjdump -ptx <binary>` 或 `cuobjdump -sass <
 - 可执行文件：`build/bin/rmsnorm_v0` … `rmsnorm_v3`
 - ncu 报告：`data/ncu_reports/`
 - PTX/SASS：本地运行 `cuobjdump -ptx <binary>` 生成
+
+---
+
+## 主场景性能口径（统一）
+
+主指标统一为主场景 `gpu_ms`，NCU 吞吐仅用于瓶颈归因。
+
+| 实现 | 主场景维度 | GPU耗时(ms) | 校验状态 | 数据文件 |
+|---|---|---:|---|---|
+| `rmsnorm_v3` | `rows=4096,cols=4096` | 0.373722 | PASS | `data/results/rmsnorm_v3_results.csv` |
+
+环境口径：`RTX 5060 Ti (sm_120) + CUDA 13.2`。
+统一汇总：`data/results/main_scenario_unified.csv`（retest tag: `20260512_manual_retest`）。
+
+## 已知边界与后续补充
+
+- 当前文档以前向 kernel 为主，尚未覆盖 backward 与混合精度训练链路。
+- 建议补充跨 `cols` 桶（如 768/1536/8192）的分段最优策略与自动路由建议。

@@ -8,15 +8,17 @@
 
 ## 数学定义
 
-设输入 $X \in \mathbb{R}^{R \times D}$，gamma ∈ R^D 为 RMSNorm 权重，$W_q \in \mathbb{R}^{D \times D}$，$b_q \in \mathbb{R}^D$。
+设输入 `X`（形状 `R x D`），`gamma`（形状 `D`）为 RMSNorm 权重，`W_q`（形状 `D x D`），`b_q`（形状 `D`）。
 
 $$
 N = \text{RMSNorm}(X; \gamma, \epsilon)
 $$
+纯文本：`N = RMSNorm(X, gamma, eps)`。
 
 $$
 Q = N \cdot W_q + b_q
 $$
+纯文本：`Q = N * W_q + b_q`。
 
 ---
 
@@ -65,3 +67,21 @@ cd ..
 | v2 | Mio Throttle 27.2% | Short Scoreboard 26.8% | Long Scoreboard 15.4% | Not Selected 12.9% | No Instruction 8.5% |
 
 v0/v1 以 Long Scoreboard 占主导（~80%），v2 的 stall 分布更均匀——Mio Throttle 27.2% + Short Scoreboard 26.8% + Long Scoreboard 15.4%。这与 v2 的瓶颈阶段变化一致：融合后的 RMSNorm 阶段成为带宽瓶颈，其 stall 模式从单纯等待全局内存过渡到 MIO 管道拥塞和缓存访问延迟的混合模式。
+
+---
+
+## 主场景性能口径（统一）
+
+主指标统一为主场景 `gpu_ms`，NCU 吞吐仅用于瓶颈归因。
+
+| 实现 | 主场景维度 | GPU耗时(ms) | 校验状态 | 数据文件 |
+|---|---|---:|---|---|
+| `q_path_fusion_v2` | `rows=1024,cols=1024` | 0.182544 | PASS | `data/results/q_path_fusion_v2_results.csv` |
+
+环境口径：`RTX 5060 Ti (sm_120) + CUDA 13.2`。
+统一汇总：`data/results/main_scenario_unified.csv`（retest tag: `20260512_manual_retest`）。
+
+## 已知边界与后续补充
+
+- 当前主口径使用 `rows=1024,cols=1024`（4096 档位为 `SKIP`），大尺寸正确性仍需单独补测。
+- 建议补充不同 `cols` 桶下 `RMSNormKernel` 与 `QPathFusionV2Kernel` 的分阶段占比。
