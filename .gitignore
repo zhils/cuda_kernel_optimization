@@ -44,6 +44,8 @@ __pycache__/
 # Personal learning notes (internal reflections, AI-generated code disclosure, self-critique, etc.)
 # Not suitable for public GitHub as an interview project
 notes/
+INTERVIEW_*.md
+PROJECT_OVERVIEW.md
 
 # Project documentation (HTML overview, environment notes, etc.)
 docs/
