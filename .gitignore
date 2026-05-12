@@ -47,8 +47,18 @@ notes/
 INTERVIEW_*.md
 PROJECT_OVERVIEW.md
 
-# Project documentation (HTML overview, environment notes, etc.)
+# Internal-only project docs (process notes, private guidelines, generated overviews)
 docs/
+docs/*.html
+docs/*guidelines*.md
+docs/benchmark_environment.md
+
+# Interview preparation / private narration material
+INTERVIEW_PRESENTATION_SCRIPT.md
+INTERVIEW_SPRINT_ROADMAP.md
+*INTERVIEW*.md
+*interview*.md
+*面试*.md
 
 # Generated ISA / disassembly (nvcc -ptx / -cubin outputs; regenerate from .cu)
 **/asm/
