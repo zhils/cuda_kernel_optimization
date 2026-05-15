@@ -322,3 +322,60 @@ v4 的 Math Pipe Throttle 占 72.9%，说明 Tensor Core WMMA 指令已完全占
 
 - 当前 FP32/FP16 主口径来自不同目标可执行文件，建议后续增加统一批次的并排实测表。
 - 建议补充 `M!=N!=K` 的非方阵场景，以覆盖推理服务常见形状分布。
+
+---
+
+## 7. BF16 WMMA Tensor Core + 全变体对比 (2026-05-15)
+
+新增 `gemm_bf16`（BF16 WMMA k=16 Tensor Core）和统一对比工具 `gemm_all_compare`。
+
+### gemm_bf16 — BF16 K=16 Tensor Core
+
+与 gemm_fp16 结构一致，使用 cp.async 双缓冲流水线，128x128 block，2x4 warp 布局。
+BF16 的 mantissa 精度（7-bit）低于 FP16（10-bit），在 GEMM 中误差略大于 FP16。
+
+### 全变体统一对比 (`gemm_all_compare`)
+
+将所有手写 kernel、cuBLAS FP32/FP16/BF16 纳入同一可执行文件、同一数据、同一 timing 循环。
+
+| 规模 | gemm_v3 (FP32) | gemm_fp16 (FP16) | gemm_bf16 (BF16) | cuBLAS FP32 | cuBLAS FP16 | cuBLAS BF16 | 最佳 |
+|:----|:----:|:----:|:----:|:----:|:----:|:----:|:----:|
+| 128^3 | 0.0103 ms / 405 GFLOPS | 0.0170 ms / 246 GFLOPS | 0.0173 ms / 242 GFLOPS | 0.0338 ms / 124 GFLOPS | **0.0053 ms / 793 GFLOPS** | 0.0187 ms / 224 GFLOPS | cuBLAS FP16 |
+| 256^3 | 0.0183 ms / 1835 GFLOPS | **0.0166 ms / 2025 GFLOPS** | 0.0282 ms / 1190 GFLOPS | 0.0386 ms / 869 GFLOPS | 0.0207 ms / 1619 GFLOPS | 0.0233 ms / 1443 GFLOPS | gemm_fp16 |
+| 512^3 | 0.0286 ms / 9398 GFLOPS | **0.0232 ms / 11575 GFLOPS** | 0.0290 ms / 9267 GFLOPS | 0.0506 ms / 5305 GFLOPS | 0.0252 ms / 10652 GFLOPS | 0.0268 ms / 10019 GFLOPS | gemm_fp16 |
+| 1024^3 | 0.1935 ms / 11098 GFLOPS | 0.0719 ms / 29866 GFLOPS | 0.0851 ms / 25221 GFLOPS | 0.1550 ms / 13852 GFLOPS | 0.0527 ms / 40734 GFLOPS | **0.0526 ms / 40803 GFLOPS** | cuBLAS BF16 |
+| 4096^3 | 11.105 ms / 12377 GFLOPS | 3.717 ms / 36973 GFLOPS | 4.705 ms / 29214 GFLOPS | 8.567 ms / 16043 GFLOPS | **2.898 ms / 47420 GFLOPS** | 2.911 ms / 47221 GFLOPS | cuBLAS FP16 |
+
+### 4096^3 重点对照
+
+| 实现 | GPU ms | TFLOPS | vs cuBLAS FP16 |
+|:-----|:-----:|:------:|:--------------:|
+| gemm_fp16 | 3.72 | 37.0 | 78% |
+| gemm_bf16 | 4.70 | 29.2 | 62% |
+| cuBLAS FP16 | 2.90 | 47.4 | 100% |
+| cuBLAS BF16 | 2.91 | 47.2 | 99.6% |
+| gemm_v3 (FP32) | 11.10 | 12.4 | 26% |
+| cuBLAS FP32 | 8.57 | 16.0 | 34% |
+
+分析：
+- cuBLAS FP16/BF16 在 4096^3 均达到约 47 TFLOPS，接近 Blackwell TC 理论峰值
+- 手写 gemm_fp16 达到 cuBLAS FP16 的 78%，说明 WMMA 手写 kernel 能有效利用 Tensor Core
+- 手写 gemm_bf16 略低（62%），瓶颈可能是寄存器分配或 memcpy 粒度
+- gemm_v3（FP32 CUDA Core）12.4 TFLOPS，达到 cuBLAS FP32（16.0 TFLOPS）的 77%
+- 256^3 和 512^3 下手写 kernel 超过 cuBLAS，说明定制 kernel 在中规模有优势
+
+### 编译与运行
+
+```bash
+# 仅手写 + cuBLAS（默认）
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DCMAKE_CUDA_ARCHITECTURES=120
+cmake --build build -j4 --target gemm_all_compare
+./build/bin/gemm_all_compare
+```
+
+结果 CSV：`data/results/gemm_all_compare_results.csv`
+
+### CUTLASS 在 sm_120 上的兼容性
+
+CUTLASS 4.4.2 已安装，但 `device::Gemm` 默认配置对 sm_100/120 的 tile 参数未特化。
+当前版本主对比走 cuBLAS，CUTLASS 通道保留为后续扩展。

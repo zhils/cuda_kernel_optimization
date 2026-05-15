@@ -257,6 +257,7 @@ static void GemmCPU_FP32(const float* A, const float* B, float* C, int M, int N,
   }
 }
 
+#ifndef ALL_COMPARE_LIB
 int main() {
   constexpr int kRepeat = 10;
   constexpr int kMaxCpuVerifyDim = 1024;
@@ -374,3 +375,5 @@ int main() {
   }
   return 0;
 }
+
+#endif /* ALL_COMPARE_LIB */

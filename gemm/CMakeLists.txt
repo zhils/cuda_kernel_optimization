@@ -5,6 +5,7 @@ set(GEMM_VARIANTS
     gemm_v3
     gemm_v4
     gemm_fp16
+    gemm_bf16
     gemm_fp8
     gemm_int8
     gemm_fp8_cublaslt
@@ -19,6 +20,7 @@ set(GEMM_VARIANTS_ASM
     gemm_v2
     gemm_v3
     gemm_v4
+    gemm_bf16
 )
 
 foreach(variant ${GEMM_VARIANTS})
@@ -34,8 +36,21 @@ target_compile_definitions(gemm_v4 PRIVATE __CUDA_AMPERE_MMA__)
 
 target_link_libraries(gemm_cublas_ref PRIVATE cublas)
 target_link_libraries(gemm_fp8 PRIVATE cublasLt)
-
 target_link_libraries(gemm_fp8_cublaslt PRIVATE cublas cublasLt)
+
+# gemm_all_compare: unified GEMM comparison benchmark
+set(GEMM_ALL_COMPARE_SRCS gemm_all_compare.cu)
+add_executable(gemm_all_compare ${GEMM_ALL_COMPARE_SRCS})
+target_link_libraries(gemm_all_compare PRIVATE cuda_common cublas)
+target_compile_definitions(gemm_all_compare PRIVATE ALL_COMPARE_LIB)
+if(DEFINED CUTLASS_ROOT)
+    get_filename_component(CUTLASS_ABS_ROOT "${CUTLASS_ROOT}" ABSOLUTE)
+    message(STATUS "CUTLASS_ROOT = ${CUTLASS_ABS_ROOT}")
+    target_include_directories(gemm_all_compare PRIVATE ${CUTLASS_ABS_ROOT}/include)
+    target_compile_definitions(gemm_all_compare PRIVATE CUTLASS_ROOT)
+endif()
+set_target_properties(gemm_all_compare PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
 
 set(ASM_OUTPUT_DIR ${CMAKE_BINARY_DIR}/gemm/asm)
 set(NVCC_FLAGS -Xcompiler=-Wno-deprecated-declarations)
@@ -80,10 +95,9 @@ foreach(variant IN LISTS GEMM_VARIANTS)
 endforeach()
 
 add_custom_target(gen_asm_ptx ALL DEPENDS
-    gemm_v0 gemm_v1 gemm_v2 gemm_v3 gemm_v4
+    gemm_v0 gemm_v1 gemm_v2 gemm_v3 gemm_v4 gemm_bf16
 )
 
 add_custom_target(gen_asm_sass ALL DEPENDS
-    gemm_v0 gemm_v1 gemm_v2 gemm_v3 gemm_v4
+    gemm_v0 gemm_v1 gemm_v2 gemm_v3 gemm_v4 gemm_bf16
 )
-

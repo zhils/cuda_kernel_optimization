@@ -202,6 +202,7 @@ static void GemmCPU(const float* A, const float* B, float* C, int M, int N, int 
   }
 }
 
+#ifndef ALL_COMPARE_LIB
 int main() {
   constexpr int kRepeat = 10;
   constexpr int kMaxCpuVerifyDim = 1024;
@@ -290,3 +291,5 @@ int main() {
   }
   return 0;
 }
+
+#endif /* ALL_COMPARE_LIB */
