@@ -1,0 +1,114 @@
+{
+  "schema_version": "1",
+  "family": "gemm",
+  "cases": [
+    {
+      "id": "smoke_128_cube",
+      "expect": "pass",
+      "tags": ["smoke", "aligned"],
+      "params": { "M": 128, "N": 128, "K": 128, "dtype": "fp32", "impl": "v3" }
+    },
+    {
+      "id": "main_4096_cube",
+      "expect": "skip",
+      "tags": ["perf", "aligned"],
+      "params": { "M": 4096, "N": 4096, "K": 4096, "dtype": "fp32", "impl": "cublas" }
+    },
+    {
+      "id": "rectangular_mnk",
+      "expect": "pass",
+      "tags": ["smoke", "unaligned"],
+      "params": { "M": 100, "N": 200, "K": 300, "dtype": "fp32", "impl": "auto" }
+    },
+    {
+      "id": "unaligned_1000",
+      "expect": "pass",
+      "tags": ["unaligned", "fallback"],
+      "params": { "M": 1000, "N": 1000, "K": 1000, "dtype": "fp32", "impl": "auto" }
+    },
+    {
+      "id": "minimal_1",
+      "expect": "pass",
+      "tags": ["boundary"],
+      "params": { "M": 1, "N": 1, "K": 1, "dtype": "fp32", "impl": "v0" }
+    },
+    {
+      "id": "wide_matrix",
+      "expect": "pass",
+      "tags": ["ratio"],
+      "params": { "M": 64, "N": 4096, "K": 128, "dtype": "fp32", "impl": "auto" }
+    },
+    {
+      "id": "invalid_zero_m",
+      "expect": "invalid_argument",
+      "tags": ["boundary"],
+      "params": { "M": 0, "N": 128, "K": 128, "dtype": "fp32" }
+    },
+    {
+      "id": "invalid_negative_k",
+      "expect": "invalid_argument",
+      "tags": ["boundary"],
+      "params": { "M": 128, "N": 128, "K": -1, "dtype": "fp32" }
+    },
+    {
+      "id": "fp16_aligned",
+      "expect": "pass",
+      "tags": ["dtype", "aligned"],
+      "params": { "M": 256, "N": 256, "K": 256, "dtype": "fp16", "impl": "fp16" }
+    },
+    {
+      "id": "thin_m_8",
+      "expect": "pass",
+      "tags": ["ratio", "extreme"],
+      "params": { "M": 8, "N": 4096, "K": 4096, "dtype": "fp32", "impl": "auto" }
+    },
+    {
+      "id": "thin_n_8",
+      "expect": "pass",
+      "tags": ["ratio", "extreme"],
+      "params": { "M": 4096, "N": 8, "K": 4096, "dtype": "fp32", "impl": "auto" }
+    },
+    {
+      "id": "thin_k_8",
+      "expect": "pass",
+      "tags": ["ratio", "extreme"],
+      "params": { "M": 4096, "N": 4096, "K": 8, "dtype": "fp32", "impl": "auto" }
+    },
+    {
+      "id": "tall_skinny",
+      "expect": "pass",
+      "tags": ["ratio", "extreme"],
+      "params": { "M": 4096, "N": 128, "K": 4096, "dtype": "fp32", "impl": "auto" }
+    },
+    {
+      "id": "short_fat",
+      "expect": "pass",
+      "tags": ["ratio", "extreme"],
+      "params": { "M": 128, "N": 4096, "K": 128, "dtype": "fp32", "impl": "auto" }
+    },
+    {
+      "id": "bf16_aligned",
+      "expect": "pass",
+      "tags": ["dtype", "bf16"],
+      "params": { "M": 256, "N": 256, "K": 256, "dtype": "bf16", "impl": "cublasBf16" }
+    },
+    {
+      "id": "int8_aligned",
+      "expect": "skip",
+      "tags": ["dtype", "int8"],
+      "params": { "M": 256, "N": 256, "K": 256, "dtype": "int8", "impl": "cublasInt8" }
+    },
+    {
+      "id": "fp8e4m3_aligned",
+      "expect": "pass",
+      "tags": ["dtype", "fp8"],
+      "params": { "M": 256, "N": 256, "K": 256, "dtype": "fp8_e4m3", "impl": "cublasFp8" }
+    },
+    {
+      "id": "fp8e5m2_aligned",
+      "expect": "skip",
+      "tags": ["dtype", "fp8"],
+      "params": { "M": 256, "N": 256, "K": 256, "dtype": "fp8_e5m2", "impl": "cublasFp8" }
+    }
+  ]
+}

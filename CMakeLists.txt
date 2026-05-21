@@ -12,19 +12,31 @@ if(NOT CMAKE_BUILD_TYPE)
     set(CMAKE_BUILD_TYPE Release CACHE STRING "Build type" FORCE)
 endif()
 
+option(BUILD_TESTS "Build GoogleTest unit tests and API stubs" ON)
+
+find_package(CUDAToolkit REQUIRED)
+
+include(FetchContent)
+FetchContent_Declare(
+    nlohmann_json
+    URL https://github.com/nlohmann/json/archive/refs/tags/v3.11.3.zip
+    DOWNLOAD_EXTRACT_TIMESTAMP TRUE
+)
+FetchContent_MakeAvailable(nlohmann_json)
+
 add_subdirectory(common)
 add_subdirectory(gemm)
-add_subdirectory(softmax)
 add_subdirectory(rmsnorm)
-add_subdirectory(q_path_fusion)
 add_subdirectory(fused_conv1d_silu)
-add_subdirectory(flash_attention)
-add_subdirectory(fused_l2_norm_qk)
-add_subdirectory(fused_gated_delta_rule)
-add_subdirectory(fused_output_norm_gate)
 
-# 统一测试框架（可选，默认不构建）
-option(BUILD_TESTS "Build unified test framework" OFF)
 if(BUILD_TESTS)
+    FetchContent_Declare(
+        googletest
+        URL https://github.com/google/googletest/archive/refs/tags/v1.15.2.zip
+        DOWNLOAD_EXTRACT_TIMESTAMP TRUE
+    )
+    set(gtest_force_shared_crt ON CACHE BOOL "" FORCE)
+    FetchContent_MakeAvailable(googletest)
+    enable_testing()
     add_subdirectory(tests)
 endif()

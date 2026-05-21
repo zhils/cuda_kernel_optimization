@@ -1,6 +1,5 @@
-// RMSNorm CUB baseline: 使用 cub::BlockReduce 做平方和归约
-// 每 block 处理一行，融合归一化，float4 向量化加载/写回
-// 目的：与手写 kernel (v1~v3) 对比 CUB 库的开销
+// RMSNorm CUB 基线：使用 cub::BlockReduce 做平方和归约，每 block 处理一行，
+// 融合归一化，float4 向量化加载和写回，用于与手写 kernel 对比 CUB 库的开销
 
 #include <cuda_runtime.h>
 
@@ -24,15 +23,15 @@ constexpr int kBlockSize = 256;
 
 __global__ void RMSNormCUBKernel(const float* __restrict__ x, float* __restrict__ y,
                                   const float* __restrict__ weight, int rows, int cols, float eps) {
+  // 计算行索引与指针
   int row = blockIdx.x;
   if (row >= rows) return;
   const float* row_x = x + static_cast<size_t>(row) * cols;
   float* row_y = y + static_cast<size_t>(row) * cols;
 
-  // 每线程累加局部平方和
+  // 并行累加局部平方和
   float local_sum = 0.0f;
   const int cols4 = cols / 4;
-  // 对齐时用 float4
   const bool align4 = (cols % 4 == 0) &&
                       (reinterpret_cast<uintptr_t>(row_x) % 16 == 0) &&
                       (reinterpret_cast<uintptr_t>(row_y) % 16 == 0);
@@ -94,14 +93,8 @@ int main() {
   constexpr int kRepeat = 10;
   constexpr int kTestCases = 5;
 
-#ifdef _WIN32
-  _mkdir("data");
-  _mkdir("data\\results");
-#else
-  mkdir("data", 0755);
-  mkdir("data/results", 0755);
-#endif
-  std::ofstream ofs("data/results/rmsnorm_cub_ref_results.csv");
+  const std::string results_dir = common::EnsureResultsDir();
+  std::ofstream ofs(results_dir + "/rmsnorm_cub_ref_results.csv");
   ofs << "id,rows,cols,gpu_ms,bandwidth_gb_s,max_abs_diff,check\n";
 
   std::vector<std::pair<int, int>> test_sizes = {
@@ -111,6 +104,7 @@ int main() {
   CHECK_CUDA(cudaDeviceGetAttribute(&max_smem, cudaDevAttrMaxSharedMemoryPerBlock, 0));
 
   for (int i = 0; i < kTestCases; ++i) {
+    // 确定维度并生成测试数据
     int rows = test_sizes[i].first;
     int cols = test_sizes[i].second;
     int n = rows * cols;
@@ -119,6 +113,7 @@ int main() {
     std::vector<float> cpu(n), gpu(n);
     RMSNormCPU(x.data(), cpu.data(), w.data(), rows, cols, EPS);
 
+    // 分配 GPU 内存并拷贝数据到 GPU
     float *dx, *dy, *dw;
     CHECK_CUDA(cudaMalloc(&dx, n * sizeof(float)));
     CHECK_CUDA(cudaMalloc(&dy, n * sizeof(float)));
@@ -129,10 +124,11 @@ int main() {
     dim3 block(kBlockSize);
     dim3 grid(rows);
 
-    // warmup
+    // 预热
     RMSNormCUBKernel<<<grid, block>>>(dx, dy, dw, rows, cols, EPS);
     CHECK_CUDA(cudaDeviceSynchronize());
 
+    // 计时循环
     cudaEvent_t s, e;
     CHECK_CUDA(cudaEventCreate(&s));
     CHECK_CUDA(cudaEventCreate(&e));
@@ -146,7 +142,10 @@ int main() {
     CHECK_CUDA(cudaEventElapsedTime(&gpu_ms_total, s, e));
     const float gpu_ms = gpu_ms_total / static_cast<float>(kRepeat);
 
+    // 拷贝结果回 CPU
     CHECK_CUDA(cudaMemcpy(gpu.data(), dy, n * sizeof(float), cudaMemcpyDeviceToHost));
+
+    // 校验与结果输出
     bool ok = common::CheckEqual(cpu, gpu, 1e-4f);
 
     const double bytes = static_cast<double>(n) * sizeof(float) * 2.0;
@@ -161,6 +160,7 @@ int main() {
     ofs << i << "," << rows << "," << cols << "," << gpu_ms << "," << bw << ","
         << common::MaxAbsDiff(cpu, gpu) << "," << (ok ? "PASS" : "FAIL") << "\n";
 
+    // 释放资源
     CHECK_CUDA(cudaEventDestroy(s));
     CHECK_CUDA(cudaEventDestroy(e));
     CHECK_CUDA(cudaFree(dx));

@@ -49,29 +49,6 @@ if [[ "${RANDOM_GEMM_CASES:-0}" == "1" ]]; then
   echo "[regression] RANDOM_GEMM_CASES enabled"
 fi
 
-if [[ "${RANDOM_SOFTMAX_CASES:-0}" == "1" ]]; then
-  backup_and_generate_cases "${ROOT_DIR}/data/softmax/test_cases.csv" \
-    --count "${RANDOM_SOFTMAX_CASES_COUNT:-12}" \
-    --seed "${RANDOM_SOFTMAX_CASES_SEED:-20260512}" \
-    --min-rows 64 --max-rows 4096 \
-    --min-cols 64 --max-cols 2048 \
-    --align 16 \
-    --max-elements "${RANDOM_SOFTMAX_CASES_MAX_ELEMENTS:-8388608}"
-  echo "[regression] RANDOM_SOFTMAX_CASES enabled"
-fi
-
-if [[ "${RANDOM_QPATH_CASES:-0}" == "1" ]]; then
-  backup_and_generate_cases "${ROOT_DIR}/data/q_path_fusion/test_cases.csv" \
-    --count "${RANDOM_QPATH_CASES_COUNT:-10}" \
-    --seed "${RANDOM_QPATH_CASES_SEED:-20260513}" \
-    --min-rows 64 --max-rows 1024 \
-    --min-cols 64 --max-cols 1024 \
-    --align 16 \
-    --max-elements "${RANDOM_QPATH_CASES_MAX_ELEMENTS:-2097152}" \
-    --square-only
-  echo "[regression] RANDOM_QPATH_CASES enabled"
-fi
-
 restore_case_files() {
   for pair in "${CASE_BACKUPS[@]}"; do
     local target="${pair%%|*}"

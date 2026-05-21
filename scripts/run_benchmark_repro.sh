@@ -39,11 +39,7 @@ cmake --build "${BUILD_DIR}" --target "${TARGETS[@]}"
 for bin in "${TARGETS[@]}"; do
   log_file="${LOG_DIR}/${bin}.log"
   echo "[repro] running ${bin}"
-  if [[ "${bin}" == "softmax_benchmark_all" ]]; then
-    NCU_QUICK=1 "${BUILD_DIR}/bin/${bin}" > "${log_file}" 2>&1
-  else
-    "${BUILD_DIR}/bin/${bin}" > "${log_file}" 2>&1
-  fi
+  "${BUILD_DIR}/bin/${bin}" > "${log_file}" 2>&1
 done
 
 python3 "${ROOT_DIR}/scripts/normalize_results.py" \

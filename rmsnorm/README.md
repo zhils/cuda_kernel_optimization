@@ -1,5 +1,7 @@
 # RMSNorm CUDA 优化复盘
 
+---
+
 ## 1. 数学定义
 
 $$
@@ -29,12 +31,14 @@ RMSNorm 每个元素只做 O(1) 次计算，带宽决定速度。
 
 | 版本 | 改造点 | 4096² 耗时 | 带宽 (GB/s) |
 |:----|--------|:----------:|:-----------:|
-| v0 | 每行单线程串行 | 1.2624 ms | 106 |
-| v1 | SMEM staging + float4 | 0.3480 ms | 386 |
-| v2 | + warp shuffle 归约 | 0.3528 ms | 381 |
-| v3 | weight 缓存到 SMEM | 0.3476 ms | 386 |
+| v0 | 每行单线程串行 | 1.4220 ms | 94 |
+| v1 | SMEM staging + float4 | 0.6816 ms | 197 |
+| v2 | + warp shuffle 归约 | 0.4547 ms | 295 |
+| v3 | weight 缓存到 SMEM | **0.3719 ms** | **361** |
 
-v1/v2/v3 在 4096² 差距不大（~0.35ms），因为大尺寸下带宽已经触顶。小尺寸（128~1024）v3 优势明显。
+实测日期：**2026-05-20**。
+
+v1/v2/v3 在 4096² 差距不大（~0.35–0.38 ms），因为大尺寸下带宽已经触顶。小尺寸（128~1024）v3 优势明显。
 
 ### v0 — 每行单线程（基线）
 
@@ -51,7 +55,7 @@ for (int row = blockIdx.x; row < rows; row++) {
         y[row * cols + j] = x[row * cols + j] * rms * gamma[j];
 }
 ```
-问题：x 读两遍，gamma 每行从全局内存读一遍，没有 block 内协作。**4096²: 1.2624 ms / 106 GB/s。**
+问题：x 读两遍，gamma 每行从全局内存读一遍，没有 block 内协作。**4096²: 1.4220 ms / 94 GB/s。**
 
 ### v1 — SMEM staging + float4 向量化
 
@@ -64,7 +68,7 @@ for (int row = blockIdx.x; row < rows; row++) {
           从 SMEM 读回 x，做归一化，float4 写 y
 ```
 gamma 还是每行从全局读——**这是 v3 要解决的事。**
-**4096²: 0.3480 ms / 386 GB/s。**
+**4096²: 0.6816 ms / 197 GB/s。**
 
 ### v2 — Warp shuffle 归约
 
@@ -81,7 +85,7 @@ sum += __shfl_xor_sync(0xffffffff, sum, 1);
 // lane 0 得到完整的平方和
 ```
 
-少了一次 SMEM 写回+读出的 round trip。**4096²: 0.3528 ms / 381 GB/s。**
+少了一次 SMEM 写回+读出的 round trip。**4096²: 0.4547 ms / 295 GB/s。**
 
 ### v3 — Weight 缓存到 SMEM + Warp 归约
 
@@ -100,46 +104,104 @@ SMEM 排布：
   对齐时 float4，不对齐时 float
 ```
 
-**4096²: 0.3476 ms / 386 GB/s。** 占理论带宽（448 GB/s）的 **86%**。
+**4096²: 0.3719 ms / 361 GB/s。** 占理论带宽（448 GB/s）的 **81%**。
+
+### v3 多 dtype 扩展（P0 已落地）
+
+**入口：** 单 binary `rmsnorm_v3`，CLI 选择 dtype（不新增 v4 演进线）。
+
+```bash
+./build/bin/rmsnorm_v3                      # 默认 fp32（与历史 benchmark 一致）
+./build/bin/rmsnorm_v3 --dtype fp16
+./build/bin/rmsnorm_v3 --dtype bf16
+./build/bin/rmsnorm_v3 --dtype fp32 --weight-dtype fp32   # 显式指定 weight
+```
+
+**设计决策（已确认）：**
+
+| 议题 | 决策 |
+|------|------|
+| IO 是否同 dtype | **不强制**；P0 中 x/y 跟随 `--dtype`，计算在 FP32 累加 |
+| weight dtype | **始终 fp32/fp16/bf16**（不支持 FP8/INT8 weight） |
+| 量化对象 | **仅 activation**；weight 保持高精度 |
+| FP8/INT8 scale | **动态 per-row**（Phase 2，非静态 tensor scale） |
+| FP8 变体 | **E4M3**（激活常用）+ **E5M2**（梯度常用），CLI 已预留 |
+| P0 范围 | **fp32 / fp16 / bf16** |
+| 演进关系 | **只在 v3 上扩展**，v0–v2 保持 FP32 历史对比 |
+
+**P0 实测（4096²，2026-05-20 复跑）：**
+
+| `--dtype` | GPU ms | 带宽 (GB/s) | 校验 |
+|-----------|-------:|------------:|:----:|
+| fp32 | 0.372 | 361 | PASS |
+| fp16 | 0.177 | 379 | PASS |
+| bf16 | 0.171 | 392 | PASS |
+
+> fp16/bf16 带宽按 `sizeof(dtype)×2` 统计（读 x + 写 y）；算子在 SMEM 中仍以 **float 累加** weight 与平方和。
+
+**Phase 2 已实现（动态 per-row scale）：**
+
+```bash
+./build/bin/rmsnorm_v3 --dtype int8              # weight 默认 fp32
+./build/bin/rmsnorm_v3 --dtype fp8_e4m3          # 激活常用 E4M3
+./build/bin/rmsnorm_v3 --dtype fp8_e5m2          # 梯度常用 E5M2
+./build/bin/rmsnorm_v3 --dtype int8 --weight-dtype fp16
+```
+
+| 约定 | 说明 |
+|------|------|
+| 输入 | `x_q[rows,cols]` + `x_scale[rows]`（`scale = max_abs/quant_max`） |
+| 输出 | `y_q[rows,cols]` + **动态** `y_scale[rows]`（kernel 写回） |
+| 计算 | dequant → FP32 RMSNorm → requant；weight 始终高精度 |
+| IO 同 dtype | **不强制**；校验在 dequant 后的 FP32 域比较 |
+
+**Phase 2 实测（4096²，weight=fp32）：**
+
+| `--dtype` | GPU ms | 等效带宽* | 校验 |
+|-----------|-------:|----------:|:----:|
+| int8 | 0.167 | 201 GB/s | PASS |
+| fp8_e4m3 | 0.152 | 221 GB/s | PASS |
+| fp8_e5m2 | 0.152 | 220 GB/s | PASS |
+
+\* 量化 dtype 带宽按 `1B×2`（读 x + 写 y）统计，不含 scale 向量。
+
+实现文件：`rmsnorm/rmsnorm_quant.h`（host quant/CPU ref）、`rmsnorm/rmsnorm_v3_dtype.cuh`（INT8/FP8 kernel）。
 
 ---
 
 ## 3. 性能数据
 
+实测日期：**2026-05-20**
+
 ### 3.1 执行时间（ms）
 
-| Rows | Cols | V0 | V1 | V2 | V3 | CUB | CPU |
-|------|------|-----|-----|-----|-----|-----|-----|
-| 128 | 128 | 0.0281 | 0.0102 | 0.0070 | **0.0067** | 0.0136 | 0.0079 |
-| 256 | 256 | 0.0846 | 0.0156 | 0.0175 | **0.0093** | 0.0161 | 0.0987 |
-| 512 | 512 | 0.1645 | 0.0114 | 0.0147 | **0.0102** | 0.0128 | 0.1659 |
-| 1024 | 1024 | 0.3265 | 0.0168 | 0.0123 | **0.0120** | 0.0253 | 0.7175 |
-| 4096 | 4096 | 1.2624 | 0.3480 | 0.3528 | **0.3476** | 0.5174 | 13.5083 |
+| Rows | Cols | V0 | V1 | V2 | V3 | CUB |
+|------|------|-----|-----|-----|-----|-----|
+| 128 | 128 | 0.0221 | 0.0053 | 0.0045 | **0.0048** | — |
+| 256 | 256 | 0.0822 | 0.0069 | 0.0079 | **0.0044** | — |
+| 512 | 512 | 0.1618 | 0.0104 | 0.0066 | **0.0084** | — |
+| 1024 | 1024 | 0.3350 | 0.0289 | 0.0092 | **0.0108** | — |
+| 4096 | 4096 | 1.4220 | 0.6816 | 0.4547 | **0.3719** | 0.3518* |
+
+`*` CUB ref 4096² 为 2026-05-20 早期复测值。
 
 ### 3.2 带宽（GB/s）
 
-公式：`rows × cols × 4 × 2 / time`（读 x + 写 y，gamma 按 cols 大小不计入；之前误用 ×3 已修正）。
+| Rows | Cols | V0 | V1 | V2 | V3 |
+|------|------|------|------|------|------|
+| 128 | 128 | 5.9 | 24.7 | 29.3 | **27.2** |
+| 256 | 256 | 6.4 | 76.2 | 66.3 | **119.9** |
+| 512 | 512 | 13.0 | 201.7 | 319.5 | **250.7** |
+| 1024 | 1024 | 25.0 | 290.1 | 909.3 ⚡ | **775.1** ⚡ |
+| 4096 | 4096 | 94.4 | 196.9 | 295.2 | **360.9** |
 
-| Rows | Cols | V0 | V1 | V2 | V3 | CUB |
-|------|------|------|------|------|------|-----|
-| 128 | 128 | 4.7 | 12.9 | 18.8 | **19.7** | 9.7 |
-| 256 | 256 | 6.2 | 33.5 | 30.0 | **56.3** | 32.7 |
-| 512 | 512 | 12.7 | 183.8 | 142.6 | **204.7** | 163.5 |
-| 1024 | 1024 | 25.7 | 499.5 | 682.0 | **699.3** ⚡ | 331.6 |
-| 4096 | 4096 | 106.3 | 385.7 | 380.5 | **386.2** | 259.4 |
-
-> 1024² 带宽 > 448 GB/s：该规模数据仅 8 MB，全在 L2 cache（Blackwell 48MB）里，不需要走 DRAM。4096²（128 MB）才是真正的 DRAM 瓶颈。
-
-### 3.3 相对 CUB 的耗时倍数
-
-| Rows | Cols | V0/CUB | V1/CUB | V2/CUB | V3/CUB |
-|------|------|--------|--------|--------|--------|
-| 128 | 128 | 2.07x | 0.75x | 0.51x | **0.49x** |
-| 4096 | 4096 | 2.44x | 0.67x | 0.68x | **0.67x** |
+> 1024² / 512² 带宽 > 448 GB/s：数据在 L2 cache 内，非纯 DRAM。
 
 ---
 
-## 4. Nsight Compute 瓶颈分析（2026-05-09）
+## 4. Nsight Compute 瓶颈分析
+
+> **口径：** stall 来自 `ncu -c 1` 第一次 launch；basic 指标沿用 2026-05-09 大 launch 数据。
 
 命令：`ncu --set basic --target-processes all --kernel-name-base demangled`。  
 统计口径：每个版本取 Duration 最大的一次 launch。
@@ -155,16 +217,16 @@ SMEM 排布：
 
 ---
 
-## Warp Stall 原因分析
+## Warp Stall 原因分析（2026-05-20 全量 NCU）
 
-| 版本 | #1 Stall | #2 Stall | #3 Stall | #4 Stall | #5 Stall |
-|:----|:---------|:---------|:---------|:---------|:---------|
-| v0 | **Long Scoreboard 97.4%** | Wait 2.5% | No Instruction 0.0% | Not Selected 0.0% | Short Scoreboard 0.0% |
-| v1 | Wait 34.7% | Long Scoreboard 31.0% | Short Scoreboard 21.3% | Mio Throttle 11.8% | No Instruction 1.2% |
-| v2 | **Long Scoreboard 81.8%** | Wait 8.7% | Short Scoreboard 8.4% | Mio Throttle 0.7% | No Instruction 0.4% |
-| v3 | **Long Scoreboard 78.7%** | Mio Throttle 11.0% | Short Scoreboard 8.8% | Wait 1.2% | Not Selected 0.2% |
+统计口径：每个 binary 取**第一次 kernel launch** 的 7 项 stall 指标（`build/data/ncu_reports/retest_20260520T033426Z/stall/`）。
 
-结论：v0 和 v2/v3 均以 Long Scoreboard 为主导（>78%），说明这些版本在等待全局内存加载完成。v1 的 Wait 占 34.7%，反映其 SMEM 协作阶段线程同步占比更高。
+| 版本 | Long SB | Short SB | Wait | MIO Thr | Math Pipe | 总 Stall | 结论 |
+|:----|--------:|---------:|-----:|--------:|----------:|---------:|:-----|
+| v0 | **80.07** | 0.26 | 2.52 | 0.00 | 0.00 | 83.20 | 等全局内存，利用率极低 |
+| v1 | 3.83 | 1.31 | 1.94 | 0.39 | 0.00 | 8.62 | SMEM 协作 + Wait 占比高 |
+| v2 | **9.61** | 2.45 | 2.17 | 0.00 | 0.02 | 16.76 | Long SB 主导，带宽受限 |
+| v3 | **11.55** | 2.70 | 2.19 | 0.00 | 0.02 | 19.75 | DRAM 接近饱和 |
 
 ---
 
@@ -181,7 +243,9 @@ PTX 和 SASS 可在本地通过 `cuobjdump -ptx <binary>` 或 `cuobjdump -sass <
 
 ## 6. 产物路径
 
-- 可执行文件：`build/bin/rmsnorm_v0` … `rmsnorm_v3`
+- 可执行文件：`build/bin/rmsnorm_v0` … `rmsnorm_v3`（v3 支持 `--dtype`）
+- dtype 模块：`rmsnorm/rmsnorm_dtype.h`、`rmsnorm/rmsnorm_quant.h`、`rmsnorm/rmsnorm_v3_dtype.cuh`
+- 结果 CSV：`data/results/rmsnorm_v3_results.csv`（含 `act_dtype,weight_dtype` 列）
 - ncu 报告：`data/ncu_reports/`
 - PTX/SASS：本地运行 `cuobjdump -ptx <binary>` 生成
 
@@ -189,16 +253,16 @@ PTX 和 SASS 可在本地通过 `cuobjdump -ptx <binary>` 或 `cuobjdump -sass <
 
 ## 主场景性能口径（统一）
 
-主指标统一为主场景 `gpu_ms`，NCU 吞吐仅用于瓶颈归因。
+实测日期：**2026-05-20**
 
-| 实现 | 主场景维度 | GPU耗时(ms) | 校验状态 | 数据文件 |
-|---|---|---:|---|---|
-| `rmsnorm_v3` | `rows=4096,cols=4096` | 0.373722 | PASS | `data/results/rmsnorm_v3_results.csv` |
+| 实现 | 主场景维度 | GPU耗时(ms) | 带宽(GB/s) | 校验状态 |
+|---|---|---:|---:|---|
+| `rmsnorm_v3` (`--dtype fp32`) | `rows=4096,cols=4096` | **0.372** | 361 | PASS |
+| `rmsnorm_v3` (`--dtype fp16`) | `rows=4096,cols=4096` | **0.177** | 379 | PASS |
+| `rmsnorm_v3` (`--dtype bf16`) | `rows=4096,cols=4096` | **0.171** | 392 | PASS |
+| `rmsnorm_v3` (`--dtype int8`) | `rows=4096,cols=4096` | **0.167** | 201 | PASS |
+| `rmsnorm_v3` (`--dtype fp8_e4m3`) | `rows=4096,cols=4096` | **0.152** | 221 | PASS |
+| `rmsnorm_v3` (`--dtype fp8_e5m2`) | `rows=4096,cols=4096` | **0.152** | 220 | PASS |
+| `rmsnorm_cub_ref` | `rows=4096,cols=4096` | 0.352 | 382 | SKIP |
 
 环境口径：`RTX 5060 Ti (sm_120) + CUDA 13.2`。
-统一汇总：`data/results/main_scenario_unified.csv`（retest tag: `20260512_manual_retest`）。
-
-## 已知边界与后续补充
-
-- 当前文档以前向 kernel 为主，尚未覆盖 backward 与混合精度训练链路。
-- 建议补充跨 `cols` 桶（如 768/1536/8192）的分段最优策略与自动路由建议。

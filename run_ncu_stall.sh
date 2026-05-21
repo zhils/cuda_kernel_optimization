@@ -3,9 +3,10 @@ set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 BIN="${ROOT_DIR}/build/bin"
+DATA_ROOT="${CUDA_DATA_ROOT:-${ROOT_DIR}/build/data}"
 RUN_ID="${RUN_ID:-ncu_$(date -u +%Y%m%dT%H%M%SZ)}"
-OUT_DIR="${ROOT_DIR}/data/ncu_reports/${RUN_ID}/stall"
-CACHE_PATH="${ROOT_DIR}/data/baselines/autotune_cache.json"
+OUT_DIR="${DATA_ROOT}/ncu_reports/${RUN_ID}/stall"
+CACHE_PATH="${DATA_ROOT}/baselines/autotune_cache.json"
 CATALOG_PATH="${ROOT_DIR}/configs/kernel_catalog.json"
 DISPATCH_ARCH="${DISPATCH_ARCH:-sm120}"
 DISPATCH_DTYPE="${DISPATCH_DTYPE:-any}"
@@ -37,7 +38,7 @@ mapfile -t TARGETS < <(
 )
 
 if [[ -n "${NCU_STALL_QUICK:-}" ]]; then
-  TARGETS=(gemm_v3 rmsnorm_v3 softmax_v3)
+  TARGETS=(gemm_fp16 rmsnorm_v3 fused_conv1d_silu_v3)
 fi
 
 extract_top_stalls() {

@@ -1,0 +1,36 @@
+name: CI
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  gate:
+    name: Catalog + API unit tests
+    runs-on: ubuntu-latest
+    container:
+      image: nvidia/cuda:13.0.1-devel-ubuntu24.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install build deps
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends \
+            cmake ninja-build git python3
+
+      - name: Checkout CUTLASS
+        run: |
+          git clone --depth 1 https://github.com/NVIDIA/cutlass.git "${HOME}/cutlass"
+
+      - name: CI gate
+        run: bash scripts/cko_driver.sh ci
+        env:
+          CMAKE_CUDA_ARCHITECTURES: "90"
+          CUTLASS_DIR: "${HOME}/cutlass"

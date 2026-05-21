@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run ncu profiling on all binaries and extract key metrics."""
+"""Run ncu profiling on core binaries."""
 
 import subprocess
 import re
@@ -9,49 +9,34 @@ import sys
 import time
 from collections import OrderedDict
 
-BIN_DIR = "/mnt/d/deploy/cuda_kernel_optimization/build/bin"
-OUTPUT_DIR = "/mnt/d/deploy/cuda_kernel_optimization/data/profiling"
+BIN_DIR = "/home/zh0813/cuda_kernel_optimization/build/bin"
+OUTPUT_DIR = "/home/zh0813/cuda_kernel_optimization/data/profiling"
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
 BINARIES = OrderedDict([
-    # (binary_name, operator_group, description, kernel_filter_regex)
-    ("gemm_v0",       ["gemm",        "V0: Naive triple-loop baseline"]),
-    ("gemm_v1",       ["gemm",        "V1: 16x16 shared memory tiling"]),
-    ("gemm_v2",       ["gemm",        "V2: 8x8/thread register tiling"]),
-    ("gemm_v3",       ["gemm",        "V3: cp.async + 8x4 sub-tile + TileK=32"]),
-    ("gemm_fp16",     ["gemm",        "FP16: WMMA Tensor Core"]),
-    ("gemm_fp8",      ["gemm",        "FP8: cuBLASLt FP8 E4M3"]),
-    ("gemm_int8",     ["gemm",        "INT8: WMMA Tensor Core"]),
-    ("gemm_cublas_ref", ["gemm",      "cuBLAS: FP32 reference"]),
-    ("softmax_v0",    ["softmax",     "V0: 2-pass scan, 1 thread/row"]),
-    ("softmax_v1",    ["softmax",     "V1: SMEM staging, warp reduce"]),
-    ("softmax_v2",    ["softmax",     "V2: 8-warp online reduce"]),
-    ("softmax_v3",    ["softmax",     "V3: SMEM + warp shuffle"]),
-    ("softmax_cudnn_ref", ["softmax", "cuDNN reference"]),
-    ("rmsnorm_v0",    ["rmsnorm",     "V0: 1 thread/row serial"]),
-    ("rmsnorm_v1",    ["rmsnorm",     "V1: SMEM + float4 vectorized"]),
-    ("rmsnorm_v2",    ["rmsnorm",     "V2: + warp shuffle reduce"]),
-    ("rmsnorm_v3",    ["rmsnorm",     "V3: + weight cached in SMEM"]),
-    ("rmsnorm_cub_ref", ["rmsnorm",   "CUB reference"]),
+    ("gemm_v0",       ["gemm",        "V0: Naive baseline"]),
+    ("gemm_v1",       ["gemm",        "V1: SMEM 16x16 tiling"]),
+    ("gemm_v2",       ["gemm",        "V2: Register 8x8/thread"]),
+    ("gemm_v3",       ["gemm",        "V3: cp.async + TileK=32"]),
+    ("gemm_v4",       ["gemm",        "V4: TF32 WMMA"]),
+    ("gemm_fp16",     ["gemm",        "FP16 WMMA Tensor Core"]),
+    ("gemm_cublas_ref", ["gemm",      "cuBLAS FP32 reference"]),
+    ("gemm_cublas_fp16", ["gemm",     "cuBLAS FP16 reference"]),
+    ("rmsnorm_v0",    ["rmsnorm",     "V0: 1 thread/row"]),
+    ("rmsnorm_v1",    ["rmsnorm",     "V1: SMEM + float4"]),
+    ("rmsnorm_v2",    ["rmsnorm",     "V2: + warp shuffle"]),
+    ("rmsnorm_v3",    ["rmsnorm",     "V3: + weight in SMEM"]),
     ("fused_conv1d_silu_v0", ["fused_conv1d_silu", "V0: 5 separate kernels"]),
-    ("fused_conv1d_silu_v1", ["fused_conv1d_silu", "V1: single fused kernel"]),
-    ("fused_conv1d_silu_v2", ["fused_conv1d_silu", "V2: 2-kernel + flat grid + vec4"]),
-    ("fused_conv1d_silu_v3", ["fused_conv1d_silu", "V3: 2-kernel + 2D grid + SMEM tile"]),
-    ("flash_attention_v0", ["flash_attention", "V0: explicit NxN attention matrix"]),
-    ("flash_attention_v1", ["flash_attention", "V1: tiled online-softmax"]),
-    ("fused_l2_norm_qk_v0", ["fused_l2_norm_qk", "V0: baseline"]),
-    ("fused_gated_delta_rule_v0", ["fused_gated_delta_rule", "V0: baseline"]),
-    ("fused_output_norm_gate_v0", ["fused_output_norm_gate", "V0: baseline"]),
-    ("q_path_fusion_v2", ["q_path_fusion", "V2: warp-per-row + cuBLAS Q proj"]),
+    ("fused_conv1d_silu_v1", ["fused_conv1d_silu", "V1: fully fused"]),
+    ("fused_conv1d_silu_v3", ["fused_conv1d_silu", "V3: CUTLASS GEMM projection"]),
 ])
-
 def run_ncu(bin_path, timeout=120):
     """Run ncu basic set profiling and capture output."""
     try:
         result = subprocess.run(
             ["ncu", "--set", "basic", "-c", "1", "--print-summary", "per-kernel", bin_path],
             capture_output=True, text=True, timeout=timeout,
-            cwd="/mnt/d/deploy/cuda_kernel_optimization/build"
+            cwd="/home/zh0813/cuda_kernel_optimization/build"
         )
         return result.stdout + result.stderr
     except subprocess.TimeoutExpired:

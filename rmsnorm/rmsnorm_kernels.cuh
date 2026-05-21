@@ -6,6 +6,7 @@
 #include <cstddef>
 #include <cstdint>
 
+// V0 朴素内核：每线程独立计算一整行的平方和与归一化
 __global__ void RMSNormV0Kernel(
   const float* x, 
   float* y, 
@@ -31,6 +32,7 @@ constexpr int RMSNORM_WARP_SIZE = 32;
 constexpr int RMSNORM_WARPS_PER_BLOCK = 4;
 constexpr int RMSNORM_BLOCK_SIZE = RMSNORM_WARP_SIZE * RMSNORM_WARPS_PER_BLOCK;
 
+// V1 内核优化：共享内存缓存行数据 + float4 向量化读写 + lane0 串行归约
 __global__ void RMSNormV1Kernel(
   const float* __restrict__ x, 
   float* __restrict__ y,
@@ -91,6 +93,7 @@ __global__ void RMSNormV1Kernel(
   }
 }
 
+// V2 内核优化：在 V1 基础上用 warp shuffle 替代 lane0 串行归约
 __global__ void RMSNormV2Kernel(
   const float* __restrict__ x, 
   float* __restrict__ y,
@@ -129,7 +132,7 @@ __global__ void RMSNormV2Kernel(
     const float val = s_row[c];
     local_sum += val * val;
   }
-  // 区别只是变成了规约求和
+  // warp shuffle 归约求和
 #pragma unroll
   for (int offset = 16; offset > 0; offset >>= 1) {
     local_sum += __shfl_down_sync(0xffffffff, local_sum, offset);
@@ -155,6 +158,7 @@ __global__ void RMSNormV2Kernel(
   }
 }
 
+// V3 内核优化：在 V2 基础上将 weight 缓存到共享内存，使用 __ldg 加载输入
 __global__ void RMSNormV3Kernel(
   const float* __restrict__ x, 
   float* __restrict__ y,

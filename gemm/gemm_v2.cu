@@ -11,9 +11,19 @@
 #include "common/benchmark.h"
 #include "common/cuda_utils.h"
 #include "common/kernel_config.h"
+// inline CpuGemm defined below
+
+static void GemmCPU(const float* A, const float* B, float* C, int M, int N, int K) {
+  for (int i = 0; i < M; ++i)
+    for (int j = 0; j < N; ++j) {
+      double sum = 0;
+      for (int k = 0; k < K; ++k) sum += static_cast<double>(A[i * K + k]) * B[k * N + j];
+      C[i * N + j] = static_cast<float>(sum);
+    }
+}
 
 constexpr int kTM = 8;
-constexpr int kTN = 8;
+constexpr int kTN = 4;
 
 constexpr int kBlockThreadsX = 16;
 constexpr int kBlockThreadsY = 16;
@@ -37,8 +47,8 @@ __global__ void GemmV2Kernel(
     int M, 
     int N, 
     int K
-) {
-
+){
+    // 共享内存与线程索引
     __shared__ float As[kBlockM][kTileK + kPadA];
     __shared__ float Bs[kTileK + kPadB][kBlockN];
 
@@ -46,18 +56,19 @@ __global__ void GemmV2Kernel(
     const int ty = threadIdx.y;
     const int tid = ty * kBlockThreadsX + tx;
     
-    // 先计算在A中的起始位置
     const int row_start = blockIdx.y * kBlockM + ty * kTM;
-    // 计算在B中起始位置
     const int col_start = blockIdx.x * kBlockN + tx * kTN;
 
+    // 初始化累加器
     float sum[kTM][kTN] = {};
 
     const int num_k_tiles = (K + kTileK - 1) / kTileK;
 
+    // 遍历K块：加载A → 加载B → 同步 → 计算 → 同步
     for (int t = 0; t < num_k_tiles; ++t) {
         const int k0 = t * kTileK;
 
+        // 加载A到共享内存
         #pragma unroll
         for (int l = 0; l < kALoadsPerThread; ++l) {
             int idx = tid * kALoadsPerThread + l;
@@ -82,6 +93,7 @@ __global__ void GemmV2Kernel(
             }
         }
 
+        // 加载B到共享内存
         #pragma unroll
         for (int l = 0; l < kBLoadsPerThread; ++l) {
             int idx = tid * kBLoadsPerThread + l;
@@ -108,6 +120,7 @@ __global__ void GemmV2Kernel(
 
         __syncthreads();
 
+        // 计算乘加
         #pragma unroll
         for (int kk = 0; kk < kTileK; ++kk) {
             float b_vals[kTN];
@@ -129,6 +142,7 @@ __global__ void GemmV2Kernel(
         __syncthreads();
     }
 
+    // 写回结果
     #pragma unroll
     for (int i = 0; i < kTM; ++i) {
         int g_r = row_start + i;
@@ -143,35 +157,15 @@ __global__ void GemmV2Kernel(
             v.w = sum[i][3];
             *reinterpret_cast<float4*>(C + g_r * N + g_c) = v;
         } else {
-            for (int j = 0; j < 4 && g_c + j < N; ++j) {
-                C[g_r * N + g_c + j] = sum[i][j];
-            }
-        }
-        if (g_c + 7 < N) {
-            float4 v;
-            v.x = sum[i][4];
-            v.y = sum[i][5];
-            v.z = sum[i][6];
-            v.w = sum[i][7];
-            *reinterpret_cast<float4*>(C + g_r * N + g_c + 4) = v;
-        } else if (g_c + 4 < N) {
-            for (int j = 4; j < kTN && g_c + j < N; ++j) {
+            for (int j = 0; j < kTN && g_c + j < N; ++j) {
                 C[g_r * N + g_c + j] = sum[i][j];
             }
         }
     }
 }
 
-static void GemmCPU(const float* A, const float* B, float* C, int M, int N, int K) {
-    for (int r = 0; r < M; ++r)
-        for (int c = 0; c < N; ++c) {
-            float s = 0;
-            for (int k = 0; k < K; ++k) s += A[r * K + k] * B[k * N + c];
-            C[r * N + c] = s;
-        }
-}
-
 int main() {
+    // 参数与输出文件准备
     constexpr int kRepeat = 10;
     constexpr int kMaxCpuVerifyDim = 1024;
     auto cases = common::LoadOrCreateTestCasesCsv("data/gemm/test_cases.csv");
@@ -181,27 +175,35 @@ int main() {
 
     for (size_t i = 0; i < cases.size(); ++i) {
         int M = cases[i].rows, N = cases[i].cols, K = M;
+
+        // 生成测试数据
         int n = M * N;
         std::vector<float> A(n), B(n), C_cpu(n), C_gpu(n);
         common::InitMatrix(A, M, K);
         common::InitMatrix(B, K, N);
+
+        // CPU参考计算
         if (M <= kMaxCpuVerifyDim && N <= kMaxCpuVerifyDim) {
             GemmCPU(A.data(), B.data(), C_cpu.data(), M, N, K);
         }
 
+        // 分配GPU内存
         float *d_A, *d_B, *d_C;
         CHECK_CUDA(cudaMalloc(&d_A, M * K * sizeof(float)));
         CHECK_CUDA(cudaMalloc(&d_B, K * N * sizeof(float)));
         CHECK_CUDA(cudaMalloc(&d_C, M * N * sizeof(float)));
+
+        // 拷贝数据到设备
         CHECK_CUDA(cudaMemcpy(d_A, A.data(), M * K * sizeof(float), cudaMemcpyHostToDevice));
         CHECK_CUDA(cudaMemcpy(d_B, B.data(), K * N * sizeof(float), cudaMemcpyHostToDevice));
 
+        // 启动配置与预热
         common::GemmLaunchConfig launch_cfg = common::MakeGemmLaunchConfig(
             M, N, kBlockM, kBlockN, kTileK, kBlockThreadsX, kBlockThreadsY);
-
         GemmV2Kernel<<<launch_cfg.grid, launch_cfg.block>>>(d_A, d_B, d_C, M, N, K);
         CHECK_CUDA(cudaDeviceSynchronize());
 
+        // 计时循环
         cudaEvent_t start, stop;
         CHECK_CUDA(cudaEventCreate(&start));
         CHECK_CUDA(cudaEventCreate(&stop));
@@ -215,26 +217,30 @@ int main() {
         CHECK_CUDA(cudaEventElapsedTime(&ms, start, stop));
         ms /= kRepeat;
 
+        // 拷贝结果回主机
         CHECK_CUDA(cudaMemcpy(C_gpu.data(), d_C, M * N * sizeof(float), cudaMemcpyDeviceToHost));
+
+        // 校验
         bool did_verify = (M <= kMaxCpuVerifyDim && N <= kMaxCpuVerifyDim);
         bool ok = true;
         if (did_verify) {
             ok = common::CheckEqual(C_cpu, C_gpu, 1e-3f);
         }
+
+        // 计算并输出结果
         double gflops = (2.0 * M * N * K) / (ms * 1e6);
         const char* check = did_verify ? (ok ? "PASS" : "FAIL") : "NOT_RUN";
         const std::string max_abs_diff =
             did_verify ? std::to_string(common::MaxAbsDiff(C_cpu, C_gpu)) : "";
-
         std::cout << M << "x" << N << "x" << K << " | " << std::fixed << std::setprecision(4) << ms << " ms"
                   << " | " << std::setprecision(1) << gflops << " GFLOP/s"
                   << " | " << check << "\n";
-
         ofs << i << ",gemm_v2," << M << "," << N << "," << K << ","
             << ms << "," << gflops << ","
             << max_abs_diff << ","
             << check << "\n";
 
+        // 释放资源
         CHECK_CUDA(cudaEventDestroy(start));
         CHECK_CUDA(cudaEventDestroy(stop));
         CHECK_CUDA(cudaFree(d_A));

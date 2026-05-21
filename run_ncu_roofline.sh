@@ -28,7 +28,7 @@ mapfile -t TARGETS < <(
 )
 
 if [[ -n "${NCU_ROOF_QUICK:-}" ]]; then
-  TARGETS=(gemm_v3 rmsnorm_v3 softmax_v3)
+  TARGETS=(gemm_fp16 rmsnorm_v3 fused_conv1d_silu_v3)
 fi
 
 run_target() {

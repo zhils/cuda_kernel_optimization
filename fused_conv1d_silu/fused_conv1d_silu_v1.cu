@@ -12,22 +12,61 @@
 
 #include "common/benchmark.h"
 #include "common/cuda_utils.h"
+// inline FusedConv1dSiLU_CPU defined below
+
+static void FusedConv1dSiLU_CPU(
+    const float* x,
+    const float* W_qkv, const float* b_qkv,
+    const float* W_z, const float* b_z,
+    const float* K_conv,
+    float* Q, float* K, float* V,
+    int B, int L, int D, int H, int k_size) {
+  std::vector<float> z_proj(static_cast<size_t>(B) * L * H);
+  for (int b = 0; b < B; ++b) {
+    for (int t = 0; t < L; ++t) {
+      const float* x_bt = x + (static_cast<size_t>(b) * L + t) * D;
+      for (int h = 0; h < H; ++h) {
+        float q_raw = b_qkv[h];
+        float k_raw = b_qkv[h + H];
+        float v_raw = b_qkv[h + 2 * H];
+        float zp = b_z[h];
+        for (int d = 0; d < D; ++d) {
+          float xv = x_bt[d];
+          q_raw += xv * W_qkv[static_cast<size_t>(h) * D + d];
+          k_raw += xv * W_qkv[static_cast<size_t>(h + H) * D + d];
+          v_raw += xv * W_qkv[static_cast<size_t>(h + 2 * H) * D + d];
+          zp += xv * W_z[static_cast<size_t>(h) * D + d];
+        }
+        size_t out_idx = (static_cast<size_t>(b) * L + t) * H + h;
+        Q[out_idx] = q_raw;
+        K[out_idx] = k_raw;
+        V[out_idx] = v_raw;
+        z_proj[out_idx] = zp;
+      }
+    }
+  }
+  for (int b = 0; b < B; ++b) {
+    for (int t = 0; t < L; ++t) {
+      for (int h = 0; h < H; ++h) {
+        float z_conv = 0.0f;
+        for (int i = 0; i < k_size; ++i) {
+          int ti = t - i;
+          if (ti < 0) continue;
+          z_conv += z_proj[(static_cast<size_t>(b) * L + ti) * H + h] * K_conv[static_cast<size_t>(i) * H + h];
+        }
+        float sigmoid = 1.0f / (1.0f + std::exp(-z_conv));
+        size_t out_idx = (static_cast<size_t>(b) * L + t) * H + h;
+        V[out_idx] *= (z_conv * sigmoid);
+      }
+    }
+  }
+}
 
 namespace fused_v1 {
 
-// ============================================================================
-// Fused Conv1D + SiLU v1（单 kernel 融合）
-// ============================================================================
-// 把 5 个步骤压成 1 个 kernel：
-// 1) qkv 线性投影
-// 2) z 线性投影
-// 3) split qkv -> Q/K/V
-// 4) causal conv(z) + SiLU
-// 5) V = V_raw * z_act
-//
-// 线程映射：一个线程负责一个 (b,h)，沿 t=0..L-1 顺序推进
-// 相比 v0，显著减少中间张量写回
-// ============================================================================
+// Fused Conv1D + SiLU v1: 单 kernel 融合，将 qkv/z 线性投影、split、causal conv + SiLU、
+// gate multiply 全部合并为一个 kernel。每线程负责一个 (b,h)，沿 t 顺序推进，相比 v0
+// 显著减少中间张量写回。
 
 constexpr int kBlockSize = 256;
 constexpr int kMaxKernelSize = 64;
@@ -44,11 +83,12 @@ __global__ void FusedKernel(
   float* __restrict__ V,
   int B, int L, int D, int H, int k_size
 ) {
-  // ---------------- 线程坐标 ----------------
+  // 线程映射：每个 block 对应一个 batch，每个线程对应一个通道
   const int b_idx = blockIdx.x;
   const int h = blockIdx.y * blockDim.x + threadIdx.x;
   if (b_idx >= B || h >= H) return;
 
+  // 预取当前通道的权重指针与 bias
   const float* Wq = W_qkv + static_cast<size_t>(h) * D;
   const float* Wk = W_qkv + static_cast<size_t>(h + H) * D;
   const float* Wv = W_qkv + static_cast<size_t>(h + 2 * H) * D;
@@ -59,7 +99,7 @@ __global__ void FusedKernel(
   const float bv = b_qkv[h + 2 * H];
   const float bz = b_z[h];
 
-  // ---------------- 环形历史缓存 ----------------
+  // 环形历史缓存初始化
   float z_hist[kMaxKernelSize];
   #pragma unroll
   for (int i = 0; i < kMaxKernelSize; ++i) {
@@ -68,7 +108,7 @@ __global__ void FusedKernel(
 
   const int ksize = (k_size <= kMaxKernelSize) ? k_size : kMaxKernelSize;
 
-  // ---------------- 按时间步推进 ----------------
+  // 沿时间步顺序推进
   for (int t = 0; t < L; ++t) {
     const float* x_bt = x + (static_cast<size_t>(b_idx) * L + t) * D;
 
@@ -86,9 +126,10 @@ __global__ void FusedKernel(
       z_proj += xv * Wz[d];
     }
 
+    // 将 z 投影写入环形历史缓存
     z_hist[t % ksize] = z_proj;
 
-    // causal conv + SiLU
+    // 因果卷积 + SiLU 激活
     float z_conv = 0.0f;
     const int valid = (t + 1 < ksize) ? (t + 1) : ksize;
     for (int lag = 0; lag < valid; ++lag) {
@@ -99,7 +140,7 @@ __global__ void FusedKernel(
     const float sigmoid = 1.0f / (1.0f + expf(-z_conv));
     const float z_act = z_conv * sigmoid;
 
-    // 回写 Q/K/V
+    // 回写 Q/K/V 到全局内存
     const size_t out_idx = (static_cast<size_t>(b_idx) * L + t) * H + h;
     Q[out_idx] = q_raw;
     K[out_idx] = k_raw;
@@ -109,67 +150,12 @@ __global__ void FusedKernel(
 
 }  // namespace fused_v1
 
-// ============================================================================
-// CPU Reference Implementation
-// ============================================================================
-static void FusedConv1dSiLU_CPU(const float* x,
-                                const float* W_qkv, const float* b_qkv,
-                                const float* W_z, const float* b_z,
-                                const float* K_conv,
-                                float* Q, float* K, float* V,
-                                int B, int L, int D, int H, int k_size) {
-  for (int ib = 0; ib < B; ++ib) {
-    for (int t = 0; t < L; ++t) {
-      const float* x_bt = x + (ib * L + t) * D;
-
-      for (int h = 0; h < H; ++h) {
-        float q_raw = b_qkv[h];
-        float k_raw = b_qkv[h + H];
-        float v_raw = b_qkv[h + 2 * H];
-        for (int d = 0; d < D; ++d) {
-          const float xv = x_bt[d];
-          q_raw += xv * W_qkv[h * D + d];
-          k_raw += xv * W_qkv[(h + H) * D + d];
-          v_raw += xv * W_qkv[(h + 2 * H) * D + d];
-        }
-        Q[(ib * L + t) * H + h] = q_raw;
-        K[(ib * L + t) * H + h] = k_raw;
-        V[(ib * L + t) * H + h] = v_raw;
-      }
-    }
-  }
-
-  for (int ib = 0; ib < B; ++ib) {
-    for (int h = 0; h < H; ++h) {
-      float z_hist[64] = {0.0f};
-      int ksize = (k_size <= 64) ? k_size : 64;
-      for (int t = 0; t < L; ++t) {
-        float z_proj = b_z[h];
-        const float* x_bt = x + (ib * L + t) * D;
-        for (int d = 0; d < D; ++d) {
-          z_proj += x_bt[d] * W_z[h * D + d];
-        }
-        z_hist[t % ksize] = z_proj;
-        float z_conv = 0.0f;
-        int valid = (t + 1 < ksize) ? (t + 1) : ksize;
-        for (int lag = 0; lag < valid; ++lag) {
-          int hist_idx = (t - lag) % ksize;
-          z_conv += z_hist[hist_idx] * K_conv[lag * H + h];
-        }
-        float sigmoid = 1.0f / (1.0f + std::exp(-z_conv));
-        V[(ib * L + t) * H + h] *= (z_conv * sigmoid);
-      }
-    }
-  }
-}
-
-// ============================================================================
-// Main
-// ============================================================================
 int main() {
+  // 基准测试参数
   constexpr int kWarmup = 1;
   constexpr int kRepeat = 10;
 
+  // 测试配置
   std::vector<std::tuple<int, int, int, int, int>> test_cases = {
       {1, 128, 64, 32, 4},
       {1, 256, 128, 64, 4},
@@ -178,6 +164,7 @@ int main() {
       {8, 2048, 512, 256, 4},
   };
 
+  // 创建输出 CSV 文件并写入表头
   std::filesystem::create_directories("data/results");
   std::ofstream ofs("data/results/fused_conv1d_silu_v1_results.csv");
   ofs << "B,L,D,H,k_size,cpu_ms,gpu_ms_v1,max_abs_diff_q,max_abs_diff_k,"
@@ -191,12 +178,14 @@ int main() {
   std::cout << std::string(73, '-') << "\n";
 
   for (const auto& tc : test_cases) {
+    // 提取测试参数
     int B = std::get<0>(tc);
     int L = std::get<1>(tc);
     int D = std::get<2>(tc);
     int H = std::get<3>(tc);
     int k_size = std::get<4>(tc);
 
+    // 分配主机内存
     std::vector<float> h_x(B * L * D);
     std::vector<float> h_W_qkv(3 * H * D), h_b_qkv(3 * H);
     std::vector<float> h_W_z(H * D), h_b_z(H);
@@ -204,6 +193,7 @@ int main() {
     std::vector<float> h_Q_cpu(B * L * H), h_K_cpu(B * L * H), h_V_cpu(B * L * H);
     std::vector<float> h_Q_gpu(B * L * H), h_K_gpu(B * L * H), h_V_gpu(B * L * H);
 
+    // 随机初始化输入数据
     std::mt19937 gen(42);
     std::uniform_real_distribution<float> dist(-0.5f, 0.5f);
     auto rand_fill = [&](std::vector<float>& v) {
@@ -214,6 +204,7 @@ int main() {
     rand_fill(h_W_z); rand_fill(h_b_z);
     rand_fill(h_K_conv);
 
+    // 运行 CPU 参考实现并计时
     auto t0 = std::chrono::high_resolution_clock::now();
     FusedConv1dSiLU_CPU(h_x.data(),
                         h_W_qkv.data(), h_b_qkv.data(),
@@ -224,6 +215,7 @@ int main() {
     auto t1 = std::chrono::high_resolution_clock::now();
     double cpu_ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
 
+    // 分配 GPU 内存
     float *d_x, *d_W_qkv, *d_b_qkv, *d_W_z, *d_b_z, *d_K_conv;
     float *d_Q, *d_K, *d_V;
 
@@ -237,6 +229,7 @@ int main() {
     CHECK_CUDA(cudaMalloc(&d_K, h_K_gpu.size() * sizeof(float)));
     CHECK_CUDA(cudaMalloc(&d_V, h_V_gpu.size() * sizeof(float)));
 
+    // 拷贝数据到 GPU
     CHECK_CUDA(cudaMemcpy(d_x, h_x.data(), h_x.size() * sizeof(float), cudaMemcpyHostToDevice));
     CHECK_CUDA(cudaMemcpy(d_W_qkv, h_W_qkv.data(), h_W_qkv.size() * sizeof(float), cudaMemcpyHostToDevice));
     CHECK_CUDA(cudaMemcpy(d_b_qkv, h_b_qkv.data(), h_b_qkv.size() * sizeof(float), cudaMemcpyHostToDevice));
@@ -244,9 +237,11 @@ int main() {
     CHECK_CUDA(cudaMemcpy(d_b_z, h_b_z.data(), h_b_z.size() * sizeof(float), cudaMemcpyHostToDevice));
     CHECK_CUDA(cudaMemcpy(d_K_conv, h_K_conv.data(), h_K_conv.size() * sizeof(float), cudaMemcpyHostToDevice));
 
+    // 计算 GPU kernel 启动网格
     dim3 block(fused_v1::kBlockSize);
     dim3 grid(B, (H + fused_v1::kBlockSize - 1) / fused_v1::kBlockSize);
 
+    // GPU 预热
     for (int w = 0; w < kWarmup; ++w) {
       fused_v1::FusedKernel<<<grid, block>>>(
           d_x, d_W_qkv, d_b_qkv, d_W_z, d_b_z, d_K_conv,
@@ -254,6 +249,7 @@ int main() {
     }
     CHECK_CUDA(cudaDeviceSynchronize());
 
+    // GPU 基准测试
     cudaEvent_t s, e;
     CHECK_CUDA(cudaEventCreate(&s));
     CHECK_CUDA(cudaEventCreate(&e));
@@ -272,6 +268,7 @@ int main() {
       gpu_times.push_back(ms);
     }
 
+    // 计算中位数耗时
     std::sort(gpu_times.begin(), gpu_times.end());
     float gpu_ms = 0.0f;
     if (gpu_times.size() > 2) {
@@ -282,16 +279,19 @@ int main() {
       gpu_ms /= static_cast<float>(gpu_times.size());
     }
 
+    // 拷贝 GPU 结果回主机
     CHECK_CUDA(cudaMemcpy(h_Q_gpu.data(), d_Q, h_Q_gpu.size() * sizeof(float), cudaMemcpyDeviceToHost));
     CHECK_CUDA(cudaMemcpy(h_K_gpu.data(), d_K, h_K_gpu.size() * sizeof(float), cudaMemcpyDeviceToHost));
     CHECK_CUDA(cudaMemcpy(h_V_gpu.data(), d_V, h_V_gpu.size() * sizeof(float), cudaMemcpyDeviceToHost));
 
+    // 误差校验
     double max_diff_q = common::MaxAbsDiff(h_Q_cpu, h_Q_gpu);
     double max_diff_k = common::MaxAbsDiff(h_K_cpu, h_K_gpu);
     double max_diff_v = common::MaxAbsDiff(h_V_cpu, h_V_gpu);
     bool ok = (max_diff_q < 1e-3 && max_diff_k < 1e-3 && max_diff_v < 1e-3);
     const char* check = ok ? "PASS" : "FAIL";
 
+    // 清理 GPU 资源
     CHECK_CUDA(cudaEventDestroy(s));
     CHECK_CUDA(cudaEventDestroy(e));
     CHECK_CUDA(cudaFree(d_x));
@@ -300,6 +300,7 @@ int main() {
     CHECK_CUDA(cudaFree(d_K_conv));
     CHECK_CUDA(cudaFree(d_Q)); CHECK_CUDA(cudaFree(d_K)); CHECK_CUDA(cudaFree(d_V));
 
+    // 输出结果
     double speedup = (gpu_ms > 0) ? cpu_ms / gpu_ms : 0.0;
     std::cout << std::left << std::setw(6) << B << std::setw(6) << L
               << std::setw(6) << D << std::setw(6) << H << std::setw(8) << k_size

@@ -1,3 +1,37 @@
+add_library(gemm_api STATIC
+  src/gemm_api.cpp
+  src/gemm_ref_cpu.cpp
+  src/gemm_gpu.cu
+  src/gemm_quant.cu
+)
+
+find_package(OpenMP)
+if(OpenMP_CXX_FOUND)
+  target_link_libraries(gemm_api PRIVATE OpenMP::OpenMP_CXX)
+  target_compile_definitions(gemm_api PRIVATE $<$<COMPILE_LANGUAGE:CXX>:_OPENMP>)
+endif()
+
+target_include_directories(gemm_api PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
+target_include_directories(gemm_api PRIVATE ${CMAKE_CURRENT_SOURCE_DIR} ${CMAKE_SOURCE_DIR})
+target_link_libraries(gemm_api PUBLIC cuda_common CUDA::cudart cublas cublasLt)
+set_target_properties(gemm_api PROPERTIES CUDA_SEPARABLE_COMPILATION ON POSITION_INDEPENDENT_CODE ON)
+
+set(CUTLASS_DIR "$ENV{HOME}/cutlass" CACHE PATH "CUTLASS source root")
+
+if(EXISTS "${CUTLASS_DIR}/include/cute/tensor.hpp")
+  set(CUTLASS_UTIL_INCLUDE "${CUTLASS_DIR}/tools/util/include")
+  set(CUTLASS_GEMM_CUDA_FLAGS "--expt-relaxed-constexpr")
+  target_include_directories(gemm_api PRIVATE "${CUTLASS_DIR}/include" "${CUTLASS_UTIL_INCLUDE}")
+  target_compile_definitions(gemm_api PRIVATE CKO_GEMM_CUTLASS_FP16)
+  target_compile_options(gemm_api PRIVATE
+      $<$<COMPILE_LANGUAGE:CUDA>:${CUTLASS_GEMM_CUDA_FLAGS}>)
+  message(STATUS "gemm: API kFp16 uses CUTLASS (${CUTLASS_DIR})")
+  message(STATUS "gemm: CuTe FP16 binary enabled (${CUTLASS_DIR})")
+else()
+  message(STATUS "gemm: API kFp16 uses handwritten WMMA (CUTLASS not found at ${CUTLASS_DIR})")
+  message(STATUS "gemm: CuTe FP16 binary disabled (CUTLASS not found at ${CUTLASS_DIR})")
+endif()
+
 set(GEMM_VARIANTS
     gemm_v0
     gemm_v1
@@ -5,22 +39,8 @@ set(GEMM_VARIANTS
     gemm_v3
     gemm_v4
     gemm_fp16
-    gemm_bf16
-    gemm_fp8
-    gemm_int8
-    gemm_fp8_cublaslt
-    quant_gemm_compare
-    quant_fp8_bias_compensate
     gemm_cublas_ref
-)
-
-set(GEMM_VARIANTS_ASM
-    gemm_v0
-    gemm_v1
-    gemm_v2
-    gemm_v3
-    gemm_v4
-    gemm_bf16
+    gemm_cublas_fp16
 )
 
 foreach(variant ${GEMM_VARIANTS})
@@ -30,74 +50,36 @@ foreach(variant ${GEMM_VARIANTS})
         RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
 endforeach()
 
-# CUDA 13.2 + sm_120 toolchain does not expose tf32 WMMA tags by default.
-# Enable Ampere WMMA tag path for legacy tf32 kernels.
-target_compile_definitions(gemm_v4 PRIVATE __CUDA_AMPERE_MMA__)
+if(EXISTS "${CUTLASS_DIR}/include/cute/tensor.hpp")
+  add_executable(gemm_cute_fp16 gemm_cute_fp16.cu)
+  target_link_libraries(gemm_cute_fp16 PRIVATE cuda_common)
+  target_include_directories(gemm_cute_fp16 PRIVATE "${CMAKE_SOURCE_DIR}" "${CUTLASS_DIR}/include"
+      "${CUTLASS_UTIL_INCLUDE}")
+  target_compile_options(gemm_cute_fp16 PRIVATE
+      $<$<COMPILE_LANGUAGE:CUDA>:${CUTLASS_GEMM_CUDA_FLAGS}>)
+  set_target_properties(gemm_cute_fp16 PROPERTIES
+      RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
+endif()
 
 target_link_libraries(gemm_cublas_ref PRIVATE cublas)
-target_link_libraries(gemm_fp8 PRIVATE cublasLt)
-target_link_libraries(gemm_fp8_cublaslt PRIVATE cublas cublasLt)
+target_link_libraries(gemm_cublas_fp16 PRIVATE cublas)
 
-# gemm_all_compare: unified GEMM comparison benchmark
-set(GEMM_ALL_COMPARE_SRCS gemm_all_compare.cu)
-add_executable(gemm_all_compare ${GEMM_ALL_COMPARE_SRCS})
-target_link_libraries(gemm_all_compare PRIVATE cuda_common cublas)
-target_compile_definitions(gemm_all_compare PRIVATE ALL_COMPARE_LIB)
-if(DEFINED CUTLASS_ROOT)
-    get_filename_component(CUTLASS_ABS_ROOT "${CUTLASS_ROOT}" ABSOLUTE)
-    message(STATUS "CUTLASS_ROOT = ${CUTLASS_ABS_ROOT}")
-    target_include_directories(gemm_all_compare PRIVATE ${CUTLASS_ABS_ROOT}/include)
-    target_compile_definitions(gemm_all_compare PRIVATE CUTLASS_ROOT)
-endif()
-set_target_properties(gemm_all_compare PROPERTIES
-    RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
+add_executable(gemm_dtype gemm_dtype.cu)
+target_link_libraries(gemm_dtype PRIVATE gemm_api cuda_common CUDA::cudart cublas cublasLt)
+target_include_directories(gemm_dtype PRIVATE "${CMAKE_SOURCE_DIR}")
+set_target_properties(gemm_dtype PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
 
-set(ASM_OUTPUT_DIR ${CMAKE_BINARY_DIR}/gemm/asm)
-set(NVCC_FLAGS -Xcompiler=-Wno-deprecated-declarations)
+add_executable(gemm_tune gemm_tune.cu)
+target_link_libraries(gemm_tune PRIVATE gemm_api cuda_common CUDA::cudart)
+target_include_directories(gemm_tune PRIVATE "${CMAKE_SOURCE_DIR}")
+set_target_properties(gemm_tune PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
 
-foreach(variant IN LISTS GEMM_VARIANTS)
-    if(${variant} STREQUAL "gemm_cublas_ref")
-        continue()
-    endif()
-    if(${variant} STREQUAL "quant_gemm_compare")
-        continue()
-    endif()
-    if(${variant} STREQUAL "quant_fp8_bias_compensate")
-        continue()
-    endif()
-    if(${variant} STREQUAL "gemm_fp8_cublaslt")
-        continue()
-    endif()
-    add_custom_command(
-        OUTPUT ${ASM_OUTPUT_DIR}/ptx/${variant}.ptx
-        COMMAND ${CMAKE_CUDA_COMPILER} ${NVCC_FLAGS} -ptx
-                ${CMAKE_SOURCE_DIR}/gemm/${variant}.cu
-                --generate-code=arch=compute_89,code=sm_89
-                -o ${ASM_OUTPUT_DIR}/ptx/${variant}.ptx
-                -I${CMAKE_SOURCE_DIR}/common/include
-                -I${CMAKE_CUDA_TOOLKIT_INCLUDE}
-        DEPENDS ${variant}
-        COMMENT "Generating PTX for ${variant}"
-        VERBATIM
-    )
-    add_custom_command(
-        OUTPUT ${ASM_OUTPUT_DIR}/sass/${variant}.cubin
-        COMMAND ${CMAKE_CUDA_COMPILER} ${NVCC_FLAGS} -cubin
-                ${CMAKE_SOURCE_DIR}/gemm/${variant}.cu
-                --generate-code=arch=compute_89,code=sm_89
-                -o ${ASM_OUTPUT_DIR}/sass/${variant}.cubin
-                -I${CMAKE_SOURCE_DIR}/common/include
-                -I${CMAKE_CUDA_TOOLKIT_INCLUDE}
-        DEPENDS ${variant}
-        COMMENT "Generating SASS (cubin) for ${variant}"
-        VERBATIM
-    )
-endforeach()
+add_executable(gemm_quant_bench gemm_quant_bench.cu)
+target_link_libraries(gemm_quant_bench PRIVATE gemm_api cuda_common CUDA::cudart)
+target_include_directories(gemm_quant_bench PRIVATE "${CMAKE_SOURCE_DIR}")
+set_target_properties(gemm_quant_bench PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
 
-add_custom_target(gen_asm_ptx ALL DEPENDS
-    gemm_v0 gemm_v1 gemm_v2 gemm_v3 gemm_v4 gemm_bf16
-)
-
-add_custom_target(gen_asm_sass ALL DEPENDS
-    gemm_v0 gemm_v1 gemm_v2 gemm_v3 gemm_v4 gemm_bf16
-)
+add_executable(gemm_compare gemm_compare.cu)
+target_link_libraries(gemm_compare PRIVATE gemm_api cuda_common CUDA::cudart cublas cublasLt)
+target_include_directories(gemm_compare PRIVATE "${CMAKE_SOURCE_DIR}")
+set_target_properties(gemm_compare PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)

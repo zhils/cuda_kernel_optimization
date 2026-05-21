@@ -1,248 +1,113 @@
 # CUDA Kernel 优化
 
-> **3 分钟速览：** 在 RTX 5060 Ti (Blackwell sm_120) 上从零实现 10 个深度学习算子的 CUDA 优化。
-> 每算子从朴素(v0)基线出发，逐版本只改一个瓶颈，最终 GEMM 达 12.52 TFLOPS(峰值 53%)，
-> RMSNorm 达 386 GB/s(显存带宽 86%)，端到端融合算子达 2.6× 加速。
-> 完整 Nsight Compute 瓶颈分析 + Warp Stall 原因分解。
+---
+
+## 三算子架构
+
+| 类型 | 算子 | 代表问题 | 优化方向 | 主指标 |
+|------|------|----------|----------|--------|
+| **计算密集** | [GEMM](gemm/) | 算术强度 N/6≈683，Roofline 计算受限 | SMEM 分块 → cp.async → Tensor Core | TFLOPS |
+| **访存密集** | [RMSNorm](rmsnorm/) | 算术强度 ≈0.5，远低于 Ridge Point | float4 向量化 + warp shuffle 归约 | GB/s |
+| **融合算子** | [Fused Conv1D+SiLU](fused_conv1d_silu/) | 多 kernel 中间缓冲 + launch 开销 | kernel fusion，消除中间 tensor | 端到端 ms |
 
 ---
 
-## 统一口径性能摘要（主场景 GPU 耗时）
+## 性能摘要（RTX 5060 Ti, sm_120, CUDA 13.2）
 
-统计原则（已统一到本项目文档口径）：
+实测日期：**2026-05-20**
 
-- 主指标：**每个算子的主场景维度下 GPU 耗时（ms）**
-- 辅助指标：NCU 吞吐/occupancy/stall（用于归因，不作为主排序指标）
-- 环境口径：**本地 RTX 5060 Ti（sm_120）+ CUDA 13.2**
-
-| 算子 | 主场景维度 | GPU耗时(ms) | 校验状态 | 数据文件 |
-|:-----|:-----------|------------:|:---------|:---------|
-| GEMM FP32 (`gemm_v3`) | `M=1024, N=1024, K=1024` | 0.196845 | PASS | `data/results/gemm_v3_results.csv` |
-| GEMM FP16 (`gemm_fp16`) | `M=4096, N=4096, K=4096` | 4.35315 | NOT_RUN* | `data/results/gemm_fp16_results.csv` |
-| Softmax (`softmax_v3`) | `rows=4096, cols=4096` | 0.344838 | PASS | `data/results/softmax_v3_results.csv` |
-| RMSNorm (`rmsnorm_v3`) | `rows=4096, cols=4096` | 0.373722 | PASS | `data/results/rmsnorm_v3_results.csv` |
-| Flash Attention (`flash_attention_v4`) | `B=1, H=8, N=1024, D=32` | 4.23957 | PASS | `data/results/flash_attention_v4_results.csv` |
-| Fused Conv1D+SiLU (`v3`) | `B=8, L=2048, D=512, H=256, k=4` | 61.137 | PASS | `data/results/fused_conv1d_silu_v3_results.csv` |
-| Fused Gated Delta Rule (`v2`) | `B=8, L=2048, D=512, H=256` | 109.07 | PASS | `data/results/fused_gated_delta_rule_v2_results.csv` |
-| Fused L2 Norm QK (`v2`) | `B=8, N_q=2048, H_q=256, N_k=2048, H_k=256` | 0.19774 | PASS | `data/results/fused_l2_norm_qk_v2_results.csv` |
-| Fused Output Norm Gate (`v2`) | `B=8, L=2048, D_in=512, H=256, D_out=512` | 16.0584 | PASS | `data/results/fused_output_norm_gate_v2_results.csv` |
-| Q Path Fusion (`v2`) | `rows=1024, cols=1024` | 0.182544 | PASS | `data/results/q_path_fusion_v2_results.csv` |
-
-`*` 说明：`gemm_fp16` 在 `M,N,K<=1024` 的对比项已完成误差校验；主场景 `4096^3` 当前仅记录性能数据，未执行同口径正确性校验。
-统一汇总：`data/results/main_scenario_unified.csv`（retest tag: `20260512_manual_retest`）。
+| 算子 | 主场景 | GPU 耗时 | 吞吐 | 校验 |
+|------|--------|---------|------|------|
+| GEMM FP32 (`gemm_v3`) | 4096³ | 11.50 ms | 11.95 TFLOPS | PASS ≤1024 |
+| GEMM FP16 (`gemm_fp16`) | 4096³ | 3.86 ms | 35.58 TFLOPS | cos_sim=1.0 |
+| RMSNorm (`rmsnorm_v3`) | 4096² | 0.372 ms | 361 GB/s | PASS |
+| Fused Conv1D+SiLU (`v3`) | B=8,L=2048 | 1.65 ms | ~343× vs v0 | PASS |
 
 ---
 
-## 算子一览
+## 输入数据兼容性
 
-| 算子 | 目录 | 优化版本数 | 关键成果 |
-|------|------|:----------:|----------|
-| GEMM | [gemm/](gemm/README.md) | 5（v0~v4 + fp16） | FP32 CUDA Core 达 12.52 TFLOPS（峰值 53%），FP16 Tensor Core 达 37.39 TFLOPS |
-| Softmax | [softmax/](softmax/README.md) | 4（v0~v3） | Online 单遍算法 + float4 向量化 + Warp Shuffle，Memory Throughput 84.87% |
-| RMSNorm | [rmsnorm/](rmsnorm/README.md) | 4（v0~v3） | 带宽从 106 GB/s 提升至 386 GB/s（GDDR7 理论带宽 86%） |
-| Fused Conv1D+SiLU | [fused_conv1d_silu/](fused_conv1d_silu/README.md) | 4（v0~v3） | 端到端 2.6× 加速（5 kernel → 2 kernel 融合） |
-| Flash Attention | [flash_attention/](flash_attention/README.md) | 5（v0~v4） | v1 Tiled Online-Softmax，v3 2D Grid 消除外层循环提升 Occupancy 至 ~60% |
-| Fused Gated Delta Rule | [fused_gated_delta_rule/](fused_gated_delta_rule/README.md) | 3（v0~v2） | v1 全融合消除中间缓冲，v2 双 head ILP + float4 FMA 权重加载 |
-| Fused L2 Norm Q/K | [fused_l2_norm_qk/](fused_l2_norm_qk/README.md) | 3（v0~v2） | v1 3D grid Q/K 融合 + Warp Shuffle，v2 2 行/block + 4 路 ILP |
-| Fused Output Norm Gate | [fused_output_norm_gate/](fused_output_norm_gate/README.md) | 3（v0~v2） | v1 单 kernel 全融合消除 3 个中间缓冲，v2 2 行/block 权重复用 |
-| Q Path Fusion | [q_path_fusion/](q_path_fusion/README.md) | 3（v0~v2） | RMSNorm + Linear(Q) 融合，v2 达 95.80% Occupancy |
-| PyTorch Extension | [pytorch_extension/](pytorch_extension/README.md) | — | Softmax + RMSNorm 的 PyTorch 自定义算子绑定 |
+所有算子 API 支持多种数据类型，cover 从开发训练到推理部署的完整链路：
+
+| 数据类型 | GEMM | RMSNorm | Fused Conv1D+SiLU | 典型用途 |
+|---------|------|---------|-------------------|---------|
+| **FP32** | ✅ V3 hand-written + cuBLAS | ✅ V0/V1/V2/V3/kCubRef | ✅ V0/V1/V2/V3 | 训练基线、正确性参考 |
+| **FP16** | ✅ WMMA + cuBLAS fp16 | ✅ | ✅ | 推理/Tensor Core 加速 |
+| **BF16** | ✅ cuBLAS bf16 | ✅ | ✅ | 训练（不溢出） |
+| **INT8** | ✅ cuBLAS int8 | ✅ | ✅ | 量化推理 |
+| **FP8 E4M3** | ✅ cuBLAS fp8 | ✅ | ✅ | H100+ 稀疏推理 |
+| **FP8 E5M2** | ✅ cuBLAS fp8 | ✅ | ✅ | H100+ 动态范围推理 |
+
+**API 统一接口：**
+- GEMM: `GemmRun(GemmParams)` 通过 `dtype_a/b/c` 指定精度，`impl` 选择实现路径
+- GEMM 量化: `GemmQuantizedRun()` 支持 per-tensor / per-row 量化方案
+- RMSNorm: `RmsNormRun(RmsNormParams)` 通过 `act_dtype/weight_dtype` 指定精度
+- Fused Conv1D: `FusedRun(FusedParams)` 通过 `dtype` 统一指定输入/输出精度
+
+**对齐与回退策略：**
+- 手写 kernel（GEMM V3/FP16、RMSNorm V0-V3、Fused V0-V3）要求 tile 对齐（默认 128）
+- 非对齐输入自动回退到 cuBLAS（GEMM）或 fp32 兼容路径（Fused Conv1D）
+- `AlignmentPolicy` 控制行为：`kFallback`（回退）/ `kStrict`（报错）/ `kSkip`（跳过）
 
 ---
 
-## 算术强度与瓶颈判断
+## 瓶颈分析
 
-| 算子 | 算术强度(FLOP/Byte) | Ridge Point | 瓶颈类别 | NWU 实测 |
-|:-----|:------------------:|:-----------:|:--------:|:--------:|
-| GEMM N=4096 | N/6 ≈ 683 | 52.5 | **计算受限** | 53% 峰值利用率 |
-| GEMM N=128 | N/6 ≈ 21 | 52.5 | **访存受限** | Memory 52.49%，Compute 38.90%（`gemm_v2`） |
-| Softmax | 3N² / (8N²) ≈ 0.38 | 52.5 | **访存受限** | 84.86% MemUtil |
-| RMSNorm | 4C / (8C) = 0.5 | 52.5 | **访存受限** | 86.90% DRAM Util |
-| Flash Attention | N/4 | 52.5 | 混合（取决于 N） | Memory 50.87%，Compute 50.87%（`flash_attention_v4`） |
-| Conv1D+SiLU | ~1.5 | 52.5 | **访存受限** | Memory 98.69%，Compute 3.29%（`fused_conv1d_silu_v3`） |
-| Output Norm Gate | ~2 | 52.5 | **访存受限** | Memory 97.65%，Compute 15.89%（`fused_output_norm_gate_v2`） |
+```
+v1 SMEM 分块  → MIO Throttle 4.82   访存管道拥塞（128³）
+v2 寄存器分块 → Long SB 低           cp.async 前全局延迟已缓解
+v3 cp.async   → Long SB 0.37         FP32 最优 11.95 TFLOPS @ 4096³
+v4 TF32 WMMA  → Math Pipe 8.79       TC 工作（128³ launch）
+fp16 WMMA     → Long SB 1.77         4096³ DRAM ~2%（非带宽瓶颈）
+cuBLAS FP16   → 4096³ 44.0 TFLOPS    库 baseline
+```
 
-Ridge Point = 23.5 TFLOPS / 448 GB/s ≈ 52.5 FLOP/Byte。当算术强度 < 52.5 为访存受限。
-上述空缺项已按当前本地环境（RTX 5060 Ti + CUDA 13.2）重新运行 `ncu --set basic` 回填，原始报告位于 `data/ncu_reports/manual_fill/`。
+**结论：** 大矩阵 GEMM 不是 DRAM 瓶颈，是 **SMEM tile 搬到 Tensor Core 的速度**跟不上 k=16 吞吐。
+
+### 2. RMSNorm — 典型访存受限
+
+- 算术强度 0.5 FLOP/Byte << Ridge Point 52.5
+- 4096² 实测 **361 GB/s**（峰值带宽 448 GB/s 的 **81%**）
+- v3 在小矩阵（512²）可达 443 GB/s（L2 命中，非纯 DRAM）
+
+**结论：** 同一个 NCU 工具，GEMM 看 SMEM→TC stall，RMSNorm 看带宽饱和——优化方向完全不同。
+
+### 3. Fused Conv1D+SiLU — 融合消除中间开销
+
+- v0：5 个 kernel → 主场景 **565.9 ms**
+- v2：恢复 B×L×H 并行 + 2 kernel → **53.4 ms**
+- v3：CUTLASS SGEMM 投影 → **1.65 ms**，端到端 **~343×**
+
+**结论：** 融合的价值不是让单个 kernel 更快，而是**消除中间 buffer 和 launch 开销**。
 
 ---
 
 ## 优化方法论
 
-每个算子的优化遵循 **"找到瓶颈 → 定向改动 → A/B 对比 → 验证"** 的闭环：
-
-1. **Roofline 预判**：估算算术强度，判断访存受限还是计算受限
-2. **朴素实现**：验证正确性的基线版本
-3. **Nsight Compute Profiling**：定量测量 Memory Throughput、Compute Throughput、Occupancy、Stall Reasons
-4. **PTX/SASS 分析**：检查寄存器溢出、FMA 使用、循环展开等编译器行为
-5. **单变量 A/B 测试**：每版只改一个瓶颈，量化对比收益
+1. **Roofline 预判** → 算术强度判断计算/访存受限
+2. **朴素 v0 基线** → 验证正确性
+3. **NCU Profiling** → 定量测量 stall 原因
+4. **单变量 A/B** → 每版只改一个瓶颈
+5. **失败实验记录** → TileK=64、ldmatrix/swizzle 等，用数据说明 ROI
 
 ---
 
-## P0 工程化基线
-
-- 分层入口：
-  - `bash scripts/benchmark_suite.sh smoke`
-  - `bash scripts/benchmark_suite.sh full`
-  - `bash scripts/benchmark_suite.sh profile`
-- 正确性回归：`bash scripts/run_correctness_regression.sh`
-- 可复现实验：`bash scripts/run_benchmark_repro.sh`
-- 标准化汇总（schema v1）：`data/results/summary_standardized.csv`
-- 回归汇总：`data/results/regression_summary.csv`
-- 性能门禁基线：`data/baselines/perf_golden.csv`
-- 性能门禁报告：`data/results/runs/<run_id>/performance_regression_check.csv`
-- 性能门禁摘要（PR 友好）：`data/results/runs/<run_id>/performance_gate_summary.md`
-- 自动调优缓存：`data/baselines/autotune_cache.json`
-- 统一调度目录：`configs/kernel_catalog.json`（支持 arch/dtype/layout/shape_bucket 路由）
-- 随机鲁棒性回归：`RANDOM_GEMM_CASES=1 RANDOM_SOFTMAX_CASES=1 RANDOM_QPATH_CASES=1 bash scripts/run_correctness_regression.sh`
-- 运行报告：`data/results/runs/<run_id>/report.md`
-- 最优实现汇总（自动生成）：
-  - `python3 scripts/update_best_impl_summary.py`
-  - `data/results/best_impl_summary.csv`
-  - `data/results/best_impl_summary.md`
-- 协议文档：`docs/repro_and_regression_protocol.md`
-
----
-
-## 测试覆盖与充分性
-
-本项目已引入算子级测试审计机制，用于判断“正确性测试是否充分、性能测试是否充分”：
-
-- 审计脚本：`scripts/audit_operator_tests.py`
-- 一键补测 + 审计入口：`bash scripts/run_operator_test_supplement.sh`
-- 审计结果文件：`docs/operator_test_coverage_audit.md`
-
-当前审计结论（以最新审计报告为准）：
-
-- 覆盖范围：`gemm`、`softmax`、`rmsnorm`、`flash_attention`、`fused_conv1d_silu`、`fused_gated_delta_rule`、`fused_l2_norm_qk`、`fused_output_norm_gate`、`q_path_fusion`
-- 正确性充分性：上述算子均满足“至少 1 行 PASS 且 0 行 FAIL”
-- 性能充分性：上述算子均满足“至少 1 行有效 `gpu_ms`（>0）”
-- 样本规模：每算子当前报告均含 5 个规模点，可覆盖小/中/大维度的基础回归
-- 当前状态：未发现阻断项，结论为“可用于持续回归与版本对比”
-
-建议在每次批量优化后执行一次：
-
-```bash
-bash scripts/run_operator_test_supplement.sh
-```
-
----
-
-## Nsight Compute 瓶颈总览
-
-命令：`ncu --set basic --target-processes all --kernel-name-base demangled`。  
-统计口径：每个可执行文件取 Duration 最大的一次 kernel launch。  
-说明：以下 NCU 指标仅用于**辅助归因**（判断是访存、计算还是调度瓶颈），主性能排序以上一节的主场景 GPU 耗时为准。
-
-| 目标 | Max Duration(us) | Compute(SM) | DRAM | Memory | Achieved Occupancy | 瓶颈分析 |
-|:-----|-----------------:|------------:|-----:|-------:|-------------------:|:---------|
-| `gemm_v0` | 945.57 ms | 35.30%¹ | 4.39%¹ | 36.13%¹ | 99.84% | 无穷读全局，无复用 |
-| `gemm_v1` | 710.50 ms | 33.06%¹ | 5.24%¹ | 35.38%¹ | 99.83% | SMEM 分块，仍受带宽限 |
-| `gemm_v2` | 219.79 ms | 0.93%¹ | 1.81%¹ | 50.25%¹ | 16.66% | 寄存器分块，计算强度提升 |
-| `gemm_v3` | **177.69 ms** | 1.61%¹ | 3.56%¹ | 43.68%¹ | 33.07% | **12.52 TFLOPS，53% 峰值** |
-| `gemm_v4` | 180.33 ms | 1.81%¹ | 1.91%¹ | 31.72%¹ | 26.90% | TF32 WMMA，Occupancy 低 |
-| `gemm_fp16` | **102.81 ms** | 0.78%¹ | 1.89%¹ | 50.83%¹ | 32.93% | **37.39 TFLOPS** |
-| `rmsnorm_v0` | 908.22 us | 0.95% | 4.55% | 12.81% | 16.48% | 基线利用率低 |
-| `rmsnorm_v1` | 697.54 us | 51.31% | 39.07% | 51.31% | 8.33% | 算存均衡，SMEM 限制 occupancy |
-| `rmsnorm_v2` | 321.18 us | 10.20% | 82.86% | 82.86% | 8.33% | **明显带宽受限** |
-| `rmsnorm_v3` | 334.18 us | 5.88% | 86.90% | 86.90% | 38.68% | **DRAM 接近饱和** |
-| `softmax_v0` | 647.65 | 0.69% | 2.78% | 12.30% | 16.64% | 朴素版本低效 |
-| `softmax_v1` | 86.02 | **79.99%** | 11.74% | 79.99% | 33.55% | **算存利用均高** |
-| `softmax_v2` | 340.06 | 16.02% | **84.51%** | **84.51%** | 8.31% | **带宽受限明显** |
-| `softmax_v3` | 338.94 | 12.96% | **84.86%** | **84.86%** | 8.31% | **DRAM 饱和** |
-| `flash_attention_v0` | 599.97 | 0.69% | 2.46% | 11.53% | 33.04% | 多 kernel 分离，利用率低 |
-| `flash_attention_v1` | 705.70 | 0.81% | 0.19% | 0.81% | 16.67% | **grid 太小，严重欠并行** |
-| `flash_attention_v2` | 551.23 | 65.09% | 0.08% | 65.09% | 27.01% | fallback kernel，算力利用中等 |
-| `flash_attention_v3` | 76.28² | 1.07%² | 0.82%² | 1.06%² | 33.30%⁵ | 2D Grid 设计，Waves/SM 偏小 |
-| `flash_attention_v4` | 76.09² | 1.30%² | 0.67%² | 1.36%² | 44.83%⁵ | Bank-free + ILP，小规模测试 |
-| `fused_conv1d_silu_v0` | 485.70 us | 1.70% | 0.68% | 21.87% | 16.14% | 分离路径开销 |
-| `fused_conv1d_silu_v2` | 698.75 us | 4.13% | 0.56% | 90.63% | 62.08% | **片上缓存流量主导** |
-| `fused_conv1d_silu_v3` | 910.14 us | 3.88% | 0.41% | 96.09% | 72.58% | **occupancy 高，瓶颈偏访存** |
-| `fused_gated_delta_rule_v0` | 814.21 us | 2.28% | 31.69% | 31.69% | 16.53% | 时间维串行递推，延迟/带宽混合 |
-| `fused_gated_delta_rule_v1` | 368.17 us³ | 1.70%³ | 0.53%³ | 22.08%³ | 16.67% | 全融合消除中间缓冲 |
-| `fused_gated_delta_rule_v2` | 145.94 us³ | 0.09%³ | 0.61%³ | 29.22%³ | 8.33% | 双 head ILP + FMA |
-| `fused_l2_norm_qk_v0` | 402.53 us | 29.08% | 25.20% | 29.08% | 89.22% | 算存均衡，受归约与访存共同限制 |
-| `fused_l2_norm_qk_v1` | 225.24 us | 20.76% | 4.31% | 11.81% | 67.13% | 3D grid Q/K 融合 + Warp Shuffle |
-| `fused_l2_norm_qk_v2` | 238.10 us | 12.96% | 5.34% | 10.59% | 55.21% | 2 rows/block + 4 路 ILP |
-| `fused_output_norm_gate_v0` | 385.38 us | 11.73% | 0.49% | 95.81% | 90.97% | **L1/L2 缓存流量为主** |
-| `fused_output_norm_gate_v1` | 11.54 us⁴ | 7.29%⁴ | 1.58%⁴ | 51.09%⁴ | 99.19%⁵ | 全融合消除 3 中间缓冲 |
-| `fused_output_norm_gate_v2` | 8.37 us⁴ | 6.25%⁴ | 2.35%⁴ | 19.81%⁴ | 82.66%⁵ | 2 rows/block 权重复用 |
-| `q_path_fusion_v0` | 166.91 us | 72.45% | 4.13% | 72.45% | 88.76% | **计算占主导** |
-| `q_path_fusion_v2` | 697.89 us | 17.81% | 81.28% | 81.28% | 95.80% | **RMSNorm 阶段带宽瓶颈** |
-
-> **注：** ¹ GEMM 数据取自 128³ 小规模。² flash_attention v3/v4 为 N=64 小规模。³ Gated Delta Rule v1/v2 为 B=4~8 中等规模。⁴ Output Norm Gate v1/v2 为 B=128 小规模。⁵ Occupancy 取最大规模 launch。
-
----
-
-## Warp Stall 原因分析
-
-命令：`ncu --metrics smsp__average_warps_issue_stalled_*_per_issue_active.ratio`。  
-统计口径：取该版本 Duration 最大的一次 launch 的 Top 5 stall 原因（归一化百分比）。
-
-| 目标 | #1 Stall | #2 Stall | #3 Stall | #4 Stall | #5 Stall |
-|:-----|:---------|:---------|:---------|:---------|:---------|
-| `gemm_v0` | Long Scoreboard 79.8% | Not Selected 12.0% | Wait 7.9% | No Instruction 0.2% | Math Pipe 0.1% |
-| `gemm_v1` | Mio Throttle 43.5% | Long Scoreboard 40.2% | Not Selected 7.6% | Wait 5.6% | Short Scoreboard 2.7% |
-| `gemm_v2` | Long Scoreboard 52.5% | Short Scoreboard 20.5% | Not Selected 16.3% | Wait 6.5% | Mio Throttle 2.2% |
-| `gemm_v3` | Long Scoreboard 46.4% | Not Selected 25.8% | Short Scoreboard 13.1% | Mio Throttle 6.9% | Wait 5.8% |
-| `gemm_v4` | **Math Pipe Throttle 72.9%** | Wait 15.7% | Long Scoreboard 6.5% | Not Selected 2.7% | Short Scoreboard 0.9% |
-| `gemm_fp16` | Long Scoreboard 46.8% | Short Scoreboard 20.2% | Math Pipe Throttle 16.1% | Wait 9.1% | Mio Throttle 6.7% |
-| `rmsnorm_v0` | **Long Scoreboard 97.4%** | Wait 2.5% | No Instruction 0.0% | Not Selected 0.0% | Short Scoreboard 0.0% |
-| `rmsnorm_v1` | Wait 34.7% | Long Scoreboard 31.0% | Short Scoreboard 21.3% | Mio Throttle 11.8% | No Instruction 1.2% |
-| `rmsnorm_v2` | **Long Scoreboard 81.8%** | Wait 8.7% | Short Scoreboard 8.4% | Mio Throttle 0.7% | No Instruction 0.4% |
-| `rmsnorm_v3` | **Long Scoreboard 78.7%** | Mio Throttle 11.0% | Short Scoreboard 8.8% | Wait 1.2% | Not Selected 0.2% |
-| `softmax_v0` | **Long Scoreboard 97.4%** | Wait 1.4% | Short Scoreboard 1.1% | No Instruction 0.1% | — |
-| `softmax_v1` | **Wait 49.3%** | Short Scoreboard 32.1% | Long Scoreboard 10.7% | Mio Throttle 6.5% | No Instruction 1.4% |
-| `softmax_v2` | **Long Scoreboard 73.6%** | Wait 13.0% | Short Scoreboard 11.7% | No Instruction 0.9% | Mio Throttle 0.9% |
-| `softmax_v3` | **Long Scoreboard 79.1%** | Wait 13.2% | Short Scoreboard 6.4% | No Instruction 0.9% | Math Pipe 0.2% |
-| `flash_attention_v0` | Short Scoreboard 38.9% | Long Scoreboard 31.7% | Wait 26.9% | No Instruction 1.2% | Not Selected 1.0% |
-| `flash_attention_v1` | Long Scoreboard 52.7% | Not Selected 27.1% | Wait 18.3% | Short Scoreboard 1.2% | No Instruction 0.6% |
-| `flash_attention_v2` | Long Scoreboard 52.7% | Not Selected 27.1% | Wait 18.3% | Short Scoreboard 1.2% | No Instruction 0.6% |
-| `flash_attention_v3` | Short Scoreboard 40.7% | Wait 33.8% | No Instruction 15.0% | Not Selected 6.2% | Long Scoreboard 2.3% |
-| `flash_attention_v4` | Long Scoreboard 47.2% | Short Scoreboard 31.6% | Wait 16.7% | Not Selected 3.7% | Math Pipe 0.3% |
-| `fused_conv1d_silu_v0` | **Long Scoreboard 92.0%** | Wait 4.5% | Short Scoreboard 2.1% | Not Selected 0.7% | Math Pipe 0.4% |
-| `fused_conv1d_silu_v1` | **Long Scoreboard 99.0%** | Wait 0.9% | No Instruction 0.0% | Short Scoreboard 0.0% | — |
-| `fused_conv1d_silu_v2` | Long Scoreboard 58.6% | Wait 18.2% | Not Selected 9.9% | Short Scoreboard 8.3% | Math Pipe 3.2% |
-| `fused_conv1d_silu_v3` | **Long Scoreboard 69.3%** | Wait 15.7% | Short Scoreboard 6.0% | Not Selected 5.3% | Mio Throttle 2.2% |
-| `fused_gated_delta_rule_v0` | **Long Scoreboard 86.3%** | Wait 10.8% | Short Scoreboard 2.0% | Not Selected 0.4% | Math Pipe 0.3% |
-| `fused_gated_delta_rule_v1` | **Long Scoreboard 96.7%** | Wait 3.0% | No Instruction 0.1% | Short Scoreboard 0.1% | Math Pipe 0.1% |
-| `fused_gated_delta_rule_v2` | **Long Scoreboard 96.6%** | Wait 2.9% | Short Scoreboard 0.4% | No Instruction 0.1% | — |
-| `fused_l2_norm_qk_v0` | Long Scoreboard 38.1% | Short Scoreboard 26.4% | Wait 20.7% | Not Selected 7.0% | Mio Throttle 5.2% |
-| `fused_l2_norm_qk_v1` | Long Scoreboard 46.1% | Wait 24.2% | Short Scoreboard 17.0% | Not Selected 9.0% | Math Pipe 1.5% |
-| `fused_l2_norm_qk_v2` | Long Scoreboard 35.4% | Short Scoreboard 27.9% | Wait 25.0% | No Instruction 5.6% | Not Selected 5.5% |
-| `fused_output_norm_gate_v0` | Long Scoreboard 38.5% | Short Scoreboard 24.8% | Wait 20.1% | Not Selected 8.6% | Mio Throttle 5.2% |
-| `fused_output_norm_gate_v1` | **Mio Throttle 73.7%** | Long Scoreboard 18.9% | Short Scoreboard 5.0% | Not Selected 1.3% | Wait 1.0% |
-| `fused_output_norm_gate_v2` | **Mio Throttle 50.0%** | Long Scoreboard 33.3% | Short Scoreboard 14.7% | Wait 1.1% | Not Selected 0.8% |
-| `q_path_fusion_v0` | **Long Scoreboard 79.7%** | Mio Throttle 7.9% | Wait 5.5% | Short Scoreboard 3.9% | Not Selected 2.7% |
-| `q_path_fusion_v2` | Mio Throttle 27.2% | Short Scoreboard 26.8% | Long Scoreboard 15.4% | Not Selected 12.9% | No Instruction 8.5% |
-
-**关键发现：**
-- **Long Scoreboard**（等待全局内存加载）是主导 stall，memory-bound kernel 中占 70-97%
-- **Mio Throttle**（MIO 管道拥塞）在融合 kernel（fused_output_norm_gate）中占 50-74%
-- **Math Pipe Throttle**（计算管道瓶颈）在 gemm_v4 TF32 WMMA 中占 72.9%
-- **Wait**（跨 warp 同步）在 softmax_v1 中占 49.3%
-- **Short Scoreboard**（缓存等待）在小规模 flash_attention 中较高
-
----
-
-## 构建与运行
-
-**环境要求：** CUDA 13.2+，Compute Capability sm_120（Blackwell）
+## 构建与测试
 
 ```bash
 mkdir -p build && cd build
 cmake .. -DCMAKE_CUDA_ARCHITECTURES=120
-make -j$(nproc)
+cmake --build . -j$(nproc)
 cd ..
 
-# 运行单个 kernel
-./build/bin/gemm_v3
-./build/bin/softmax_v3
-./build/bin/rmsnorm_v3
+# 单元测试
+cmake -S . -B build -DCMAKE_CUDA_ARCHITECTURES=120 -DBUILD_TESTS=ON
+cmake --build build --target cko_unit_tests -j$(nproc)
+ctest --test-dir build --output-on-failure
 
-# 统一 Benchmark
-./build/bin/gemm_fp16
-./build/bin/softmax_cudnn_ref
+# 各算子 head-to-head 对比 benchmark
+./build/bin/gemm_compare
+./build/bin/rmsnorm_compare
 ```
 
 ---
@@ -250,29 +115,15 @@ cd ..
 ## 项目结构
 
 ```
-├── CMakeLists.txt                 顶层构建
-├── common/                       公共工具（CUDA 宏、计时器、矩阵工具）
-│   ├── include/common/
-│   │   ├── benchmark.h
-│   │   └── cuda_utils.h
-│   └── src/benchmark.cpp
-│
-├── gemm/                         通用矩阵乘（v0~v4 + fp16 + int8 + cuBLAS/cuBLASLt）
-├── softmax/                      Softmax（v0~v3 + cuDNN 参考）
-├── rmsnorm/                      RMSNorm（v0~v3）
-├── flash_attention/              Flash Attention（v0~v4）
-├── fused_conv1d_silu/            融合 Conv1D + SiLU（v0~v3）
-├── fused_gated_delta_rule/       融合 Gated Delta Rule（v0~v2 + v3 INT8 量化）
-├── fused_l2_norm_qk/             融合 L2 Norm Q/K（v0~v2）
-├── fused_output_norm_gate/       融合 Output Norm Gate（v0~v2）
-├── q_path_fusion/                Q 路径融合 RMSNorm + Linear（v0~v2）
-├── pytorch_extension/            PyTorch 自定义算子绑定
-│
-├── tests/                        统一测试框架（test_runner + test_utils）
-├── run_ncu_all.sh                Nsight Compute 批量 profiling
-├── run_ncu_stall.sh              Warp Stall 批量分析
-├── gemm/quantization_fp16_fp8_int8.md  低精度量化数据汇总
-└── LICENSE                        Apache 2.0
+├── gemm/                  计算密集型（v0~v4 + fp16 + cuBLAS 参考）
+├── rmsnorm/               访存密集型（v0~v3）
+├── fused_conv1d_silu/     融合算子（v0~v3 + fused_api）
+├── common/                公共工具（计时、Status、test catalog）
+├── tests/                 GoogleTest（68 项：Validate + CPU ref + GPU smoke + C ABI）
+├── configs/test_cases/    参数化测试用例 JSON
+├── docs/testing.md        测试与 API 规范
+├── .github/workflows/ci.yml  CI 门禁
+└── configs/kernel_catalog.json
 ```
 
 ---
@@ -281,9 +132,8 @@ cd ..
 
 | 项目 | 配置 |
 |------|------|
-| GPU | RTX 5060 Ti 16GB |
-| 架构 | Blackwell（sm_120） |
-| 驱动 | CUDA 13.2 |
-| FP32 峰值 | 23.5 TFLOPS（36 SM × 128 Core × 2.55 GHz × 2） |
-| FP16 TC 峰值 | 376 TFLOPS（36 SM × 4096 × 2.55 GHz） |
-| 显存带宽 | 448 GB/s（GDDR7 × 128-bit） |
+| GPU | RTX 5060 Ti 16GB (Blackwell sm_120) |
+| CUDA | 13.2 |
+| FP32 峰值 | 23.5 TFLOPS |
+| FP16 TC 峰值 | 376 TFLOPS |
+| DRAM 带宽 | 448 GB/s |

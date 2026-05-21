@@ -53,12 +53,23 @@ docs/*.html
 docs/*guidelines*.md
 docs/benchmark_environment.md
 
-# Interview preparation / private narration material
-INTERVIEW_PRESENTATION_SCRIPT.md
-INTERVIEW_SPRINT_ROADMAP.md
+# Demo / presentation related files
 *INTERVIEW*.md
-*interview*.md
 *面试*.md
+*DEMO*.md
+*RETEST*.md
+scripts/demo.sh
+scripts/cko_driver.sh
+scripts/audit_operator_tests.py
+scripts/run_benchmark_repro.sh
+scripts/run_correctness_regression.sh
+scripts/run_operator_test_supplement.sh
+run_ncu_all.sh
+run_ncu_roofline.sh
+run_ncu_stall.sh
+tools/add_profiling_note.py
+tools/profile_all.py
+tools/update_readmes.py
 
 # Generated ISA / disassembly (nvcc -ptx / -cubin outputs; regenerate from .cu)
 **/asm/

@@ -1,11 +1,8 @@
-// GEMM V3: cp.async + 8×4 sub-block + TileK=32
-//
-// 关键参数调优：
-//   1. kTN=4 (8×4): 累加器从 64 降到 32 寄存器 → 更高 occupancy
-//   2. kBlockN=64 (128×64): B SMEM 减半 → 48KB → 2 blocks/SM
-//   3. kTileK=32: 外循环从 256 次减到 128 次 → 更少 __syncthreads
-//   4. cp.async: DMA 异步加载与计算重叠
-//   5. __launch_bounds__(256,2): 预留 2 blocks/SM 的寄存器
+// GEMM V3：使用 cp.async + 8×4 子块 + TileK=32。kTN=4 产生 8×4 子块，
+// 将累加器从 64 个寄存器减少到 32 个以提高占用率。kBlockN=64 将 B 的共享内存
+// 减半至 48KB，允许每 SM 运行 2 个块。kTileK=32 将外层循环从 256 次减少到
+// 128 次，同时减少 __syncthreads 调用。cp.async DMA 实现异步加载/计算流水线。
+// __launch_bounds__(256,2) 注解为每 SM 2 个块预留寄存器。
 
 #include <cuda_runtime.h>
 #include <cuda_pipeline.h>
@@ -19,6 +16,16 @@
 
 #include "common/benchmark.h"
 #include "common/cuda_utils.h"
+// inline CpuGemm defined below
+
+static void GemmCPU(const float* A, const float* B, float* C, int M, int N, int K) {
+  for (int i = 0; i < M; ++i)
+    for (int j = 0; j < N; ++j) {
+      double sum = 0;
+      for (int k = 0; k < K; ++k) sum += static_cast<double>(A[i * K + k]) * B[k * N + j];
+      C[i * N + j] = static_cast<float>(sum);
+    }
+}
 
 constexpr int kTM = 8;
 constexpr int kTN = 4;
@@ -27,24 +34,25 @@ constexpr int kBlockThreadsX = 16;
 constexpr int kBlockThreadsY = 16;
 constexpr int kBlockThreads = kBlockThreadsX * kBlockThreadsY;
 
-constexpr int kBlockM = kBlockThreadsY * kTM;  // 128
-constexpr int kBlockN = kBlockThreadsX * kTN;  // 64
+constexpr int kBlockM = kBlockThreadsY * kTM;
+constexpr int kBlockN = kBlockThreadsX * kTN;
 
 constexpr int kTileK = 32;
 
-constexpr int kSmemABuf = kBlockM * kTileK;  // 4096 floats
-constexpr int kSmemBBuf = kTileK * kBlockN;  // 2048 floats
+constexpr int kSmemABuf = kBlockM * kTileK;
+constexpr int kSmemBBuf = kTileK * kBlockN;
 
 __global__ __launch_bounds__(kBlockThreads, 2)
 void GemmV3Kernel(const float* __restrict__ A, const float* __restrict__ B,
     float* __restrict__ C, int M, int N, int K) {
-
+    // 共享内存双缓冲
     extern __shared__ float smem[];
     float* As_buf0 = smem;
     float* As_buf1 = smem + kSmemABuf;
     float* Bs_buf0 = smem + 2 * kSmemABuf;
     float* Bs_buf1 = smem + 2 * kSmemABuf + kSmemBBuf;
 
+    // 线程索引
     const int tx = threadIdx.x;
     const int ty = threadIdx.y;
     const int tid = ty * kBlockThreadsX + tx;
@@ -52,10 +60,12 @@ void GemmV3Kernel(const float* __restrict__ A, const float* __restrict__ B,
     const int row_start = blockIdx.y * kBlockM + ty * kTM;
     const int col_start = blockIdx.x * kBlockN + tx * kTN;
 
+    // 初始化累加器
     float sum[kTM][kTN] = {};
 
     const int num_k_tiles = (K + kTileK - 1) / kTileK;
 
+    // 异步加载函数：cp.async 加载 A/B 块
     auto load_tile_async = [&](int tile_k_start, float* As_buf, float* Bs_buf) {
         const int total_a_f4 = (kBlockM * kTileK) / 4;
         const int a_f4_per_th = (total_a_f4 + kBlockThreads - 1) / kBlockThreads;
@@ -97,11 +107,13 @@ void GemmV3Kernel(const float* __restrict__ A, const float* __restrict__ B,
         }
     };
 
+    // 加载首块并同步
     load_tile_async(0, As_buf0, Bs_buf0);
     __pipeline_commit();
     __pipeline_wait_prior(0);
     __syncthreads();
 
+    // 主循环：异步加载下一块 + 计算当前块
     for (int t = 0; t < num_k_tiles; ++t) {
         float* As_read = (t & 1) ? As_buf1 : As_buf0;
         float* Bs_read = (t & 1) ? Bs_buf1 : Bs_buf0;
@@ -113,6 +125,7 @@ void GemmV3Kernel(const float* __restrict__ A, const float* __restrict__ B,
             __pipeline_commit();
         }
 
+        // 计算当前块：B值预取 + A遍历
         #pragma unroll
         for (int kk = 0; kk < kTileK; ++kk) {
             float b_vals[kTN];
@@ -135,6 +148,7 @@ void GemmV3Kernel(const float* __restrict__ A, const float* __restrict__ B,
         __syncthreads();
     }
 
+    // 写回结果
     #pragma unroll
     for (int i = 0; i < kTM; ++i) {
         int g_r = row_start + i;
@@ -151,18 +165,9 @@ void GemmV3Kernel(const float* __restrict__ A, const float* __restrict__ B,
     }
 }
 
-static void GemmCPU(const float* A, const float* B, float* C, int M, int N, int K) {
-    for (int r = 0; r < M; ++r)
-        for (int c = 0; c < N; ++c) {
-            float s = 0;
-            for (int k = 0; k < K; ++k)
-                s += A[static_cast<size_t>(r) * K + k] * B[static_cast<size_t>(k) * N + c];
-            C[static_cast<size_t>(r) * N + c] = s;
-        }
-}
-
 #ifndef ALL_COMPARE_LIB
 int main() {
+    // 参数与输出文件准备
     constexpr int kRepeat = 10;
     constexpr int kMaxCpuVerifyDim = 1024;
     auto cases = common::LoadOrCreateTestCasesCsv("data/gemm/test_cases.csv");
@@ -180,29 +185,37 @@ int main() {
         size_t sz_b = static_cast<size_t>(K) * N;
         size_t sz_c = static_cast<size_t>(M) * N;
 
+        // 生成测试数据
         std::vector<float> A(sz_a), B(sz_b), C_cpu(sz_c), C_gpu(sz_c);
         common::InitMatrix(A, M, K);
         common::InitMatrix(B, K, N);
+
+        // CPU参考计算
         if (M <= kMaxCpuVerifyDim && N <= kMaxCpuVerifyDim)
             GemmCPU(A.data(), B.data(), C_cpu.data(), M, N, K);
 
         float gpu_ms = 0.0f;
         if (aligned) {
+            // 分配GPU内存
             float *dA, *dB, *dC;
             CHECK_CUDA(cudaMalloc(&dA, sz_a * sizeof(float)));
             CHECK_CUDA(cudaMalloc(&dB, sz_b * sizeof(float)));
             CHECK_CUDA(cudaMalloc(&dC, sz_c * sizeof(float)));
+
+            // 拷贝数据到设备
             CHECK_CUDA(cudaMemcpy(dA, A.data(), sz_a * sizeof(float), cudaMemcpyHostToDevice));
             CHECK_CUDA(cudaMemcpy(dB, B.data(), sz_b * sizeof(float), cudaMemcpyHostToDevice));
 
+            // 启动配置
             dim3 block(kBlockThreadsX, kBlockThreadsY);
             dim3 grid((N + kBlockN - 1) / kBlockN, (M + kBlockM - 1) / kBlockM);
-
             CHECK_CUDA(cudaFuncSetAttribute(GemmV3Kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_bytes));
 
+            // 预热
             GemmV3Kernel<<<grid, block, smem_bytes>>>(dA, dB, dC, M, N, K);
             CHECK_CUDA(cudaDeviceSynchronize());
 
+            // 计时循环
             cudaEvent_t start, stop;
             CHECK_CUDA(cudaEventCreate(&start));
             CHECK_CUDA(cudaEventCreate(&stop));
@@ -214,11 +227,15 @@ int main() {
             CHECK_CUDA(cudaEventElapsedTime(&gpu_ms, start, stop));
             gpu_ms /= kRepeat;
 
+            // 拷贝结果回主机
             CHECK_CUDA(cudaMemcpy(C_gpu.data(), dC, sz_c * sizeof(float), cudaMemcpyDeviceToHost));
+
+            // 释放GPU资源
             CHECK_CUDA(cudaEventDestroy(start)); CHECK_CUDA(cudaEventDestroy(stop));
             CHECK_CUDA(cudaFree(dA)); CHECK_CUDA(cudaFree(dB)); CHECK_CUDA(cudaFree(dC));
         }
 
+        // 校验
         bool ok = true;
         double max_abs_diff = 0.0;
         const char* check = "SKIP_UNALIGNED";
@@ -230,13 +247,12 @@ int main() {
             check = "SKIP";
         }
 
+        // 计算并输出结果
         double gflops = (gpu_ms > 0.0f) ? (2.0 * M * N * K / (gpu_ms * 1e6)) : 0.0;
-
         std::cout << M << "x" << N << "x" << K
                   << " | " << std::fixed << std::setprecision(4) << gpu_ms << " ms"
                   << " | " << std::setprecision(1) << gflops << " GFLOP/s"
                   << " | " << check << "\n";
-
         ofs << i << ",gemm_v3," << M << "," << N << "," << K << ","
             << gpu_ms << "," << gflops << "," << max_abs_diff << "," << check << "\n";
     }

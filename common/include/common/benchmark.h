@@ -27,6 +27,9 @@ std::vector<TestCase> LoadOrCreateTestCasesCsv(const std::string& file_path);
 
 void InitMatrix(std::vector<float>& matrix, int rows, int cols);
 
+// 返回可写的 results 目录（优先 data/results，不可写则回退 build/data/results → results/）
+std::string EnsureResultsDir();
+
 bool CheckEqual(const std::vector<float>& a, const std::vector<float>& b,
                 float eps = 1e-6f);
 

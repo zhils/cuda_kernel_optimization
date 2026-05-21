@@ -1,0 +1,72 @@
+{
+  "schema_version": "1",
+  "family": "fused_conv1d_silu",
+  "cases": [
+    {
+      "id": "smoke_small",
+      "expect": "pass",
+      "tags": ["smoke"],
+      "params": { "B": 1, "L": 128, "D": 64, "H": 32, "k_size": 4, "dtype": "fp32" }
+    },
+    {
+      "id": "main_demo",
+      "expect": "pass",
+      "tags": ["perf", "demo"],
+      "params": { "B": 8, "L": 2048, "D": 512, "H": 256, "k_size": 4, "dtype": "fp32" }
+    },
+    {
+      "id": "minimal_dims",
+      "expect": "pass",
+      "tags": ["boundary"],
+      "params": { "B": 1, "L": 1, "D": 8, "H": 4, "k_size": 1, "dtype": "fp32" }
+    },
+    {
+      "id": "k_equals_l",
+      "expect": "pass",
+      "tags": ["boundary"],
+      "params": { "B": 2, "L": 4, "D": 16, "H": 8, "k_size": 4, "dtype": "fp32" }
+    },
+    {
+      "id": "medium_batch",
+      "expect": "pass",
+      "tags": ["ratio"],
+      "params": { "B": 4, "L": 1024, "D": 512, "H": 256, "k_size": 4, "dtype": "fp32" }
+    },
+    {
+      "id": "invalid_k_zero",
+      "expect": "invalid_argument",
+      "tags": ["boundary"],
+      "params": { "B": 1, "L": 64, "D": 32, "H": 16, "k_size": 0, "dtype": "fp32" }
+    },
+    {
+      "id": "invalid_k_gt_l",
+      "expect": "invalid_argument",
+      "tags": ["boundary"],
+      "params": { "B": 1, "L": 4, "D": 16, "H": 8, "k_size": 8, "dtype": "fp32" }
+    },
+    {
+      "id": "invalid_h_zero",
+      "expect": "invalid_argument",
+      "tags": ["boundary"],
+      "params": { "B": 1, "L": 64, "D": 32, "H": 0, "k_size": 4, "dtype": "fp32" }
+    },
+    {
+      "id": "large_l_small_b",
+      "expect": "pass",
+      "tags": ["ratio", "extreme"],
+      "params": { "B": 1, "L": 2048, "D": 128, "H": 64, "k_size": 4, "dtype": "fp32" }
+    },
+    {
+      "id": "large_b_small_l",
+      "expect": "pass",
+      "tags": ["ratio", "extreme"],
+      "params": { "B": 8, "L": 16, "D": 256, "H": 128, "k_size": 4, "dtype": "fp32" }
+    },
+    {
+      "id": "thin_h_d_ratio",
+      "expect": "pass",
+      "tags": ["ratio", "extreme"],
+      "params": { "B": 2, "L": 256, "D": 1024, "H": 16, "k_size": 4, "dtype": "fp32" }
+    }
+  ]
+}

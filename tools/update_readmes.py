@@ -4,8 +4,8 @@
 import json
 import os
 
-PROFILING_JSON = "/mnt/d/deploy/cuda_kernel_optimization/data/profiling/profile_results.json"
-PROJECT_ROOT = "/mnt/d/deploy/cuda_kernel_optimization"
+PROFILING_JSON = "/home/zh0813/cuda_kernel_optimization/data/profiling/profile_results.json"
+PROJECT_ROOT = "/home/zh0813/cuda_kernel_optimization"
 
 with open(PROFILING_JSON) as f:
     data = json.load(f)
@@ -16,30 +16,17 @@ KERNEL_NAMES = {
     "gemm_v1": "GemmSmemKernel",
     "gemm_v2": "GemmRegTiledKernel",
     "gemm_v3": "GemmCpAsyncKernel",
+    "gemm_v4": "GemmTF32WmmaKernel",
     "gemm_fp16": "GemmFP16Kernel",
-    "gemm_fp8": "cublasLtMatmul (cuBLASLt FP8)",
-    "gemm_int8": "GemmINT8Kernel",
     "gemm_cublas_ref": "cublasSgemm (cuBLAS FP32)",
-    "softmax_v0": "SoftmaxNaiveKernel",
-    "softmax_v1": "SoftmaxSmemKernel",
-    "softmax_v2": "SoftmaxOnlineKernel",
-    "softmax_v3": "SoftmaxShuffleKernel",
-    "softmax_cudnn_ref": "cudnnSoftmaxForward",
+    "gemm_cublas_fp16": "cublasGemmEx (cuBLAS FP16)",
     "rmsnorm_v0": "RmsnormSerialKernel",
     "rmsnorm_v1": "RmsnormSmemVecKernel",
     "rmsnorm_v2": "RmsnormShuffleKernel",
     "rmsnorm_v3": "RmsnormWeightSmemKernel",
-    "rmsnorm_cub_ref": "RmsnormCubRefKernel",
     "fused_conv1d_silu_v0": "FusedConv1dSiluV0 (5 kernels)",
     "fused_conv1d_silu_v1": "FusedConv1dSiluV1 (fully fused)",
-    "fused_conv1d_silu_v2": "FusedConv1dSiluV2 (2-kernel + vec4)",
-    "fused_conv1d_silu_v3": "FusedConv1dSiluV3 (2D grid + SMEM)",
-    "flash_attention_v0": "FlashAttnNaiveKernel",
-    "flash_attention_v1": "FlashAttnTiledKernel",
-    "fused_l2_norm_qk_v0": "FusedL2NormQKKernel",
-    "fused_gated_delta_rule_v0": "FusedGatedDeltaRuleV0",
-    "fused_output_norm_gate_v0": "FusedOutputNormGateV0",
-    "q_path_fusion_v2": "QPathFusionV2Kernel",
+    "fused_conv1d_silu_v3": "FusedConv1dSiluV3 (CUTLASS GEMM)",
 }
 
 # Read the gemm README to determine where to insert profiling sections
@@ -109,15 +96,9 @@ def update_readme(readme_path, profiling_section):
 
 # Map operator groups to README paths
 README_MAP = {
-    "gemm":                     "/mnt/d/deploy/cuda_kernel_optimization/gemm/README.md",
-    "softmax":                  "/mnt/d/deploy/cuda_kernel_optimization/softmax/README.md",
-    "rmsnorm":                  "/mnt/d/deploy/cuda_kernel_optimization/rmsnorm/README.md",
-    "fused_conv1d_silu":        "/mnt/d/deploy/cuda_kernel_optimization/fused_conv1d_silu/README.md",
-    "flash_attention":          "/mnt/d/deploy/cuda_kernel_optimization/flash_attention/README.md",
-    "fused_l2_norm_qk":         "/mnt/d/deploy/cuda_kernel_optimization/fused_l2_norm_qk/README.md",
-    "fused_gated_delta_rule":   "/mnt/d/deploy/cuda_kernel_optimization/fused_gated_delta_rule/README.md",
-    "fused_output_norm_gate":   "/mnt/d/deploy/cuda_kernel_optimization/fused_output_norm_gate/README.md",
-    "q_path_fusion":            "/mnt/d/deploy/cuda_kernel_optimization/q_path_fusion/README.md",
+    "gemm":              f"{PROJECT_ROOT}/gemm/README.md",
+    "rmsnorm":           f"{PROJECT_ROOT}/rmsnorm/README.md",
+    "fused_conv1d_silu": f"{PROJECT_ROOT}/fused_conv1d_silu/README.md",
 }
 
 def main():

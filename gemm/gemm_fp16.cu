@@ -50,13 +50,18 @@ __global__ __launch_bounds__(kThreads, 2) void GemmFP16Kernel(
     const __half* __restrict__ A,
     const __half* __restrict__ B,
     float* __restrict__ C,
-    int M, int N, int K) {
+    int M, 
+    int N, 
+    int K
+  ) {
+  // 共享内存双缓冲
   extern __shared__ __half shared_mem[];
   __half* As_buf0 = shared_mem;
   __half* As_buf1 = shared_mem + kSmemABuf;
   __half* Bs_buf0 = shared_mem + 2 * kSmemABuf;
   __half* Bs_buf1 = shared_mem + 2 * kSmemABuf + kSmemBBuf;
 
+  // 线程与warp索引
   const int tx = threadIdx.x;
   const int ty = threadIdx.y;
   const int tid = ty * kBlockThreadsX + tx;
@@ -64,6 +69,7 @@ __global__ __launch_bounds__(kThreads, 2) void GemmFP16Kernel(
   const int warp_m = warp_id / kNumWarpsN;
   const int warp_n = warp_id % kNumWarpsN;
 
+  // 初始化WMMA累加器
   wmma::fragment<wmma::accumulator, kWmmaM, kWmmaN, kWmmaK, float>
       c_frag[kWarpTilesM][kWarpTilesN];
   #pragma unroll
@@ -79,6 +85,7 @@ __global__ __launch_bounds__(kThreads, 2) void GemmFP16Kernel(
   const int b_offset_base = warp_n * kWarpN;
   const int a_ld = kTileK;
 
+  // 异步加载函数：cp.async 加载 A/B 块
   auto load_tile_async = [&](int tile_k_start, __half* As_buf, __half* Bs_buf) {
     const int total_a_half8 = (kBlockM * kTileK) / 8;
     const int a_half8_per_thread = (total_a_half8 + kThreads - 1) / kThreads;
@@ -121,11 +128,13 @@ __global__ __launch_bounds__(kThreads, 2) void GemmFP16Kernel(
     }
   };
 
+  // 加载首块并同步
   load_tile_async(0, As_buf0, Bs_buf0);
   __pipeline_commit();
   __pipeline_wait_prior(0);
   __syncthreads();
 
+  // 主循环：异步加载下一块 + WMMA计算当前块
   #pragma unroll
   for (int t = 0; t < num_k_tiles; ++t) {
     __half* As_read = (t & 1) ? As_buf1 : As_buf0;
@@ -138,6 +147,7 @@ __global__ __launch_bounds__(kThreads, 2) void GemmFP16Kernel(
       __pipeline_commit();
     }
 
+    // WMMA计算：加载矩阵片段 + 执行乘加
     #pragma unroll
     for (int kk = 0; kk < kTileK; kk += kWmmaK) {
       wmma::fragment<wmma::matrix_a, kWmmaM, kWmmaN, kWmmaK, __half, wmma::row_major>
@@ -168,6 +178,7 @@ __global__ __launch_bounds__(kThreads, 2) void GemmFP16Kernel(
     __syncthreads();
   }
 
+  // 写回结果
   const int out_r = blockIdx.y * kBlockM + a_offset_base;
   const int out_c = blockIdx.x * kBlockN + b_offset_base;
 
@@ -188,9 +199,6 @@ __global__ __launch_bounds__(kThreads, 2) void GemmFP16Kernel(
 
 }  // namespace gemm_fp16
 
-// ============================================================
-// 精度评估指标（与 gemm_int8 一致）
-// ============================================================
 struct PrecisionMetrics {
   double cos_sim;
   double snr_db;
@@ -259,6 +267,7 @@ static void GemmCPU_FP32(const float* A, const float* B, float* C, int M, int N,
 
 #ifndef ALL_COMPARE_LIB
 int main() {
+  // 参数与输出文件准备
   constexpr int kRepeat = 10;
   constexpr int kMaxCpuVerifyDim = 1024;
   auto cases = common::LoadOrCreateTestCasesCsv("data/gemm/test_cases.csv");
@@ -279,6 +288,8 @@ int main() {
                          (N % gemm_fp16::kBlockN == 0) &&
                          (K % gemm_fp16::kTileK == 0);
     const size_t C_size = static_cast<size_t>(M) * N;
+
+    // 生成测试数据
     std::vector<float> A_fp32(static_cast<size_t>(M) * K),
                        B_fp32(static_cast<size_t>(K) * N),
                        C_cpu(C_size),
@@ -286,34 +297,42 @@ int main() {
     common::InitMatrix(A_fp32, M, K);
     common::InitMatrix(B_fp32, K, N);
 
-    // FP32 CPU 参考
+    // CPU参考计算
     if (M <= kMaxCpuVerifyDim && N <= kMaxCpuVerifyDim) {
       GemmCPU_FP32(A_fp32.data(), B_fp32.data(), C_cpu.data(), M, N, K);
     }
 
     float gpu_ms = 0.0f;
     if (aligned) {
+      // 转换为FP16
       std::vector<__half> A_half(A_fp32.size()), B_half(B_fp32.size());
       for (size_t j = 0; j < A_fp32.size(); ++j) A_half[j] = __float2half(A_fp32[j]);
       for (size_t j = 0; j < B_fp32.size(); ++j) B_half[j] = __float2half(B_fp32[j]);
 
+      // 分配GPU内存
       __half *dA, *dB;
       float *dC;
       CHECK_CUDA(cudaMalloc(&dA, A_half.size() * sizeof(__half)));
       CHECK_CUDA(cudaMalloc(&dB, B_half.size() * sizeof(__half)));
       CHECK_CUDA(cudaMalloc(&dC, C_size * sizeof(float)));
+
+      // 拷贝数据到设备
       CHECK_CUDA(cudaMemcpy(dA, A_half.data(), A_half.size() * sizeof(__half), cudaMemcpyHostToDevice));
       CHECK_CUDA(cudaMemcpy(dB, B_half.data(), B_half.size() * sizeof(__half), cudaMemcpyHostToDevice));
 
+      // 启动配置
       dim3 block(gemm_fp16::kBlockThreadsX, gemm_fp16::kBlockThreadsY);
       dim3 grid((N + gemm_fp16::kBlockN - 1) / gemm_fp16::kBlockN,
                 (M + gemm_fp16::kBlockM - 1) / gemm_fp16::kBlockM);
 
+      // 预热
       gemm_fp16::GemmFP16Kernel<<<grid, block, gemm_fp16::kSmemSize>>>(dA, dB, dC, M, N, K);
       CHECK_CUDA(cudaDeviceSynchronize());
 
+      // 拷贝结果回主机
       CHECK_CUDA(cudaMemcpy(C_gpu_fp32.data(), dC, C_size * sizeof(float), cudaMemcpyDeviceToHost));
 
+      // 计时循环
       cudaEvent_t start, stop;
       CHECK_CUDA(cudaEventCreate(&start));
       CHECK_CUDA(cudaEventCreate(&stop));
@@ -326,6 +345,7 @@ int main() {
       CHECK_CUDA(cudaEventElapsedTime(&gpu_ms, start, stop));
       gpu_ms /= static_cast<float>(kRepeat);
 
+      // 释放GPU资源
       CHECK_CUDA(cudaEventDestroy(start));
       CHECK_CUDA(cudaEventDestroy(stop));
       CHECK_CUDA(cudaFree(dA));
@@ -333,7 +353,7 @@ int main() {
       CHECK_CUDA(cudaFree(dC));
     }
 
-    // 精度评估：FP32 参考 vs FP16 GPU 结果
+    // 精度评估
     double max_abs_diff = 0.0;
     PrecisionMetrics pm = {};
     if (aligned && M <= kMaxCpuVerifyDim && N <= kMaxCpuVerifyDim) {
@@ -341,6 +361,7 @@ int main() {
       max_abs_diff = pm.max_abs_err;
     }
 
+    // 计算并输出结果
     const double gflops = (gpu_ms > 0.0f) ? (2.0 * M * N * K / (gpu_ms * 1e6)) : 0.0;
     std::cout << "\n========== " << M << "x" << N << "x" << K
               << " | GPU: " << std::fixed << std::setprecision(3) << gpu_ms << " ms"

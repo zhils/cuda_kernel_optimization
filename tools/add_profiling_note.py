@@ -3,19 +3,13 @@
 
 import os
 
-PROJECT_ROOT = "/mnt/d/deploy/cuda_kernel_optimization"
+PROJECT_ROOT = "/home/zh0813/cuda_kernel_optimization"
 
 README_PATHS = [
-    "/mnt/d/deploy/cuda_kernel_optimization/gemm/README.md",
-    "/mnt/d/deploy/cuda_kernel_optimization/softmax/README.md",
-    "/mnt/d/deploy/cuda_kernel_optimization/rmsnorm/README.md",
-    "/mnt/d/deploy/cuda_kernel_optimization/fused_conv1d_silu/README.md",
-    "/mnt/d/deploy/cuda_kernel_optimization/flash_attention/README.md",
-    "/mnt/d/deploy/cuda_kernel_optimization/fused_l2_norm_qk/README.md",
-    "/mnt/d/deploy/cuda_kernel_optimization/fused_gated_delta_rule/README.md",
-    "/mnt/d/deploy/cuda_kernel_optimization/fused_output_norm_gate/README.md",
-    "/mnt/d/deploy/cuda_kernel_optimization/q_path_fusion/README.md",
-    "/mnt/d/deploy/cuda_kernel_optimization/README.md",
+    "/home/zh0813/cuda_kernel_optimization/gemm/README.md",
+    "/home/zh0813/cuda_kernel_optimization/rmsnorm/README.md",
+    "/home/zh0813/cuda_kernel_optimization/fused_conv1d_silu/README.md",
+    "/home/zh0813/cuda_kernel_optimization/README.md",
 ]
 
 NOTE = """**说明：** ncu `--set basic` 默认对程序的**第一个 kernel launch** 进行 profiling。对于 GEMM 等算子，这对应最小测试尺寸（128×128），GPU 远未饱和。因此表格中的 Compute% / MemBW% 表示的是**小尺寸下的资源利用率**，用于横向对比各版本的寄存器压力、occupancy 等结构性差异。大尺寸下的实际性能请参考各算子 README 中的完整 benchmark 表格。

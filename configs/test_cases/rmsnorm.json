@@ -1,0 +1,84 @@
+{
+  "schema_version": "1",
+  "family": "rmsnorm",
+  "cases": [
+    {
+      "id": "smoke_128",
+      "expect": "pass",
+      "tags": ["smoke"],
+      "params": { "rows": 128, "cols": 128, "act_dtype": "fp32", "weight_dtype": "fp32" }
+    },
+    {
+      "id": "main_4096",
+      "expect": "pass",
+      "tags": ["perf", "demo"],
+      "params": { "rows": 4096, "cols": 4096, "act_dtype": "fp32", "weight_dtype": "fp32" }
+    },
+    {
+      "id": "fp16_act",
+      "expect": "pass",
+      "tags": ["dtype"],
+      "params": { "rows": 512, "cols": 512, "act_dtype": "fp16", "weight_dtype": "fp16" }
+    },
+    {
+      "id": "bf16_act",
+      "expect": "pass",
+      "tags": ["dtype"],
+      "params": { "rows": 512, "cols": 512, "act_dtype": "bf16", "weight_dtype": "bf16" }
+    },
+    {
+      "id": "int8_quant",
+      "expect": "pass",
+      "tags": ["dtype", "quant"],
+      "params": { "rows": 256, "cols": 256, "act_dtype": "int8", "weight_dtype": "fp32" }
+    },
+    {
+      "id": "single_row",
+      "expect": "pass",
+      "tags": ["boundary"],
+      "params": { "rows": 1, "cols": 4096, "act_dtype": "fp32", "weight_dtype": "fp32" }
+    },
+    {
+      "id": "single_col",
+      "expect": "pass",
+      "tags": ["boundary"],
+      "params": { "rows": 4096, "cols": 1, "act_dtype": "fp32", "weight_dtype": "fp32" }
+    },
+    {
+      "id": "invalid_zero_cols",
+      "expect": "invalid_argument",
+      "tags": ["boundary"],
+      "params": { "rows": 128, "cols": 0, "act_dtype": "fp32", "weight_dtype": "fp32" }
+    },
+    {
+      "id": "wide_hidden",
+      "expect": "pass",
+      "tags": ["ratio"],
+      "params": { "rows": 32, "cols": 8192, "act_dtype": "fp32", "weight_dtype": "fp32" }
+    },
+    {
+      "id": "extreme_many_rows",
+      "expect": "pass",
+      "tags": ["ratio", "extreme"],
+      "params": { "rows": 4096, "cols": 64, "act_dtype": "fp32", "weight_dtype": "fp32" }
+    },
+    {
+      "id": "extreme_wide_fp16",
+      "expect": "pass",
+      "tags": ["ratio", "extreme", "dtype"],
+      "params": { "rows": 4, "cols": 4096, "act_dtype": "fp16", "weight_dtype": "fp16" }
+    },
+    {
+      "id": "fp8e4m3_act",
+      "expect": "pass",
+      "tags": ["dtype", "fp8"],
+      "params": { "rows": 256, "cols": 256, "act_dtype": "fp8_e4m3", "weight_dtype": "fp32" }
+    },
+    {
+      "id": "fp8e5m2_act",
+      "expect": "pass",
+      "tags": ["dtype", "fp8"],
+      "params": { "rows": 256, "cols": 256, "act_dtype": "fp8_e5m2", "weight_dtype": "fp32" }
+    }
+  ]
+}
