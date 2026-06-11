@@ -30,13 +30,17 @@ $$
 | 1024 | 171 | 计算受限 |
 | 4096 | 683 | 计算受限 |
 
-**GPU 参数：** RTX 5060 Ti（Blackwell sm_120, 36 SM × 2.55 GHz）
-- FP32 CUDA Core：36×128×2.55×2 = **23.5 TFLOPS**
-- TF32 TC (k=8)：36×2048×2.55 ≈ **188 TFLOPS**（理论，实际受 occupancy 限）
-- FP16/BF16 TC (k=16)：36×4096×2.55 ≈ **376 TFLOPS**
-- DRAM：**448 GB/s**（GDDR7 × 128-bit）
+**GPU 参数：** RTX 5060 Ti（Blackwell sm_120, 36 SM × 2.55 GHz, **DRAM 448 GB/s** GDDR7 128-bit）
 
-实际利用率达不到理论值——指令流中有 load/store、地址计算、同步等非 FMA 指令混入。手写 FP32 kernel 通常达到理论峰值的 40~60%。
+| 精度 | 理论 TC 峰值 | 实际可达上限 | 说明 |
+|------|------------|------------|------|
+| FP32 CUDA Core | **23.5 TFLOPS** | 23.5 TFLOPS | 纯 CUDA Core FMA |
+| TF32 TC (k=8) | 188 TFLOPS | ~24 TFLOPS | 受 SMEM→TC 供给限，约 1/8 |
+| FP16/BF16 TC (k=16) | **752 TFLOPS** | **~94 TFLOPS** | 受 SMEM→TC 供给限，约 1/8 |
+| INT8 TC | 1.5 POPS | ~0.2 POPS | 同上 |
+| FP8 TC | 3.0 POPS | ~0.4 POPS | 同上 |
+
+> 理论峰值为纯 Tensor Core FMA 速率（36 SM × 4 TC × 每 TC FMA × 2 × 2.55 GHz）。实际可达上限受 SMEM→TC 供给带宽制约——TC 消费数据的速度远超 SMEM 通过流水线供给的速率，利用率约 1/8。cuBLAS FP16 在 4096³ 实测 44.04 TFLOPS，已达实际上限的 47%（44/94），是相当好的利用率；手写 fp16 WMMA 达 35.58 TFLOPS（38%）也已接近同口径水平。具体瓶颈详见 NCU 分析。
 
 ---
 
@@ -226,18 +230,18 @@ v0 (1.34T) ──[+42%]──→ v1 (1.90T) ──[+430%]──→ v2 (10.07T)
                                                 ──[+198%]─→ fp16 (35.58T) ← FP16 TC
 ```
 
-4096³ GFLOPS 演进（vs FP32 CUDA Core 峰值 23.5T）：
+4096³ GFLOPS 演进（CUDA Core 版本 vs 23.5T FP32 峰值，TC 版本 vs 94T TC 实际上限）：
 
-| 版本 | GFLOPS | 占峰值 | 关键优化 |
-|:-----|------:|------:|:---------|
-| v0 | 1,340 | 6% | 朴素基线，无任何复用 |
-| v1 | 1,895 | 8% | SMEM 分块 16×16 |
-| v2 | 10,073 | 43% | 寄存器分块 8×8/线程 |
-| v3 | 11,949 | 51% | cp.async + 8×4 + TileK=32 |
-| v4 | 10,277 | 44% | TF32 WMMA TC（寄存器压力大） |
-| gemm_fp16 | **35,579** | — | FP16 WMMA k=16, TileK=32 |
-| cuBLAS FP32 | 15,276 | 65% | BF16×9 仿真路径 |
-| cuBLAS FP16 | 44,039 | — | `cublasGemmEx` Tensor Op |
+| 版本 | GFLOPS | 占实际上限 | 关键优化 |
+|:-----|------:|:----------:|:---------|
+| v0 | 1,340 | 6%（vs CUDA Core） | 朴素基线，无任何复用 |
+| v1 | 1,895 | 8%（vs CUDA Core） | SMEM 分块 16×16 |
+| v2 | 10,073 | 43%（vs CUDA Core） | 寄存器分块 8×8/线程 |
+| v3 | 11,949 | 51%（vs CUDA Core） | cp.async + 8×4 + TileK=32 |
+| v4 | 10,277 | 44%（vs CUDA Core） | TF32 WMMA TC（寄存器压力大） |
+| gemm_fp16 | **35,579** | **38%**（vs 94T TC 上限） | FP16 WMMA k=16, TileK=32 |
+| cuBLAS FP32 | 15,276 | 65%（vs CUDA Core） | BF16×9 仿真路径 |
+| cuBLAS FP16 | 44,039 | **47%**（vs 94T TC 上限） | `cublasGemmEx` Tensor Op |
 
 ### 3.5 TileK=32 设计说明
 
@@ -352,7 +356,7 @@ cuBLAS FP16 ──→ 库 baseline (44.0 TFLOPS @ 4096³)
 ## 6. 产物路径
 
 - 可执行文件：`build/bin/gemm_v0` … `gemm_v4`、`gemm_fp16`、`gemm_cublas_ref`、`gemm_cublas_fp16`
-- 低精度量化实验：已移除（偏离三算子 demo 主线）
+- 低精度量化实验：已移除
 - 结果 CSV：`data/results/`
 - ncu 报告：`build/data/ncu_reports/`
 - PTX/SASS：本地运行 `make gemm_v0.ptx` 或 `cuobjdump -sass <binary>` 生成

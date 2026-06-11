@@ -16,12 +16,15 @@
 
 实测日期：**2026-05-20**
 
-| 算子 | 主场景 | GPU 耗时 | 吞吐 | 校验 |
-|------|--------|---------|------|------|
-| GEMM FP32 (`gemm_v3`) | 4096³ | 11.50 ms | 11.95 TFLOPS | PASS ≤1024 |
-| GEMM FP16 (`gemm_fp16`) | 4096³ | 3.86 ms | 35.58 TFLOPS | cos_sim=1.0 |
-| RMSNorm (`rmsnorm_v3`) | 4096² | 0.372 ms | 361 GB/s | PASS |
-| Fused Conv1D+SiLU (`v3`) | B=8,L=2048 | 1.65 ms | ~343× vs v0 | PASS |
+| 算子 | 主场景 | GPU 耗时 | 吞吐 | 实际利用率 | 校验 |
+|------|--------|---------|------|-----------|------|
+| GEMM FP32 (`gemm_v3`) | 4096³ | 11.50 ms | 11.95 TFLOPS | 51%（vs 23.5T CUDA Core） | PASS ≤1024 |
+| GEMM FP16 (`gemm_fp16`) | 4096³ | 3.86 ms | 35.58 TFLOPS | 38%（vs 94T TC 实际上限） | cos_sim=1.0 |
+| cuBLAS FP32 | 4096³ | 9.00 ms | 15.28 TFLOPS | 65%（vs 23.5T CUDA Core） | — |
+| cuBLAS FP16 | 4096³ | 3.12 ms | 44.04 TFLOPS | 47%（vs 94T TC 实际上限） | — |
+| cuBLAS FP8e4 | 4096³ | 0.84 ms | 163.78 TFLOPS | 41%（vs 0.4 POPS TC 实际上限） | — |
+| RMSNorm (`rmsnorm_v3`) | 4096² | 0.372 ms | 361 GB/s | 81%（vs 448 GB/s DRAM） | PASS |
+| Fused Conv1D+SiLU (`v3`) | B=8,L=2048 | 1.65 ms | ~343× vs v0 | — | PASS |
 
 ---
 
@@ -56,13 +59,14 @@
 ```
 v1 SMEM 分块  → MIO Throttle 4.82   访存管道拥塞（128³）
 v2 寄存器分块 → Long SB 低           cp.async 前全局延迟已缓解
-v3 cp.async   → Long SB 0.37         FP32 最优 11.95 TFLOPS @ 4096³
-v4 TF32 WMMA  → Math Pipe 8.79       TC 工作（128³ launch）
-fp16 WMMA     → Long SB 1.77         4096³ DRAM ~2%（非带宽瓶颈）
-cuBLAS FP16   → 4096³ 44.0 TFLOPS    库 baseline
+v3 cp.async   → Long SB 0.37         FP32 最优 11.95 TFLOPS @ 4096³（51% CUDA Core 峰值）
+v4 TF32 WMMA  → Math Pipe 8.79       TC 工作（128³ launch），TC 实际利用 ~42%（vs 24T 上限）
+fp16 WMMA     → Long SB 1.77         TC 实际利用 ~38%（vs 94T 上限），DRAM ~2%（非带宽瓶颈）
+cuBLAS FP16   → 4096³ 44.0 TFLOPS    TC 实际利用 ~47%（vs 94T 上限）
+cuBLAS FP8e4  → 4096³ 163.8 TFLOPS   TC 实际利用 ~41%（vs 0.4 POPS 上限）
 ```
 
-**结论：** 大矩阵 GEMM 不是 DRAM 瓶颈，是 **SMEM tile 搬到 Tensor Core 的速度**跟不上 k=16 吞吐。
+**结论：** 大矩阵 GEMM 不是 DRAM 瓶颈，也不是 Tensor Core 计算吞吐瓶颈——TC 实际利用在 **38~47%** 之间。真正的瓶颈是 **SMEM tile 搬到 Tensor Core 的供给速度跟不上 TC 的消费速率**（Long Scoreboard = SMEM→寄存器数据未到位）。cuBLAS FP16 已达实际上限的 47%，手写 fp16 达 38%，差距合理。后续优化方向应转向减少 SMEM→TC 往返次数（如更大 TileK、FP8 更高吞吐摊薄供给开销）。
 
 ### 2. RMSNorm — 典型访存受限
 
@@ -134,6 +138,8 @@ ctest --test-dir build --output-on-failure
 |------|------|
 | GPU | RTX 5060 Ti 16GB (Blackwell sm_120) |
 | CUDA | 13.2 |
-| FP32 峰值 | 23.5 TFLOPS |
-| FP16 TC 峰值 | 376 TFLOPS |
+| FP32 CUDA Core 峰值 | 23.5 TFLOPS |
+| FP16 TC 峰值 | 752 TFLOPS（实际上限 ~94T，受 SMEM→TC 供给限） |
+| TF32 TC 峰值 | 188 TFLOPS（实际上限 ~24T） |
+| FP8 TC 峰值 | 3.0 POPS（实际上限 ~0.4 POPS） |
 | DRAM 带宽 | 448 GB/s |
