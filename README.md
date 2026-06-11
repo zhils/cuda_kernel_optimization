@@ -66,7 +66,7 @@ cuBLAS FP16   → 4096³ 44.0 TFLOPS    TC 实际利用 ~47%（vs 94T 上限）
 cuBLAS FP8e4  → 4096³ 163.8 TFLOPS   TC 实际利用 ~41%（vs 0.4 POPS 上限）
 ```
 
-**结论：** 大矩阵 GEMM 不是 DRAM 瓶颈，也不是 Tensor Core 计算吞吐瓶颈——TC 实际利用在 **38~47%** 之间。真正的瓶颈是 **SMEM tile 搬到 Tensor Core 的供给速度跟不上 TC 的消费速率**（Long Scoreboard = SMEM→寄存器数据未到位）。cuBLAS FP16 已达实际上限的 47%，手写 fp16 达 38%，差距合理。后续优化方向应转向减少 SMEM→TC 往返次数（如更大 TileK、FP8 更高吞吐摊薄供给开销）。
+**结论：** 大矩阵 GEMM 不是 DRAM 瓶颈，也不是 Tensor Core 计算吞吐瓶颈——TC 实际利用在 **38~47%** 之间。核心瓶颈是 SMEM→register 的**数据供给速度**跟不上 TC 消费速率（Long SB + Short SB 合计 ~35% stall）。non-TC 指令（地址计算、同步）和寄存器压力（reg/thr=112~128, occupancy ~27%）进一步压缩了有效 TC 时间。cuBLAS 达 47% 说明供给侧已接近 Blackwell 架构上限，手写 38% 差距合理。
 
 ### 2. RMSNorm — 典型访存受限
 

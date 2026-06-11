@@ -40,7 +40,20 @@ $$
 | INT8 TC | 1.5 POPS | ~0.2 POPS | 同上 |
 | FP8 TC | 3.0 POPS | ~0.4 POPS | 同上 |
 
-> 理论峰值为纯 Tensor Core FMA 速率（36 SM × 4 TC × 每 TC FMA × 2 × 2.55 GHz）。实际可达上限受 SMEM→TC 供给带宽制约——TC 消费数据的速度远超 SMEM 通过流水线供给的速率，利用率约 1/8。cuBLAS FP16 在 4096³ 实测 44.04 TFLOPS，已达实际上限的 47%（44/94），是相当好的利用率；手写 fp16 WMMA 达 35.58 TFLOPS（38%）也已接近同口径水平。具体瓶颈详见 NCU 分析。
+> 理论峰值为纯 Tensor Core FMA 速率（36 SM × 4 TC × 每 TC FMA × 2 × 2.55 GHz）。实际可达上限受 SMEM→TC 供给带宽制约——TC 消费数据的速度远超 SMEM 通过流水线供给的速率，利用率约 1/8。cuBLAS FP16 在 4096³ 实测 44.04 TFLOPS，已达实际上限的 47%（44/94），是相当好的利用率；手写 fp16 WMMA 达 35.58 TFLOPS（38%）也已接近同口径水平。
+
+### 1.1 为什么 TC 利用率不到 50%
+
+无论手写还是 cuBLAS，TC 利用率均在 38~47%，这不是实现质量问题，而是 Blackwell 架构的固有瓶颈。NCU stall 数据揭示了四个原因：
+
+| 原因 | NCU 指标（gemm_fp16 @ 128³） | 影响 |
+|------|------------------------------|------|
+| **SMEM→寄存器供数跟不上** | Long SB 1.83 + Short SB 3.15 = **35% stall** | TC 等待数据，warp 停在该 SMEM load 的后续指令上 |
+| **非 TC 指令占比** | 地址计算、循环控制、`__syncthreads` 挤占 TC slot | 每 k 轮至少 1 次同步 + 地址重算，non-TC 指令约占 ~30% 周期 |
+| **寄存器压力限制 occupancy** | gemm_fp16 reg/thr=112，gemm_v4=128，cuBLAS=128 | occupancy ~27%，无法用更多 warp 切换隐藏延迟 |
+| **WMMA API 固定 tile 开销** | k=16 需每个 warp 发 4 条 mma_sync，中间穿插 ldmatrix | ldmatrix 从 SMEM→register 是 4 拍延迟，TC 必须等待 |
+
+**结论：** TC 计算本身不是瓶颈（Math Pipe 4.09 表示 TC 一直有活干），瓶颈在数据供给侧。SMEM→register 的吞吐上限决定了 TC 的实际可达天花板。cuBLAS 能到 47% 是因为其更优的 SMEM 布局减少 bank conflict，手写 38% 也已接近该上限。这解释了为什么继续手写追 cuBLAS FP16（44 TFLOPS @ 4096³）ROI 不高——差距主要在供给侧的工程优化。
 
 ---
 
